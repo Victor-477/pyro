@@ -1,33 +1,27 @@
-# PYRO — a linguagem-alvo nativa (`.pyro`)
+# PYRO — back-end nativo (código de máquina)
 
-O **Pyro** é a **linguagem-alvo própria** do sistema: um **bytecode binário** com um
-conjunto de instruções (ISA) inventado aqui — **não é** x86, Go nem C. O compilador
-(**Burnout**) gera `.pyro` a partir de `.cryo`, e a **VM Pyro** (em Go) carrega e
-executa esse bytecode na máquina.
-
-```
-  .cryo ──►  Burnout (compilador)  ──►  .pyro (bytecode próprio)  ──►  VM Pyro (Go)  ──►  execução
-```
+O **PYRO** é a camada "quente": recebe a AST do CRYO e **gera código nativo**,
+falando direto com a máquina. Inclui os geradores de código, o runtime C e a
+camada de máquina (skills nativas de LLM + acesso ao sistema).
 
 ## Conteúdo
 
-| Caminho | Papel |
+| Arquivo | Papel |
 |---|---|
-| `vm/main.go` · `vm/go.mod` | A **VM Pyro** (em Go): carrega, decodifica e executa `.pyro` |
-| `PYRO_BYTECODE.md` | Especificação da ISA e do formato do `.pyro` |
-| `PYRO.md` | Visão da camada nativa (pipeline, skills, acesso à máquina) |
+| `codegen_go.py` | Backend **Go** (base atual) — linguagem completa + skills/máquina |
+| `codegen_c.py` | Backend C nativo (+ instrumentação de segurança) |
+| `codegen_asm.py` | Backend x86-64 (ABIs System V e Win64) |
+| `codegen_legacy.py` | Backend Python legado (não usado pela CLI) |
+| `runtime/cryo_runtime.c/.h` | Runtime C compartilhado (backends C/asm) |
+| `PYRO.md` | Explicação da camada Pyro: pipeline, skills e acesso à máquina |
 
-## Por que é sua própria linguagem
+## Camada de máquina (skills + OS)
 
-- **Roda na máquina** via a VM (portável).
-- **Compacta/opaca** ("criptografada") por natureza — a seção de código é codificada.
-- **Nativa do sistema**, ótima como dado de treino para agentes de IA (instruções já
-  na forma que a máquina executa).
-- **Própria** — não derivada de linguagens existentes.
-
-Detalhes completos em [PYRO_BYTECODE.md](PYRO_BYTECODE.md).
+Skills de LLM são **compiladas no binário** (sem arquivos `.md`), com introspecção
+nativa (`skills()`, `skill_get()`, `skills_json()`), e há builtins de acesso direto
+à máquina (`pyro_exec`, `pyro_env`, `pyro_args`, `pyro_time`, …). Ver [PYRO.md](PYRO.md).
 
 ## Dependências
 
-A VM é **autocontida** (só Go padrão). O `.pyro` que ela executa é produzido pelo
-**Burnout**. Será distribuído como repositório próprio (a linguagem-alvo + a VM).
+PYRO depende de `ast_nodes.py` do **CRYO** (importado como `from ast_nodes import *`).
+Será distribuído como repositório próprio, consumindo o CRYO como dependência.

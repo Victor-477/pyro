@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 )
 
@@ -54,6 +55,14 @@ const (
 	opPRINT   = 0x50
 	opASSERT  = 0x51
 	opPRINTLN = 0x52
+	opNEWARR  = 0x60
+	opNEWMAP  = 0x61
+	opINDEX   = 0x62
+	opSETIDX  = 0x63
+	opLEN     = 0x64
+	opAPPEND  = 0x65
+	opHAS     = 0x66
+	opKEYS    = 0x67
 )
 
 // tipos de valor
@@ -63,21 +72,59 @@ const (
 	kBool
 	kStr
 	kNull
+	kArray // *[]Value  (referência: push/setidx mutam o compartilhado)
+	kMap   // map[any]Value (structs também usam este tipo)
 )
 
 type Value struct {
-	k byte
-	i int64
-	f float64
-	b bool
-	s string
+	k   byte
+	i   int64
+	f   float64
+	b   bool
+	s   string
+	arr *[]Value
+	m   map[any]Value
 }
 
-func vInt(i int64) Value    { return Value{k: kInt, i: i} }
-func vFloat(f float64) Value { return Value{k: kFloat, f: f} }
-func vBool(b bool) Value    { return Value{k: kBool, b: b} }
-func vStr(s string) Value   { return Value{k: kStr, s: s} }
-func vNull() Value          { return Value{k: kNull} }
+func vInt(i int64) Value      { return Value{k: kInt, i: i} }
+func vFloat(f float64) Value  { return Value{k: kFloat, f: f} }
+func vBool(b bool) Value      { return Value{k: kBool, b: b} }
+func vStr(s string) Value     { return Value{k: kStr, s: s} }
+func vNull() Value            { return Value{k: kNull} }
+func vArr(a []Value) Value    { return Value{k: kArray, arr: &a} }
+func vMap(m map[any]Value) Value { return Value{k: kMap, m: m} }
+
+// chave comparável (Go) a partir de um Value
+func keyOf(v Value) any {
+	switch v.k {
+	case kInt:
+		return v.i
+	case kStr:
+		return v.s
+	case kBool:
+		return v.b
+	case kFloat:
+		return v.f
+	default:
+		return nil
+	}
+}
+
+// reconstrói um Value a partir de uma chave de map
+func keyToValue(k any) Value {
+	switch t := k.(type) {
+	case int64:
+		return vInt(t)
+	case string:
+		return vStr(t)
+	case bool:
+		return vBool(t)
+	case float64:
+		return vFloat(t)
+	default:
+		return vNull()
+	}
+}
 
 func (v Value) truthy() bool {
 	switch v.k {
@@ -89,6 +136,10 @@ func (v Value) truthy() bool {
 		return v.f != 0
 	case kStr:
 		return v.s != ""
+	case kArray:
+		return len(*v.arr) > 0
+	case kMap:
+		return len(v.m) > 0
 	default:
 		return false
 	}
@@ -114,9 +165,45 @@ func (v Value) String() string {
 		return "false"
 	case kStr:
 		return v.s
+	case kArray:
+		parts := make([]string, len(*v.arr))
+		for i, e := range *v.arr {
+			parts[i] = e.String()
+		}
+		return "[" + join(parts, ", ") + "]"
+	case kMap:
+		ks := mapKeysSorted(v.m)
+		parts := make([]string, len(ks))
+		for i, k := range ks {
+			parts[i] = keyToValue(k).String() + ": " + v.m[k].String()
+		}
+		return "{" + join(parts, ", ") + "}"
 	default:
 		return "null"
 	}
+}
+
+func join(parts []string, sep string) string {
+	out := ""
+	for i, p := range parts {
+		if i > 0 {
+			out += sep
+		}
+		out += p
+	}
+	return out
+}
+
+// chaves de map ordenadas (saída determinística)
+func mapKeysSorted(m map[any]Value) []any {
+	ks := make([]any, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.Slice(ks, func(i, j int) bool {
+		return keyToValue(ks[i]).String() < keyToValue(ks[j]).String()
+	})
+	return ks
 }
 
 type Func struct {
@@ -164,17 +251,17 @@ func load(data []byte) *Program {
 		tag := data[pos]
 		pos++
 		switch tag {
-		case 1: // int64
+		case 1:
 			p.consts[i] = vInt(int64(binary.LittleEndian.Uint64(data[pos:])))
 			pos += 8
-		case 2: // float64
+		case 2:
 			p.consts[i] = vFloat(math.Float64frombits(binary.LittleEndian.Uint64(data[pos:])))
 			pos += 8
-		case 3: // string
+		case 3:
 			n := rd16()
 			p.consts[i] = vStr(string(data[pos : pos+n]))
 			pos += n
-		case 4: // bool
+		case 4:
 			p.consts[i] = vBool(data[pos] != 0)
 			pos++
 		default:
@@ -209,6 +296,62 @@ func xorDecode(code []byte) {
 		b := code[i] ^ k
 		code[i] = b
 		k = byte((int(k)*31 + 7 + int(b)) & 0xFF)
+	}
+}
+
+// ── operações de container ──────────────────────────────────
+
+func lengthOf(v Value) int64 {
+	switch v.k {
+	case kStr:
+		return int64(len(v.s))
+	case kArray:
+		return int64(len(*v.arr))
+	case kMap:
+		return int64(len(v.m))
+	default:
+		fatal("len() aplicado a valor sem tamanho")
+		return 0
+	}
+}
+
+func indexGet(cont, key Value) Value {
+	switch cont.k {
+	case kArray:
+		idx := key.i
+		if idx < 0 || idx >= int64(len(*cont.arr)) {
+			fatal(fmt.Sprintf("[Cryo Seguranca] IndexError: índice %d fora dos limites (len=%d)", idx, len(*cont.arr)))
+		}
+		return (*cont.arr)[idx]
+	case kMap:
+		if v, ok := cont.m[keyOf(key)]; ok {
+			return v
+		}
+		return vNull()
+	case kStr:
+		idx := key.i
+		if idx < 0 || idx >= int64(len(cont.s)) {
+			fatal("[Cryo Seguranca] IndexError: índice de string fora dos limites")
+		}
+		return vStr(string(cont.s[idx]))
+	default:
+		fatal("indexação de valor não indexável")
+		return vNull()
+	}
+}
+
+func indexSet(cont, key, val Value) {
+	switch cont.k {
+	case kArray:
+		idx := key.i
+		if idx < 0 || idx >= int64(len(*cont.arr)) {
+			fatal(fmt.Sprintf("[Cryo Seguranca] IndexError: índice %d fora dos limites", idx))
+		}
+		(*cont.arr)[idx] = val
+	case kMap:
+		cont.m[keyOf(key)] = val
+	default:
+		fatal("atribuição indexada em valor não indexável")
 	}
 }
 
@@ -298,13 +441,12 @@ func run(p *Program) {
 			fr := frames[len(frames)-1]
 			frames = frames[:len(frames)-1]
 			if fr.retpc < 0 {
-				return // retorno da main
+				return
 			}
 			pc = fr.retpc
 			push(ret)
 		case opPRINT:
 			fmt.Println(pop().String())
-			// valor de expressão fica a cargo do bytecode (NULL emitido depois)
 		case opPRINTLN:
 			fmt.Println()
 		case opASSERT:
@@ -313,6 +455,61 @@ func run(p *Program) {
 			if !cond.truthy() {
 				fatal("[Cryo Assert] " + msg.String())
 			}
+		case opNEWARR:
+			n := rd16()
+			base := len(stack) - n
+			elems := make([]Value, n)
+			copy(elems, stack[base:])
+			stack = stack[:base]
+			push(vArr(elems))
+		case opNEWMAP:
+			n := rd16()
+			base := len(stack) - 2*n
+			mm := make(map[any]Value, n)
+			for j := 0; j < n; j++ {
+				mm[keyOf(stack[base+2*j])] = stack[base+2*j+1]
+			}
+			stack = stack[:base]
+			push(vMap(mm))
+		case opINDEX:
+			key := pop()
+			cont := pop()
+			push(indexGet(cont, key))
+		case opSETIDX:
+			val := pop()
+			key := pop()
+			cont := pop()
+			indexSet(cont, key, val)
+		case opLEN:
+			push(vInt(lengthOf(pop())))
+		case opAPPEND:
+			val := pop()
+			arr := pop()
+			if arr.k != kArray {
+				fatal("push em valor que não é array")
+			}
+			*arr.arr = append(*arr.arr, val)
+			push(vInt(int64(len(*arr.arr))))
+		case opHAS:
+			key := pop()
+			mp := pop()
+			if mp.k != kMap {
+				push(vBool(false))
+			} else {
+				_, ok := mp.m[keyOf(key)]
+				push(vBool(ok))
+			}
+		case opKEYS:
+			mp := pop()
+			if mp.k != kMap {
+				fatal("keys() aplicado a valor que não é map")
+			}
+			ks := mapKeysSorted(mp.m)
+			out := make([]Value, len(ks))
+			for i, k := range ks {
+				out[i] = keyToValue(k)
+			}
+			push(vArr(out))
 		default:
 			fatal(fmt.Sprintf("opcode desconhecido 0x%02X em pc=%d", op, pc-1))
 		}
@@ -320,11 +517,9 @@ func run(p *Program) {
 }
 
 func binOp(op byte, a, b Value) Value {
-	// concatenação de string
 	if op == opADD && (a.k == kStr || b.k == kStr) {
 		return vStr(a.String() + b.String())
 	}
-	// comparações de igualdade genéricas
 	if op == opEQ || op == opNE {
 		eq := valueEq(a, b)
 		if op == opNE {
@@ -332,7 +527,6 @@ func binOp(op byte, a, b Value) Value {
 		}
 		return vBool(eq)
 	}
-	// operandos de string em <, >, etc.
 	if a.k == kStr || b.k == kStr {
 		switch op {
 		case opLT:
@@ -345,7 +539,6 @@ func binOp(op byte, a, b Value) Value {
 			return vBool(a.String() >= b.String())
 		}
 	}
-	// float se algum operando for float
 	if a.k == kFloat || b.k == kFloat {
 		x, y := a.asFloat(), b.asFloat()
 		switch op {
@@ -369,7 +562,6 @@ func binOp(op byte, a, b Value) Value {
 			return vBool(x >= y)
 		}
 	}
-	// inteiros
 	x, y := a.i, b.i
 	switch op {
 	case opADD:
