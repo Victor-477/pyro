@@ -1,27 +1,45 @@
-# PYRO — back-end nativo (código de máquina)
+# PYRO — a linguagem-alvo nativa (`.pyro`)
 
-O **PYRO** é a camada "quente": recebe a AST do CRYO e **gera código nativo**,
-falando direto com a máquina. Inclui os geradores de código, o runtime C e a
-camada de máquina (skills nativas de LLM + acesso ao sistema).
+O **Pyro** é a **linguagem-alvo própria** do sistema: um **bytecode binário** com um
+conjunto de instruções (ISA) inventado aqui — **não é** x86, Go nem C. O compilador
+(**Burnout**) gera `.pyro` a partir de `.cryo`, e a **VM Pyro** (em Go) carrega e
+executa esse bytecode na máquina.
+
+```
+  .cryo ──►  Burnout (compilador)  ──►  .pyro (bytecode próprio)  ──►  VM Pyro (Go)  ──►  execução
+```
 
 ## Conteúdo
 
-| Arquivo | Papel |
+| Caminho | Papel |
 |---|---|
-| `codegen_go.py` | Backend **Go** (base atual) — linguagem completa + skills/máquina |
-| `codegen_c.py` | Backend C nativo (+ instrumentação de segurança) |
-| `codegen_asm.py` | Backend x86-64 (ABIs System V e Win64) |
-| `codegen_legacy.py` | Backend Python legado (não usado pela CLI) |
-| `runtime/cryo_runtime.c/.h` | Runtime C compartilhado (backends C/asm) |
-| `PYRO.md` | Explicação da camada Pyro: pipeline, skills e acesso à máquina |
+| `vm/main.go` · `vm/go.mod` | A **VM Pyro** (em Go): carrega, decodifica e executa `.pyro` |
+| `PYRO_BYTECODE.md` | Especificação da ISA e do formato do `.pyro` |
+| `PYRO.md` | Notas de rumo da camada nativa (histórico) |
 
-## Camada de máquina (skills + OS)
+## O que a VM suporta
 
-Skills de LLM são **compiladas no binário** (sem arquivos `.md`), com introspecção
-nativa (`skills()`, `skill_get()`, `skills_json()`), e há builtins de acesso direto
-à máquina (`pyro_exec`, `pyro_env`, `pyro_args`, `pyro_time`, …). Ver [PYRO.md](PYRO.md).
+- Escalares: `int`, `number` (float64), `bool`, `string` (tipagem dinâmica).
+- Aritmética, comparação, bit a bit, lógica (curto-circuito), unários.
+- Variáveis, `if/else`, `while`, `do/while`, `for`, `for-each`, `switch`, ternário,
+  `break`/`continue`.
+- Funções, recursão, chamadas (quadros de pilha próprios).
+- **Containers**: arrays (`[...]`, `push`, indexação, `len`), maps (`{k:v}`, `has`,
+  `keys`, indexação), structs (= map de campos, `s.campo`).
+- Segurança: divisão por zero e `assert` abortam; índices fora dos limites abortam.
+
+## Por que é sua própria linguagem
+
+- **Roda na máquina** via a VM (portável: um binário Go).
+- **Compacta/opaca** ("criptografada") — a seção de código é codificada (XOR rolling).
+- **Nativa do sistema**, ótima como dado de treino para agentes de IA (instruções já
+  na forma que a máquina executa).
+- **Própria** — não derivada de linguagens existentes.
+
+Especificação completa da ISA e do formato em [PYRO_BYTECODE.md](PYRO_BYTECODE.md).
+Desassemblador (`.pyro` → texto legível) no compilador: `--backend pyro --dis`.
 
 ## Dependências
 
-PYRO depende de `ast_nodes.py` do **CRYO** (importado como `from ast_nodes import *`).
-Será distribuído como repositório próprio, consumindo o CRYO como dependência.
+A VM é **autocontida** (só a biblioteca padrão do Go). O `.pyro` que ela executa é
+produzido pelo **Burnout**. Distribuída como repositório próprio (a linguagem-alvo).
