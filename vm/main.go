@@ -574,10 +574,16 @@ func binOp(op byte, a, b Value) Value {
 		if y == 0 {
 			fatal("[Cryo Seguranca] DivisaoPorZero: divisão inteira")
 		}
+		if x == -1<<63 && y == -1 {
+			fatal("[Cryo Seguranca] Overflow: INT64_MIN / -1")
+		}
 		return vInt(x / y)
 	case opMOD:
 		if y == 0 {
 			fatal("[Cryo Seguranca] DivisaoPorZero: módulo")
+		}
+		if x == -1<<63 && y == -1 {
+			return vInt(0) // INT64_MIN % -1 = 0 (bem-definido); só a divisão estoura
 		}
 		return vInt(x % y)
 	case opBAND:
