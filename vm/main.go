@@ -16,6 +16,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 // ── Opcodes (espelham burnout/codegen_pyro.py) ──────────────
@@ -63,6 +64,7 @@ const (
 	opAPPEND  = 0x65
 	opHAS     = 0x66
 	opKEYS    = 0x67
+	opNATIVE  = 0x70 // u8 id, u8 argc — builtin nativo (tabela em native())
 )
 
 // tipos de valor
@@ -510,10 +512,144 @@ func run(p *Program) {
 				out[i] = keyToValue(k)
 			}
 			push(vArr(out))
+		case opNATIVE:
+			nid := int(code[pc])
+			argc := int(code[pc+1])
+			pc += 2
+			base := len(stack) - argc
+			args := make([]Value, argc)
+			copy(args, stack[base:])
+			stack = stack[:base]
+			push(native(nid, args))
 		default:
 			fatal(fmt.Sprintf("opcode desconhecido 0x%02X em pc=%d", op, pc-1))
 		}
 	}
+}
+
+// native executa um builtin da VM (espelha NATIVES em codegen_pyro.py).
+func native(id int, a []Value) Value {
+	switch id {
+	case 0: // sqrt
+		return vFloat(math.Sqrt(a[0].asFloat()))
+	case 1: // pow
+		return vFloat(math.Pow(a[0].asFloat(), a[1].asFloat()))
+	case 2: // abs
+		if a[0].k == kInt {
+			if a[0].i < 0 {
+				return vInt(-a[0].i)
+			}
+			return vInt(a[0].i)
+		}
+		return vFloat(math.Abs(a[0].asFloat()))
+	case 3: // min
+		if a[0].k == kInt && a[1].k == kInt {
+			if a[0].i < a[1].i {
+				return a[0]
+			}
+			return a[1]
+		}
+		return vFloat(math.Min(a[0].asFloat(), a[1].asFloat()))
+	case 4: // max
+		if a[0].k == kInt && a[1].k == kInt {
+			if a[0].i > a[1].i {
+				return a[0]
+			}
+			return a[1]
+		}
+		return vFloat(math.Max(a[0].asFloat(), a[1].asFloat()))
+	case 5: // floor
+		return vFloat(math.Floor(a[0].asFloat()))
+	case 6: // ceil
+		return vFloat(math.Ceil(a[0].asFloat()))
+	case 7: // round
+		return vFloat(math.Round(a[0].asFloat()))
+	case 8: // to_string
+		return vStr(a[0].String())
+	case 9: // to_int
+		switch a[0].k {
+		case kInt:
+			return a[0]
+		case kFloat:
+			return vInt(int64(a[0].f))
+		case kBool:
+			if a[0].b {
+				return vInt(1)
+			}
+			return vInt(0)
+		case kStr:
+			n, err := strconv.ParseInt(strings.TrimSpace(a[0].s), 10, 64)
+			if err != nil {
+				fatal("[Cryo Seguranca] to_int: '" + a[0].s + "' não é um inteiro válido")
+			}
+			return vInt(n)
+		}
+		fatal("to_int: tipo não conversível")
+	case 10: // to_number
+		switch a[0].k {
+		case kFloat:
+			return a[0]
+		case kInt:
+			return vFloat(float64(a[0].i))
+		case kStr:
+			f, err := strconv.ParseFloat(strings.TrimSpace(a[0].s), 64)
+			if err != nil {
+				fatal("[Cryo Seguranca] to_number: '" + a[0].s + "' não é um número válido")
+			}
+			return vFloat(f)
+		}
+		fatal("to_number: tipo não conversível")
+	case 11: // remove(map, key)
+		if a[0].k != kMap {
+			fatal("remove() aplicado a valor que não é map")
+		}
+		delete(a[0].m, keyOf(a[1]))
+		return vNull()
+	case 12: // upper
+		return vStr(strings.ToUpper(a[0].String()))
+	case 13: // lower
+		return vStr(strings.ToLower(a[0].String()))
+	case 14: // trim
+		return vStr(strings.TrimSpace(a[0].String()))
+	case 15: // contains
+		return vBool(strings.Contains(a[0].String(), a[1].String()))
+	case 16: // find -> índice do substring (ou -1)
+		return vInt(int64(strings.Index(a[0].String(), a[1].String())))
+	case 17: // replace(s, velho, novo) — todas as ocorrências
+		return vStr(strings.ReplaceAll(a[0].String(), a[1].String(), a[2].String()))
+	case 18: // substr(s, inicio, n) — recorta com limites seguros
+		s := a[0].String()
+		i, n := a[1].i, a[2].i
+		if i < 0 {
+			i = 0
+		}
+		if i > int64(len(s)) {
+			i = int64(len(s))
+		}
+		end := i + n
+		if n < 0 || end > int64(len(s)) {
+			end = int64(len(s))
+		}
+		return vStr(s[i:end])
+	case 19: // split(s, sep) -> array de strings
+		parts := strings.Split(a[0].String(), a[1].String())
+		out := make([]Value, len(parts))
+		for i, p := range parts {
+			out[i] = vStr(p)
+		}
+		return vArr(out)
+	case 20: // join(arr, sep)
+		if a[0].k != kArray {
+			fatal("join() aplicado a valor que não é array")
+		}
+		parts := make([]string, len(*a[0].arr))
+		for i, v := range *a[0].arr {
+			parts[i] = v.String()
+		}
+		return vStr(strings.Join(parts, a[1].String()))
+	}
+	fatal(fmt.Sprintf("builtin nativo desconhecido: id=%d", id))
+	return vNull()
 }
 
 func binOp(op byte, a, b Value) Value {

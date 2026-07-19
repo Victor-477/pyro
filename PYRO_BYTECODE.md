@@ -54,6 +54,32 @@ Cada instrução = 1 byte de opcode + operandos de tamanho fixo.
 | `PRINT` | 50 | — | imprime `pop()` conforme o tipo |
 | `ASSERT`| 51 | — | `pop cond, msg`; aborta se falso |
 | `PRINTLN` | 52 | — | imprime linha vazia |
+| `NEWARR` | 60 | u16 n | array a partir dos `n` valores do topo |
+| `NEWMAP` | 61 | u16 n | map a partir de `n` pares (chave, valor) |
+| `INDEX`/`SETIDX` | 62/63 | — | leitura/escrita indexada (com bounds-check) |
+| `LEN` | 64 | — | tamanho de string/array/map |
+| `APPEND` | 65 | — | `arr.push(v)`; empilha o novo tamanho |
+| `HAS`/`KEYS` | 66/67 | — | existência de chave / array de chaves |
+| `NATIVE` | 70 | u8 id, u8 argc | chama um builtin nativo da VM (tabela abaixo) |
+
+### Builtins nativos (`NATIVE`)
+
+A instrução `NATIVE` consome `argc` argumentos da pilha e empilha o resultado.
+A tabela de ids é espelhada entre o gerador (`NATIVES` em `codegen_pyro.py`) e
+a VM (`native()` em `vm/main.go`):
+
+| id | nome | id | nome | id | nome |
+|---|---|---|---|---|---|
+| 0 | `sqrt` | 7 | `round` | 14 | `trim` |
+| 1 | `pow` | 8 | `to_string` | 15 | `contains` |
+| 2 | `abs` | 9 | `to_int` | 16 | `find` |
+| 3 | `min` | 10 | `to_number` | 17 | `replace` |
+| 4 | `max` | 11 | `remove` | 18 | `substr` |
+| 5 | `floor` | 12 | `upper` | 19 | `split` |
+| 6 | `ceil` | 13 | `lower` | 20 | `join` |
+
+Enums não geram código: cada membro (`Nivel_ALTO`) vira uma constante inteira
+em tempo de compilação.
 
 Saltos são **relativos** ao fim da própria instrução (`rel = alvo − (pc_após_operando)`).
 
