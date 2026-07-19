@@ -12,6 +12,7 @@ package main
 import (
 	"bufio"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -597,6 +598,67 @@ func run(p *Program) {
 	}
 }
 
+// valueToGo: Value do Pyro -> árvore interface{} p/ json.Marshal.
+func valueToGo(v Value) interface{} {
+	switch v.k {
+	case kInt:
+		return v.i
+	case kFloat:
+		return v.f
+	case kBool:
+		return v.b
+	case kStr:
+		return v.s
+	case kArray:
+		out := make([]interface{}, len(*v.arr))
+		for i, e := range *v.arr {
+			out[i] = valueToGo(e)
+		}
+		return out
+	case kMap:
+		out := make(map[string]interface{}, len(v.m))
+		for k, val := range v.m {
+			out[keyToValue(k).String()] = valueToGo(val)
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+// goToValue: árvore de json.Unmarshal -> Value do Pyro. Números JSON
+// inteiros viram int64 (structs Cryo costumam ter campos int); com parte
+// fracionária, viram float64.
+func goToValue(x interface{}) Value {
+	switch t := x.(type) {
+	case nil:
+		return vNull()
+	case bool:
+		return vBool(t)
+	case float64:
+		if t == math.Trunc(t) && !math.IsInf(t, 0) {
+			return vInt(int64(t))
+		}
+		return vFloat(t)
+	case string:
+		return vStr(t)
+	case []interface{}:
+		out := make([]Value, len(t))
+		for i, e := range t {
+			out[i] = goToValue(e)
+		}
+		return vArr(out)
+	case map[string]interface{}:
+		m := make(map[any]Value, len(t))
+		for k, val := range t {
+			m[any(k)] = goToValue(val)
+		}
+		return vMap(m)
+	default:
+		return vNull()
+	}
+}
+
 // native executa um builtin da VM (espelha NATIVES em codegen_pyro.py).
 func native(id int, a []Value) Value {
 	switch id {
@@ -721,6 +783,18 @@ func native(id int, a []Value) Value {
 		fmt.Print(a[0].String())
 		line, _ := stdin.ReadString('\n')
 		return vStr(strings.TrimRight(line, "\r\n"))
+	case 22: // json_encode(v) -> string JSON
+		b, err := json.Marshal(valueToGo(a[0]))
+		if err != nil {
+			fatal("json_encode: " + err.Error())
+		}
+		return vStr(string(b))
+	case 23: // json_decode(s) -> valor dinâmico (map/array/escalar)
+		var raw interface{}
+		if err := json.Unmarshal([]byte(a[0].String()), &raw); err != nil {
+			fatal("[Cryo] json_decode: JSON inválido: " + err.Error())
+		}
+		return goToValue(raw)
 	}
 	fatal(fmt.Sprintf("builtin nativo desconhecido: id=%d", id))
 	return vNull()
