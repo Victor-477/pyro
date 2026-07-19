@@ -94,6 +94,9 @@ a VM (`native()` em `vm/main.go`):
 | | | | | 21 | `input` |
 | | | | | 22 | `json_encode` |
 | | | | | 23 | `json_decode` |
+| | | | | 24 | `http_get` |
+| | | | | 25 | `http_post` |
+| | | | | 26 | `sleep` |
 
 Enums não geram código: cada membro (`Nivel_ALTO`) vira uma constante inteira
 em tempo de compilação.

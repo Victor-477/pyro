@@ -14,12 +14,18 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// cliente HTTP com timeout, compartilhado pelos natives de rede
+var httpClient = &http.Client{Timeout: 15 * time.Second}
 
 var stdin = bufio.NewReader(os.Stdin)
 
@@ -735,6 +741,28 @@ func goToValue(x interface{}) Value {
 	}
 }
 
+// httpGet: GET simples; devolve o corpo, ou "" em caso de erro (como no go).
+func httpGet(url string) string {
+	resp, err := httpClient.Get(url)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return string(b)
+}
+
+// httpPost: POST com corpo (content-type application/json), como no backend go.
+func httpPost(url, body string) string {
+	resp, err := httpClient.Post(url, "application/json", strings.NewReader(body))
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return string(b)
+}
+
 // native executa um builtin da VM (espelha NATIVES em codegen_pyro.py).
 func native(id int, a []Value) Value {
 	switch id {
@@ -871,6 +899,19 @@ func native(id int, a []Value) Value {
 			fatal("[Cryo] json_decode: JSON inválido: " + err.Error())
 		}
 		return goToValue(raw)
+	case 24: // http_get(url) -> corpo (string); "" em caso de erro
+		return vStr(httpGet(a[0].String()))
+	case 25: // http_post(url, body) -> corpo da resposta (string)
+		return vStr(httpPost(a[0].String(), a[1].String()))
+	case 26: // sleep(ms) -> pausa; devolve null
+		ms := a[0].i
+		if a[0].k == kFloat {
+			ms = int64(a[0].f)
+		}
+		if ms > 0 {
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+		}
+		return vNull()
 	}
 	fatal(fmt.Sprintf("builtin nativo desconhecido: id=%d", id))
 	return vNull()
