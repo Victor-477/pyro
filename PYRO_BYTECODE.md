@@ -61,6 +61,11 @@ Cada instrução = 1 byte de opcode + operandos de tamanho fixo.
 | `APPEND` | 65 | — | `arr.push(v)`; empilha o novo tamanho |
 | `HAS`/`KEYS` | 66/67 | — | existência de chave / array de chaves |
 | `NATIVE` | 70 | u8 id, u8 argc | chama um builtin nativo da VM (tabela abaixo) |
+| `TRYPUSH` | 71 | i16 rel, u16 slot | instala handler de exceção (catch em `rel`; `slot`=var, 0xFFFF=nenhuma) |
+| `TRYPOP` | 72 | — | remove o handler do topo (try concluído sem exceção) |
+| `THROW` | 73 | — | `pop` valor; desenrola pilha/quadros até o handler mais próximo |
+| `COALESCE` | 74 | — | `pop b, a` → `a` se `a != null`, senão `b` (operador `??`) |
+| `UNWRAP` | 75 | — | `pop a` → `a` se `a != null`, senão aborta (unwrap `x!`) |
 
 ### Builtins nativos (`NATIVE`)
 
@@ -77,6 +82,7 @@ a VM (`native()` em `vm/main.go`):
 | 4 | `max` | 11 | `remove` | 18 | `substr` |
 | 5 | `floor` | 12 | `upper` | 19 | `split` |
 | 6 | `ceil` | 13 | `lower` | 20 | `join` |
+| | | | | 21 | `input` |
 
 Enums não geram código: cada membro (`Nivel_ALTO`) vira uma constante inteira
 em tempo de compilação.

@@ -10,6 +10,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -18,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 )
+
+var stdin = bufio.NewReader(os.Stdin)
 
 // ── Opcodes (espelham burnout/codegen_pyro.py) ──────────────
 const (
@@ -64,8 +67,15 @@ const (
 	opAPPEND  = 0x65
 	opHAS     = 0x66
 	opKEYS    = 0x67
-	opNATIVE  = 0x70 // u8 id, u8 argc — builtin nativo (tabela em native())
+	opNATIVE   = 0x70 // u8 id, u8 argc — builtin nativo (tabela em native())
+	opTRYPUSH  = 0x71 // i16 rel (catch), u16 slot (var do catch; 0xFFFF = nenhuma)
+	opTRYPOP   = 0x72 // remove o handler de exceção do topo
+	opTHROW    = 0x73 // pop valor -> desenrola até o handler mais próximo
+	opCOALESCE = 0x74 // pop b, a -> a se a != null, senão b  (??)
+	opUNWRAP   = 0x75 // pop a -> a se a != null, senão aborta (x!)
 )
+
+const noSlot = 0xFFFF
 
 // tipos de valor
 const (
@@ -374,8 +384,35 @@ func run(p *Program) {
 	frames := []frame{{retpc: -1, locals: make([]Value, main.nlocals)}}
 	pc := int(main.entry)
 
+	// pilha de handlers de exceção (try/catch)
+	type handler struct {
+		catchPC int
+		sp      int // profundidade da pilha de operandos ao entrar no try
+		fp      int // profundidade da pilha de quadros
+		slot    int // slot da variável de catch (noSlot = nenhuma)
+	}
+	var handlers []handler
+
 	rd16 := func() int { v := int(binary.LittleEndian.Uint16(code[pc:])); pc += 2; return v }
 	rdi16 := func() int { v := int(int16(binary.LittleEndian.Uint16(code[pc:]))); pc += 2; return v }
+
+	// raise: desenrola até o handler mais próximo; devolve false se não há.
+	raise := func(v Value) bool {
+		if len(handlers) == 0 {
+			return false
+		}
+		h := handlers[len(handlers)-1]
+		handlers = handlers[:len(handlers)-1]
+		if h.sp <= len(stack) {
+			stack = stack[:h.sp]
+		}
+		frames = frames[:h.fp]
+		if h.slot != noSlot {
+			frames[len(frames)-1].locals[h.slot] = v
+		}
+		pc = h.catchPC
+		return true
+	}
 
 	for {
 		op := code[pc]
@@ -455,7 +492,40 @@ func run(p *Program) {
 			cond := pop()
 			msg := pop()
 			if !cond.truthy() {
-				fatal("[Cryo Assert] " + msg.String())
+				if !raise(vStr("[Cryo Assert] " + msg.String())) {
+					fatal("[Cryo Assert] " + msg.String())
+				}
+			}
+		case opTRYPUSH:
+			rel := rdi16()
+			slot := rd16()
+			handlers = append(handlers, handler{
+				catchPC: pc + rel, sp: len(stack), fp: len(frames), slot: slot})
+		case opTRYPOP:
+			if len(handlers) > 0 {
+				handlers = handlers[:len(handlers)-1]
+			}
+		case opTHROW:
+			v := pop()
+			if !raise(v) {
+				fatal("exceção não capturada: " + v.String())
+			}
+		case opCOALESCE:
+			b := pop()
+			a := pop()
+			if a.k == kNull {
+				push(b)
+			} else {
+				push(a)
+			}
+		case opUNWRAP:
+			a := pop()
+			if a.k == kNull {
+				if !raise(vStr("[Cryo Seguranca] unwrap de valor nulo")) {
+					fatal("[Cryo Seguranca] unwrap de valor nulo")
+				}
+			} else {
+				push(a)
 			}
 		case opNEWARR:
 			n := rd16()
@@ -647,6 +717,10 @@ func native(id int, a []Value) Value {
 			parts[i] = v.String()
 		}
 		return vStr(strings.Join(parts, a[1].String()))
+	case 21: // input(prompt) -> lê uma linha do stdin
+		fmt.Print(a[0].String())
+		line, _ := stdin.ReadString('\n')
+		return vStr(strings.TrimRight(line, "\r\n"))
 	}
 	fatal(fmt.Sprintf("builtin nativo desconhecido: id=%d", id))
 	return vNull()
