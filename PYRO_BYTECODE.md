@@ -11,8 +11,9 @@ próprios de variáveis locais).
 
 ```
 magic     4    "PYRO"
-version   1    0x01
+version   1    0x02
 flags     1    bit0 = seção de código codificada (XOR rolling)
+               bit1 = seção de depuração presente (pc → linha)
 nconsts   u16
 consts    nconsts × [ tag(1) + payload ]
               tag 1 int64   → 8 bytes
@@ -24,7 +25,15 @@ funcs     nfuncs × [ nameidx u16, entry u32, nparams u8, nlocals u16 ]
 entryfn   u16    índice da função 'main'
 codelen   u32
 code      codelen bytes   (decodificados na carga se flags bit0)
+ndebug    u32            (só se flags bit1)
+debug     ndebug × [ pc u32, line u32 ]   tabela pc → linha-fonte
 ```
+
+> **v2** (a partir da Fase 5): os saltos (`JMP`/`JMPF`/`JMPT` e o `rel` do
+> `TRYPUSH`) passaram de `i16` para **`i32`** — sem o limite de ±32 KB de
+> código por função. E há a **seção de depuração** opcional: uma tabela
+> `pc → linha`, que a VM usa para imprimir *stack traces* legíveis
+> (função + linha de cada quadro ativo) ao abortar.
 
 Constantes são deduplicadas. O `nameidx` de cada função referencia uma string no
 pool. As strings do pool ficam em claro; **apenas a seção `code` é codificada**.

@@ -226,20 +226,79 @@ type Func struct {
 	nlocals int
 }
 
+type dbgEntry struct {
+	pc   int
+	line int
+}
+
 type Program struct {
 	consts  []Value
 	funcs   []Func
 	entryFn int
 	code    []byte
+	dbg     []dbgEntry // pc -> linha (ordenado por pc); vazio se sem depuração
 }
 
 type frame struct {
 	retpc  int
 	locals []Value
+	fn     int // índice da função (para stack trace)
+}
+
+// ── estado de depuração (para stack traces em fatal) ────────
+var (
+	dbgLines  []dbgEntry
+	dbgFuncs  []Func
+	dbgFrames *[]frame
+	dbgPC     *int
+)
+
+// lineAt: maior entrada com pc <= alvo (busca binária).
+func lineAt(pc int) int {
+	lo, hi, ans := 0, len(dbgLines)-1, 0
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		if dbgLines[mid].pc <= pc {
+			ans = dbgLines[mid].line
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	return ans
+}
+
+// stackTrace: pilha de chamadas ativas com nome da função e linha.
+func stackTrace() string {
+	if len(dbgLines) == 0 || dbgFrames == nil || dbgPC == nil {
+		return ""
+	}
+	fr := *dbgFrames
+	var b strings.Builder
+	b.WriteString("  stack trace (mais recente primeiro):\n")
+	for i := len(fr) - 1; i >= 0; i-- {
+		// onde este quadro está pausado: o topo está no pc atual; os
+		// demais, no endereço de retorno do quadro que eles chamaram.
+		var at int
+		if i == len(fr)-1 {
+			at = *dbgPC
+		} else {
+			at = fr[i+1].retpc
+		}
+		name := "?"
+		if fr[i].fn >= 0 && fr[i].fn < len(dbgFuncs) {
+			name = dbgFuncs[fr[i].fn].name
+		}
+		fmt.Fprintf(&b, "    em %s (linha %d)\n", name, lineAt(at))
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func fatal(msg string) {
 	fmt.Fprintln(os.Stderr, "[Pyro VM] "+msg)
+	if tr := stackTrace(); tr != "" {
+		fmt.Fprintln(os.Stderr, tr)
+	}
 	os.Exit(1)
 }
 
@@ -249,8 +308,8 @@ func load(data []byte) *Program {
 	if len(data) < 6 || string(data[0:4]) != "PYRO" {
 		fatal("arquivo .pyro inválido (magic)")
 	}
-	if data[4] != 1 {
-		fatal("versão de .pyro não suportada")
+	if data[4] != 2 {
+		fatal("versão de .pyro não suportada (esperada v2)")
 	}
 	flags := data[5]
 	p := &Program{}
@@ -295,10 +354,21 @@ func load(data []byte) *Program {
 	codelen := int(rd32())
 	code := make([]byte, codelen)
 	copy(code, data[pos:pos+codelen])
+	pos += codelen
 	if flags&0x01 != 0 {
 		xorDecode(code)
 	}
 	p.code = code
+	// seção de depuração (pc -> linha), se presente
+	if flags&0x02 != 0 {
+		ndbg := int(rd32())
+		p.dbg = make([]dbgEntry, ndbg)
+		for i := 0; i < ndbg; i++ {
+			pc := int(rd32())
+			line := int(rd32())
+			p.dbg[i] = dbgEntry{pc: pc, line: line}
+		}
+	}
 	return p
 }
 
@@ -382,8 +452,14 @@ func run(p *Program) {
 	}
 
 	main := p.funcs[p.entryFn]
-	frames := []frame{{retpc: -1, locals: make([]Value, main.nlocals)}}
+	frames := []frame{{retpc: -1, locals: make([]Value, main.nlocals), fn: p.entryFn}}
 	pc := int(main.entry)
+
+	// estado de depuração acessível pelo fatal() (stack trace)
+	dbgLines = p.dbg
+	dbgFuncs = p.funcs
+	dbgFrames = &frames
+	dbgPC = &pc
 
 	// pilha de handlers de exceção (try/catch)
 	type handler struct {
@@ -395,7 +471,7 @@ func run(p *Program) {
 	var handlers []handler
 
 	rd16 := func() int { v := int(binary.LittleEndian.Uint16(code[pc:])); pc += 2; return v }
-	rdi16 := func() int { v := int(int16(binary.LittleEndian.Uint16(code[pc:]))); pc += 2; return v }
+	rdi32 := func() int { v := int(int32(binary.LittleEndian.Uint32(code[pc:]))); pc += 4; return v }
 
 	// raise: desenrola até o handler mais próximo; devolve false se não há.
 	raise := func(v Value) bool {
@@ -453,15 +529,15 @@ func run(p *Program) {
 		case opNOT:
 			push(vBool(!pop().truthy()))
 		case opJMP:
-			rel := rdi16()
+			rel := rdi32()
 			pc += rel
 		case opJMPF:
-			rel := rdi16()
+			rel := rdi32()
 			if !pop().truthy() {
 				pc += rel
 			}
 		case opJMPT:
-			rel := rdi16()
+			rel := rdi32()
 			if pop().truthy() {
 				pc += rel
 			}
@@ -474,7 +550,7 @@ func run(p *Program) {
 			base := len(stack) - argc
 			copy(locals, stack[base:])
 			stack = stack[:base]
-			frames = append(frames, frame{retpc: pc, locals: locals})
+			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi})
 			pc = int(fn.entry)
 		case opRET:
 			ret := pop()
@@ -498,7 +574,7 @@ func run(p *Program) {
 				}
 			}
 		case opTRYPUSH:
-			rel := rdi16()
+			rel := rdi32()
 			slot := rd16()
 			handlers = append(handlers, handler{
 				catchPC: pc + rel, sp: len(stack), fp: len(frames), slot: slot})
