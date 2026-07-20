@@ -365,6 +365,12 @@ func load(data []byte) *Program {
 		xorDecode(code)
 	}
 	p.code = code
+	// política de sandbox gravada no artefato (bit2): a VM recusa
+	// natives de rede/máquina. Também pode ser ligada em runtime
+	// por PYRO_SANDBOX=1 (nunca desliga o que o artefato exigiu).
+	if flags&0x04 != 0 {
+		sandboxed = true
+	}
 	// seção de depuração (pc -> linha), se presente
 	if flags&0x02 != 0 {
 		ndbg := int(rd32())
@@ -764,6 +770,11 @@ func httpPost(url, body string) string {
 }
 
 // native executa um builtin da VM (espelha NATIVES em codegen_pyro.py).
+// sandboxed: quando true, a VM recusa natives de rede/máquina.
+// Ligado pela flag bit2 do .pyro (--sandbox no compilador) ou por
+// PYRO_SANDBOX=1 no ambiente (política de runtime sobre artefatos).
+var sandboxed bool
+
 func native(id int, a []Value) Value {
 	switch id {
 	case 0: // sqrt
@@ -900,8 +911,14 @@ func native(id int, a []Value) Value {
 		}
 		return goToValue(raw)
 	case 24: // http_get(url) -> corpo (string); "" em caso de erro
+		if sandboxed {
+			fatal("[Cryo Seguranca] Sandbox: http_get() bloqueado por política de sandbox")
+		}
 		return vStr(httpGet(a[0].String()))
 	case 25: // http_post(url, body) -> corpo da resposta (string)
+		if sandboxed {
+			fatal("[Cryo Seguranca] Sandbox: http_post() bloqueado por política de sandbox")
+		}
 		return vStr(httpPost(a[0].String(), a[1].String()))
 	case 26: // sleep(ms) -> pausa; devolve null
 		ms := a[0].i
@@ -1030,6 +1047,9 @@ func main() {
 	data, err := os.ReadFile(os.Args[1])
 	if err != nil {
 		fatal("não foi possível ler: " + err.Error())
+	}
+	if os.Getenv("PYRO_SANDBOX") == "1" {
+		sandboxed = true
 	}
 	run(load(data))
 }
