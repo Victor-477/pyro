@@ -1,2 +1,16 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Reconhecimento de linguagem no GitHub (Linguist).
+#
+# Cryo é uma linguagem própria (não conhecida pelo Linguist); a extensão .cryo
+# é mapeada para uma linguagem próxima (Rust) só para realce/contagem.
+*.cryo linguist-language=Rust
+*.cryo linguist-detectable=true
+
+# .pyro: bytecode binário do Pyro — não indexar como texto/código.
+*.pyro binary
+
+# .pyasm: disassembly do bytecode Pyro (texto) — realçar como Assembly.
+*.pyasm linguist-language=Assembly
+*.pyasm linguist-detectable=true
+
+# A VM em C (main.c / pyro_runtime.c) e a VM em Go (main.go) já são
+# reconhecidas nativamente pelo Linguist.
