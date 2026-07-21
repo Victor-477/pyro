@@ -456,11 +456,10 @@ void rc_array_push(RcArray* a, Value v) {
 
 Value rc_array_get(RcArray* a, int64_t idx) {
     if (idx < 0 || idx >= a->length) {
+        // paridade com a VM Go: fail-fast (não capturável), mesma mensagem
         char err[128];
-        sprintf(err, "[Cryo Seguranca] IndiceForaDosLimites: array length %lld, index %lld", (long long)a->length, (long long)idx);
-        if (!raise_exception(val_str(err, strlen(err)))) {
-            fatal(err);
-        }
+        sprintf(err, "[Cryo Seguranca] IndexError: índice %lld fora dos limites (len=%lld)", (long long)idx, (long long)a->length);
+        fatal(err);
         return val_null();
     }
     return a->data[idx];
@@ -469,10 +468,8 @@ Value rc_array_get(RcArray* a, int64_t idx) {
 void rc_array_set(RcArray* a, int64_t idx, Value v) {
     if (idx < 0 || idx >= a->length) {
         char err[128];
-        sprintf(err, "[Cryo Seguranca] IndiceForaDosLimites: array length %lld, index %lld", (long long)a->length, (long long)idx);
-        if (!raise_exception(val_str(err, strlen(err)))) {
-            fatal(err);
-        }
+        sprintf(err, "[Cryo Seguranca] IndexError: índice %lld fora dos limites", (long long)idx);
+        fatal(err);
         return;
     }
     release_value(a->data[idx]);
@@ -655,17 +652,14 @@ Value index_get(Value cont, Value key) {
     if (cont.kind == VAL_STR) {
         int64_t idx = key.as.i;
         if (idx < 0 || idx >= cont.as.str->length) {
-            char err[128];
-            sprintf(err, "[Cryo Seguranca] IndiceForaDosLimites: string length %lld, index %lld", (long long)cont.as.str->length, (long long)idx);
-            if (!raise_exception(val_str(err, strlen(err)))) {
-                fatal(err);
-            }
+            // paridade com a VM Go: fail-fast, mesma mensagem
+            fatal("[Cryo Seguranca] IndexError: índice de string fora dos limites");
             return val_null();
         }
         char ch = cont.as.str->chars[idx];
         return val_str(&ch, 1);
     }
-    fatal("indexação em tipo inválido");
+    fatal("indexação de valor não indexável");
     return val_null();
 }
 
@@ -679,7 +673,7 @@ void index_set(Value cont, Value key, Value val) {
         rc_map_set(cont.as.map, key, val);
         return;
     }
-    fatal("atribuição indexada em tipo inválido");
+    fatal("atribuição indexada em valor não indexável");
 }
 
 // ── Bytecode Reader Helpers ──────────────────────────────────
@@ -1102,9 +1096,7 @@ Value native(int id, Value* a, int argc) {
                         if (*end != '\0' || end == s) {
                             char err[1024];
                             sprintf(err, "[Cryo Seguranca] to_int: '%s' não é um inteiro válido", a[0].as.str->chars);
-                            if (!raise_exception(val_str(err, strlen(err)))) {
-                                fatal(err);
-                            }
+                            fatal(err);   // paridade Go: fail-fast (não capturável)
                             return val_null();
                         }
                         return val_int(val);
@@ -1127,9 +1119,7 @@ Value native(int id, Value* a, int argc) {
                         if (*end != '\0' || end == s) {
                             char err[1024];
                             sprintf(err, "[Cryo Seguranca] to_number: '%s' não é um número válido", a[0].as.str->chars);
-                            if (!raise_exception(val_str(err, strlen(err)))) {
-                                fatal(err);
-                            }
+                            fatal(err);   // paridade Go: fail-fast (não capturável)
                             return val_null();
                         }
                         return val_float(val);
@@ -1484,17 +1474,20 @@ int get_line_number(uint32_t target_pc, Program* program) {
 }
 
 void print_stack_trace(Program* program) {
-    fprintf(stderr, "Stack trace:\n");
+    // paridade com a VM Go: sem seção de depuração -> sem stack trace.
+    if (!program->dbg || program->ndebug == 0) return;
+    fprintf(stderr, "  stack trace (mais recente primeiro):\n");
     for (int i = fp - 1; i >= 0; i--) {
         Frame fr = frames[i];
-        FuncInfo fn = program->funcs[fr.fn];
+        const char* name = (fr.fn >= 0 && fr.fn < (int)program->nfuncs)
+                           ? program->funcs[fr.fn].name : "?";
         int line = get_line_number(i == fp - 1 ? (uint32_t)pc : (uint32_t)fr.retpc, program);
-        fprintf(stderr, "  em %s() na linha %d\n", fn.name, line);
+        fprintf(stderr, "    em %s (linha %d)\n", name, line);
     }
 }
 
 void fatal(const char* msg) {
-    fprintf(stderr, "Erro fatal: %s\n", msg);
+    fprintf(stderr, "[Pyro VM] %s\n", msg);
     if (current_program) {
         print_stack_trace(current_program);
     }
@@ -1890,7 +1883,7 @@ void run_program(Program* p) {
                 {
                     Value mp = stack[sp - 1];
                     if (mp.kind != VAL_MAP) {
-                        fatal("keys() applied to non-map");
+                        fatal("keys() aplicado a valor que não é map");
                     }
                     RcArray* keys_arr = rc_array_new();
                     int64_t count = 0;
@@ -1944,7 +1937,7 @@ void run_program(Program* p) {
                     if (!raise_exception(v)) {
                         char* s = value_to_string(v);
                         char err[1024];
-                        sprintf(err, "unhandled exception: %s", s);
+                        sprintf(err, "exceção não capturada: %s", s);
                         free(s);
                         fatal(err);
                     }
@@ -1967,20 +1960,17 @@ void run_program(Program* p) {
                 {
                     Value a = stack[sp - 1];
                     if (a.kind == VAL_NULL) {
-                        Value err_msg = val_str("[Cryo Seguranca] unwrap of null value", 36);
+                        const char* um = "[Cryo Seguranca] unwrap de valor nulo";
+                        Value err_msg = val_str(um, (int64_t)strlen(um));
                         if (!raise_exception(err_msg)) {
-                            fatal("[Cryo Seguranca] unwrap of null value");
+                            fatal(um);
                         }
                         sp--;
                     }
                 }
                 break;
             default:
-                {
-                    char err[128];
-                    sprintf(err, "unknown opcode 0x%02X at pc=%d", op, pc-1);
-                    fatal(err);
-                }
+                fatal("operador inválido no bytecode");
         }
     }
 }
