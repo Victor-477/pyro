@@ -1,9 +1,9 @@
 // ============================================================
-//  Pyro VM — motor de execução (.pyro)
+//  Pyro VM — execution engine (.pyro)
 //
-//  Carrega/decodifica o bytecode e roda a máquina de pilha.
-//  O runtime (valores, containers, natives) vive em pyro_runtime.c;
-//  este arquivo depende apenas de pyro_runtime.h. (Fase 9.2)
+//  Loads/decodes the bytecode and runs the stack machine.
+//  The runtime (values, containers, natives) lives in pyro_runtime.c;
+//  this file depends only on pyro_runtime.h. (Phase 9.2)
 // ============================================================
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,7 +52,7 @@ typedef struct {
     int slot;
 } Handler;
 
-// ── Estado global da VM (para stack traces e aborto) ────────
+// ── Global VM State (for stack traces and abort) ────────
 static Program* current_program = NULL;
 static Frame frames[4096];
 static int fp = 0;
@@ -78,7 +78,7 @@ int get_line_number(uint32_t target_pc, Program* program) {
 }
 
 void print_stack_trace(Program* program) {
-    // paridade com a VM Go: sem seção de depuração -> sem stack trace.
+    // parity with the Go VM: no debug section -> no stack trace.
     if (!program->dbg || program->ndebug == 0) return;
     fprintf(stderr, "  stack trace (most recent first):\n");
     for (int i = fp - 1; i >= 0; i--) {
@@ -580,7 +580,7 @@ int main(int argc, char* argv[]) {
     
     uint8_t* data = malloc(size);
     if (fread(data, 1, size, f) != size) {
-        fprintf(stderr, "Erro fatal: erro na leitura do arquivo\n");
+        fprintf(stderr, "Fatal error: error reading file\n");
         fclose(f);
         free(data);
         return 1;

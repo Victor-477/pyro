@@ -1,8 +1,8 @@
 // ============================================================
-//  Pyro Runtime — implementação (Fase 9.2)
-//  Modelo de valores, refcount, containers, conversões, I/O e
-//  builtins NATIVE. Depende do host apenas por fatal()/pyro_sandboxed.
-//  Semântica especificada em PYRO_RUNTIME.md.
+//  Pyro Runtime — implementation (Phase 9.2)
+//  Value model, refcount, containers, conversions, I/O and
+//  NATIVE builtins. Depends on host only for fatal()/pyro_sandboxed.
+//  Semantics specified in PYRO_RUNTIME.md.
 // ============================================================
 #include "pyro_runtime.h"
 #include <stdio.h>
@@ -23,7 +23,7 @@
 #define sleep_ms(ms) usleep((ms) * 1000)
 #endif
 
-// política de sandbox: definida aqui, ligada pelo host (motor).
+// sandbox policy: defined here, linked by the host (engine).
 bool pyro_sandboxed = false;
 
 Value val_int(int64_t i) {
@@ -281,7 +281,7 @@ void rc_array_push(RcArray* a, Value v) {
 
 Value rc_array_get(RcArray* a, int64_t idx) {
     if (idx < 0 || idx >= a->length) {
-        // paridade com a VM Go: fail-fast (não capturável), mesma mensagem
+        // parity with the Go VM: fail-fast (uncatchable), same message
         char err[128];
         sprintf(err, "[Cryo Security] IndexError: index %lld out of bounds (len=%lld)", (long long)idx, (long long)a->length);
         fatal(err);
@@ -477,7 +477,7 @@ Value index_get(Value cont, Value key) {
     if (cont.kind == VAL_STR) {
         int64_t idx = key.as.i;
         if (idx < 0 || idx >= cont.as.str->length) {
-            // paridade com a VM Go: fail-fast, mesma mensagem
+            // parity with the Go VM: fail-fast, same message
             fatal("[Cryo Security] IndexError: string index out of bounds");
             return val_null();
         }
@@ -921,7 +921,7 @@ Value native(int id, Value* a, int argc) {
                         if (*end != '\0' || end == s) {
                             char err[1024];
                             sprintf(err, "[Cryo Security] to_int: '%s' is not a valid integer", a[0].as.str->chars);
-                            fatal(err);   // paridade Go: fail-fast (não capturável)
+                            fatal(err);   // parity with the Go VM: fail-fast (uncatchable)
                             return val_null();
                         }
                         return val_int(val);
@@ -944,7 +944,7 @@ Value native(int id, Value* a, int argc) {
                         if (*end != '\0' || end == s) {
                             char err[1024];
                             sprintf(err, "[Cryo Security] to_number: '%s' is not a valid number", a[0].as.str->chars);
-                            fatal(err);   // paridade Go: fail-fast (não capturável)
+                            fatal(err);   // parity with the Go VM: fail-fast (uncatchable)
                             return val_null();
                         }
                         return val_float(val);
@@ -1137,7 +1137,7 @@ Value native(int id, Value* a, int argc) {
                 if (ms > 0) sleep_ms(ms);
                 return val_null();
             }
-        case 27: // write_bytes(path, int[]) -> bool: grava os bytes num arquivo
+        case 27: // write_bytes(path, int[]) -> bool: writes bytes to a file
             {
                 if (pyro_sandboxed) {
                     fatal("[Cryo Security] Sandbox: write_bytes() blocked by sandbox policy");
@@ -1304,8 +1304,8 @@ Value str_concat(Value a, Value b) {
 }
 
 
-// keys() da VM: array com as chaves do map, ordenadas por sua forma textual
-// (determinístico, paridade com a VM Go). Encapsula MapPair/compare_map_pairs.
+// VM keys(): array with map keys, sorted by their textual representation
+// (deterministic, Go VM parity). Encapsulates MapPair/compare_map_pairs.
 RcArray* rc_map_keys_sorted(RcMap* m) {
     RcArray* keys_arr = rc_array_new();
     int64_t count = 0;

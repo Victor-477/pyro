@@ -1,16 +1,16 @@
 // ============================================================
-//  Pyro Runtime — contrato de runtime compartilhado da VM Pyro
+//  Pyro Runtime — shared runtime contract for the Pyro VM
 //
-//  Isola o "runtime mínimo" do motor de execução (Fase 9.2):
-//  modelo de valores, contagem de referências (retain/release),
-//  strings/arrays/maps, conversões, I/O e os builtins NATIVE.
-//  O motor (main.c) — e futuros alvos — dependem SÓ desta API,
-//  garantindo semântica idêntica. A especificação em prosa está
-//  em PYRO_RUNTIME.md.
+//  Isolates the "minimum runtime" of the execution engine (Phase 9.2):
+//  value model, reference counting (retain/release),
+//  strings/arrays/maps, conversions, I/O, and NATIVE builtins.
+//  The engine (main.c) — and future targets — depend ONLY on this API,
+//  ensuring identical semantics. The prose specification is in
+//  PYRO_RUNTIME.md.
 //
-//  Fronteira com o host (motor):
-//    - void fatal(const char*)  : aborta com mensagem + stack trace
-//    - bool pyro_sandboxed       : política; o runtime recusa rede se true
+//  Boundary with the host (engine):
+//    - void fatal(const char*)  : aborts with message + stack trace
+//    - bool pyro_sandboxed       : policy; the runtime refuses network if true
 // ============================================================
 #ifndef PYRO_RUNTIME_H
 #define PYRO_RUNTIME_H
@@ -133,12 +133,12 @@ struct RcMap {
     int64_t capacity;
 };
 
-// ── fronteira com o host ─────────────────────────────────────
-void fatal(const char* msg);      // aborto fail-fast (definido no motor)
-extern bool pyro_sandboxed;       // política de sandbox (rede desligada)
+// ── boundary with the host ─────────────────────────────────────
+void fatal(const char* msg);      // fail-fast abort (defined in the engine)
+extern bool pyro_sandboxed;       // sandbox policy (network disabled)
 
-// ── API do runtime ───────────────────────────────────────────
-// criadores de Value
+// ── runtime API ───────────────────────────────────────────
+// Value creators
 Value val_int(int64_t i);
 Value val_float(double f);
 Value val_bool(bool b);
@@ -148,7 +148,7 @@ Value val_str(const char* chars, int64_t len);
 Value val_str_rc(RcString* s);
 Value val_array(RcArray* arr);
 Value val_map(RcMap* map);
-// contagem de referências
+// reference counting
 void retain_value(Value v);
 void release_value(Value v);
 uint32_t hash_value(Value v);
@@ -164,23 +164,23 @@ RcArray* rc_array_new(void);
 void rc_array_push(RcArray* a, Value v);
 Value rc_array_get(RcArray* a, int64_t idx);
 void rc_array_set(RcArray* a, int64_t idx, Value v);
-RcArray* rc_map_keys_sorted(RcMap* m);   // keys() ordenadas (paridade Go)
-// conversões / consultas
+RcArray* rc_map_keys_sorted(RcMap* m);   // sorted keys() (Go parity)
+// conversions / queries
 char* value_to_string(Value v);
 bool value_eq(Value a, Value b);
 bool value_truthy(Value v);
 double value_as_float(Value v);
 int64_t value_length(Value v);
-// indexação, aritmética e concatenação
+// indexing, arithmetic and concatenation
 Value index_get(Value cont, Value key);
 void index_set(Value cont, Value key, Value val);
 Value bin_op(uint8_t op, Value a, Value b);
 Value str_concat(Value a, Value b);
 RcArray* split_str(const char* s, const char* sep);
 RcString* join_arr(RcArray* arr, const char* sep);
-// builtins nativos (ids 0..26; ver NATIVES no gerador e PYRO_RUNTIME.md)
+// native builtins (ids 0..26; see NATIVES in the generator and PYRO_RUNTIME.md)
 Value native(int id, Value* a, int argc);
-// leitura do bytecode (little-endian) + decodificação da seção de código
+// bytecode reading (little-endian) + code section decoding
 uint16_t read_u16(const uint8_t* data, int* pos);
 uint32_t read_u32(const uint8_t* data, int* pos);
 uint64_t read_u64(const uint8_t* data, int* pos);

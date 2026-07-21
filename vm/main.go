@@ -1,11 +1,11 @@
 // ============================================================
-//  Pyro VM — executa a linguagem-alvo própria .pyro (bytecode)
+//  Pyro VM — executes the custom target language .pyro (bytecode)
 //
-//  O .pyro NÃO é Go/C/asm: é o bytecode próprio do Pyro, com um
-//  conjunto de instruções (ISA) inventado no projeto. Esta VM,
-//  baseada em pilha, carrega o arquivo e o executa na máquina.
+//  The .pyro is NOT Go/C/asm: it is Pyro's custom bytecode, with an
+//  instruction set (ISA) invented in the project. This VM,
+//  stack-based, loads the file and executes it on the machine.
 //
-//  Uso:  pyrovm programa.pyro
+//  Usage: pyrovm program.pyro
 // ============================================================
 package main
 
@@ -24,12 +24,12 @@ import (
 	"time"
 )
 
-// cliente HTTP com timeout, compartilhado pelos natives de rede
+// HTTP client with timeout, shared by network natives
 var httpClient = &http.Client{Timeout: 15 * time.Second}
 
 var stdin = bufio.NewReader(os.Stdin)
 
-// ── Opcodes (espelham burnout/codegen_pyro.py) ──────────────
+// ── Opcodes (mirrors burnout/codegen_pyro.py) ──────────────
 const (
 	opHALT    = 0x00
 	opCONST   = 0x01
@@ -74,25 +74,25 @@ const (
 	opAPPEND  = 0x65
 	opHAS     = 0x66
 	opKEYS    = 0x67
-	opNATIVE   = 0x70 // u8 id, u8 argc — builtin nativo (tabela em native())
-	opTRYPUSH  = 0x71 // i16 rel (catch), u16 slot (var do catch; 0xFFFF = nenhuma)
-	opTRYPOP   = 0x72 // remove o handler de exceção do topo
-	opTHROW    = 0x73 // pop valor -> desenrola até o handler mais próximo
-	opCOALESCE = 0x74 // pop b, a -> a se a != null, senão b  (??)
-	opUNWRAP   = 0x75 // pop a -> a se a != null, senão aborta (x!)
+	opNATIVE   = 0x70 // u8 id, u8 argc — native builtin (table in native())
+	opTRYPUSH  = 0x71 // i16 rel (catch), u16 slot (catch var; 0xFFFF = none)
+	opTRYPOP   = 0x72 // removes the exception handler from the top
+	opTHROW    = 0x73 // pop value -> unwinds to the nearest handler
+	opCOALESCE = 0x74 // pop b, a -> a if a != null, else b (??)
+	opUNWRAP   = 0x75 // pop a -> a if a != null, else aborts (x!)
 )
 
 const noSlot = 0xFFFF
 
-// tipos de valor
+// value types
 const (
 	kInt = iota
 	kFloat
 	kBool
 	kStr
 	kNull
-	kArray // *[]Value  (referência: push/setidx mutam o compartilhado)
-	kMap   // map[any]Value (structs também usam este tipo)
+	kArray // *[]Value (reference: push/setidx mutate the shared array)
+	kMap   // map[any]Value (structs also use this type)
 )
 
 type Value struct {
@@ -113,7 +113,7 @@ func vNull() Value            { return Value{k: kNull} }
 func vArr(a []Value) Value    { return Value{k: kArray, arr: &a} }
 func vMap(m map[any]Value) Value { return Value{k: kMap, m: m} }
 
-// chave comparável (Go) a partir de um Value
+// comparable key (Go) from a Value
 func keyOf(v Value) any {
 	switch v.k {
 	case kInt:
@@ -129,7 +129,7 @@ func keyOf(v Value) any {
 	}
 }
 
-// reconstrói um Value a partir de uma chave de map
+// rebuilds a Value from a map key
 func keyToValue(k any) Value {
 	switch t := k.(type) {
 	case int64:
@@ -213,7 +213,7 @@ func join(parts []string, sep string) string {
 	return out
 }
 
-// chaves de map ordenadas (saída determinística)
+// sorted map keys (deterministic output)
 func mapKeysSorted(m map[any]Value) []any {
 	ks := make([]any, 0, len(m))
 	for k := range m {
@@ -242,16 +242,16 @@ type Program struct {
 	funcs   []Func
 	entryFn int
 	code    []byte
-	dbg     []dbgEntry // pc -> linha (ordenado por pc); vazio se sem depuração
+	dbg     []dbgEntry // pc -> line (ordered by pc); empty if no debug
 }
 
 type frame struct {
 	retpc  int
 	locals []Value
-	fn     int // índice da função (para stack trace)
+	fn     int // function index (for stack trace)
 }
 
-// ── estado de depuração (para stack traces em fatal) ────────
+// ── debug state (for stack traces in fatal) ────────
 var (
 	dbgLines  []dbgEntry
 	dbgFuncs  []Func
@@ -259,7 +259,7 @@ var (
 	dbgPC     *int
 )
 
-// lineAt: maior entrada com pc <= alvo (busca binária).
+// lineAt: largest entry with pc <= target (binary search).
 func lineAt(pc int) int {
 	lo, hi, ans := 0, len(dbgLines)-1, 0
 	for lo <= hi {
@@ -274,7 +274,7 @@ func lineAt(pc int) int {
 	return ans
 }
 
-// stackTrace: pilha de chamadas ativas com nome da função e linha.
+// stackTrace: active call stack with function name and line.
 func stackTrace() string {
 	if len(dbgLines) == 0 || dbgFrames == nil || dbgPC == nil {
 		return ""
@@ -283,8 +283,8 @@ func stackTrace() string {
 	var b strings.Builder
 	b.WriteString("  stack trace (most recent first):\n")
 	for i := len(fr) - 1; i >= 0; i-- {
-		// onde este quadro está pausado: o topo está no pc atual; os
-		// demais, no endereço de retorno do quadro que eles chamaram.
+		// where this frame is paused: the top is at the current pc; the
+		// others, at the return address of the frame they called.
 		var at int
 		if i == len(fr)-1 {
 			at = *dbgPC
@@ -308,7 +308,7 @@ func fatal(msg string) {
 	os.Exit(1)
 }
 
-// ── carregamento do .pyro ───────────────────────────────────
+// ── loading the .pyro ───────────────────────────────────
 
 func load(data []byte) *Program {
 	if len(data) < 6 || string(data[0:4]) != "PYRO" {
@@ -365,13 +365,13 @@ func load(data []byte) *Program {
 		xorDecode(code)
 	}
 	p.code = code
-	// política de sandbox gravada no artefato (bit2): a VM recusa
-	// natives de rede/máquina. Também pode ser ligada em runtime
-	// por PYRO_SANDBOX=1 (nunca desliga o que o artefato exigiu).
+	// sandbox policy recorded in the artifact (bit2): the VM refuses
+	// network/machine natives. Can also be enabled at runtime
+	// via PYRO_SANDBOX=1 (never disables what the artifact required).
 	if flags&0x04 != 0 {
 		sandboxed = true
 	}
-	// seção de depuração (pc -> linha), se presente
+	// debug section (pc -> line), if present
 	if flags&0x02 != 0 {
 		ndbg := int(rd32())
 		p.dbg = make([]dbgEntry, ndbg)
@@ -384,7 +384,7 @@ func load(data []byte) *Program {
 	return p
 }
 
-// inverso do XOR rolling do gerador (ofuscação leve, não é cripto forte)
+// inverse of the generator's rolling XOR (light obfuscation, not strong crypto)
 func xorDecode(code []byte) {
 	k := byte(0x5A)
 	for i := range code {
@@ -394,7 +394,7 @@ func xorDecode(code []byte) {
 	}
 }
 
-// ── operações de container ──────────────────────────────────
+// ── container operations ──────────────────────────────────
 
 func lengthOf(v Value) int64 {
 	switch v.k {
@@ -450,7 +450,7 @@ func indexSet(cont, key, val Value) {
 	}
 }
 
-// ── execução ────────────────────────────────────────────────
+// ── execution ────────────────────────────────────────────────
 
 func run(p *Program) {
 	code := p.code
@@ -467,25 +467,25 @@ func run(p *Program) {
 	frames := []frame{{retpc: -1, locals: make([]Value, main.nlocals), fn: p.entryFn}}
 	pc := int(main.entry)
 
-	// estado de depuração acessível pelo fatal() (stack trace)
+	// debug state accessible by fatal() (stack trace)
 	dbgLines = p.dbg
 	dbgFuncs = p.funcs
 	dbgFrames = &frames
 	dbgPC = &pc
 
-	// pilha de handlers de exceção (try/catch)
+	// exception handlers stack (try/catch)
 	type handler struct {
 		catchPC int
-		sp      int // profundidade da pilha de operandos ao entrar no try
-		fp      int // profundidade da pilha de quadros
-		slot    int // slot da variável de catch (noSlot = nenhuma)
+		sp      int // operand stack depth upon entering try
+		fp      int // frame stack depth
+		slot    int // catch variable slot (noSlot = none)
 	}
 	var handlers []handler
 
 	rd16 := func() int { v := int(binary.LittleEndian.Uint16(code[pc:])); pc += 2; return v }
 	rdi32 := func() int { v := int(int32(binary.LittleEndian.Uint32(code[pc:]))); pc += 4; return v }
 
-	// raise: desenrola até o handler mais próximo; devolve false se não há.
+	// raise: unwinds to the nearest handler; returns false if none.
 	raise := func(v Value) bool {
 		if len(handlers) == 0 {
 			return false
@@ -686,7 +686,7 @@ func run(p *Program) {
 	}
 }
 
-// valueToGo: Value do Pyro -> árvore interface{} p/ json.Marshal.
+// valueToGo: Pyro Value -> interface{} tree for json.Marshal.
 func valueToGo(v Value) interface{} {
 	switch v.k {
 	case kInt:
@@ -714,9 +714,9 @@ func valueToGo(v Value) interface{} {
 	}
 }
 
-// goToValue: árvore de json.Unmarshal -> Value do Pyro. Números JSON
-// inteiros viram int64 (structs Cryo costumam ter campos int); com parte
-// fracionária, viram float64.
+// goToValue: json.Unmarshal tree -> Pyro Value. JSON integer
+// numbers become int64 (Cryo structs usually have int fields); with fractional
+// part, become float64.
 func goToValue(x interface{}) Value {
 	switch t := x.(type) {
 	case nil:
@@ -747,7 +747,7 @@ func goToValue(x interface{}) Value {
 	}
 }
 
-// httpGet: GET simples; devolve o corpo, ou "" em caso de erro (como no go).
+// httpGet: simple GET; returns the body, or "" in case of error (like in go).
 func httpGet(url string) string {
 	resp, err := httpClient.Get(url)
 	if err != nil {
@@ -758,7 +758,7 @@ func httpGet(url string) string {
 	return string(b)
 }
 
-// httpPost: POST com corpo (content-type application/json), como no backend go.
+// httpPost: POST with body (content-type application/json), like in the go backend.
 func httpPost(url, body string) string {
 	resp, err := httpClient.Post(url, "application/json", strings.NewReader(body))
 	if err != nil {
@@ -769,10 +769,10 @@ func httpPost(url, body string) string {
 	return string(b)
 }
 
-// native executa um builtin da VM (espelha NATIVES em codegen_pyro.py).
-// sandboxed: quando true, a VM recusa natives de rede/máquina.
-// Ligado pela flag bit2 do .pyro (--sandbox no compilador) ou por
-// PYRO_SANDBOX=1 no ambiente (política de runtime sobre artefatos).
+// native executes a VM builtin (mirrors NATIVES in codegen_pyro.py).
+// sandboxed: when true, the VM refuses network/machine natives.
+// Enabled by the bit2 flag of .pyro (--sandbox in the compiler) or by
+// PYRO_SANDBOX=1 in the environment (runtime policy on artifacts).
 var sandboxed bool
 
 func native(id int, a []Value) Value {
@@ -860,11 +860,11 @@ func native(id int, a []Value) Value {
 		return vStr(strings.TrimSpace(a[0].String()))
 	case 15: // contains
 		return vBool(strings.Contains(a[0].String(), a[1].String()))
-	case 16: // find -> índice do substring (ou -1)
+	case 16: // find -> index of the substring (or -1)
 		return vInt(int64(strings.Index(a[0].String(), a[1].String())))
-	case 17: // replace(s, velho, novo) — todas as ocorrências
+	case 17: // replace(s, old, new) — all occurrences
 		return vStr(strings.ReplaceAll(a[0].String(), a[1].String(), a[2].String()))
-	case 18: // substr(s, inicio, n) — recorta com limites seguros
+	case 18: // substr(s, start, n) — slice with safe bounds
 		s := a[0].String()
 		i, n := a[1].i, a[2].i
 		if i < 0 {
@@ -878,7 +878,7 @@ func native(id int, a []Value) Value {
 			end = int64(len(s))
 		}
 		return vStr(s[i:end])
-	case 19: // split(s, sep) -> array de strings
+	case 19: // split(s, sep) -> array of strings
 		parts := strings.Split(a[0].String(), a[1].String())
 		out := make([]Value, len(parts))
 		for i, p := range parts {
@@ -894,33 +894,33 @@ func native(id int, a []Value) Value {
 			parts[i] = v.String()
 		}
 		return vStr(strings.Join(parts, a[1].String()))
-	case 21: // input(prompt) -> lê uma linha do stdin
+	case 21: // input(prompt) -> reads a line from stdin
 		fmt.Print(a[0].String())
 		line, _ := stdin.ReadString('\n')
 		return vStr(strings.TrimRight(line, "\r\n"))
-	case 22: // json_encode(v) -> string JSON
+	case 22: // json_encode(v) -> JSON string
 		b, err := json.Marshal(valueToGo(a[0]))
 		if err != nil {
 			fatal("json_encode: " + err.Error())
 		}
 		return vStr(string(b))
-	case 23: // json_decode(s) -> valor dinâmico (map/array/escalar)
+	case 23: // json_decode(s) -> dynamic value (map/array/scalar)
 		var raw interface{}
 		if err := json.Unmarshal([]byte(a[0].String()), &raw); err != nil {
 			fatal("[Cryo] json_decode: invalid JSON: " + err.Error())
 		}
 		return goToValue(raw)
-	case 24: // http_get(url) -> corpo (string); "" em caso de erro
+	case 24: // http_get(url) -> body (string); "" in case of error
 		if sandboxed {
 			fatal("[Cryo Security] Sandbox: http_get() blocked by sandbox policy")
 		}
 		return vStr(httpGet(a[0].String()))
-	case 25: // http_post(url, body) -> corpo da resposta (string)
+	case 25: // http_post(url, body) -> response body (string)
 		if sandboxed {
 			fatal("[Cryo Security] Sandbox: http_post() blocked by sandbox policy")
 		}
 		return vStr(httpPost(a[0].String(), a[1].String()))
-	case 26: // sleep(ms) -> pausa; devolve null
+	case 26: // sleep(ms) -> pause; returns null
 		ms := a[0].i
 		if a[0].k == kFloat {
 			ms = int64(a[0].f)
@@ -929,7 +929,7 @@ func native(id int, a []Value) Value {
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
 		return vNull()
-	case 27: // write_bytes(path, int[]) -> bool: grava os bytes num arquivo
+	case 27: // write_bytes(path, int[]) -> bool: writes bytes to a file
 		if sandboxed {
 			fatal("[Cryo Security] Sandbox: write_bytes() blocked by sandbox policy")
 		}
@@ -1014,7 +1014,7 @@ func binOp(op byte, a, b Value) Value {
 			fatal("[Cryo Security] DivByZero: modulo")
 		}
 		if x == -1<<63 && y == -1 {
-			return vInt(0) // INT64_MIN % -1 = 0 (bem-definido); só a divisão estoura
+			return vInt(0) // INT64_MIN % -1 = 0 (well-defined); only division overflows
 		}
 		return vInt(x % y)
 	case opBAND:
