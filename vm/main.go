@@ -929,6 +929,19 @@ func native(id int, a []Value) Value {
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
 		return vNull()
+	case 27: // write_bytes(path, int[]) -> bool: grava os bytes num arquivo
+		if sandboxed {
+			fatal("[Cryo Seguranca] Sandbox: write_bytes() bloqueado por política de sandbox")
+		}
+		if a[1].k != kArray {
+			return vBool(false)
+		}
+		src := *a[1].arr
+		buf := make([]byte, len(src))
+		for i, e := range src {
+			buf[i] = byte(e.i & 0xFF)
+		}
+		return vBool(os.WriteFile(a[0].String(), buf, 0644) == nil)
 	}
 	fatal(fmt.Sprintf("builtin nativo desconhecido: id=%d", id))
 	return vNull()

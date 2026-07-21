@@ -1137,6 +1137,25 @@ Value native(int id, Value* a, int argc) {
                 if (ms > 0) sleep_ms(ms);
                 return val_null();
             }
+        case 27: // write_bytes(path, int[]) -> bool: grava os bytes num arquivo
+            {
+                if (pyro_sandboxed) {
+                    fatal("[Cryo Seguranca] Sandbox: write_bytes() bloqueado por política de sandbox");
+                }
+                if (a[1].kind != VAL_ARRAY) return val_bool(false);
+                char* path = value_to_string(a[0]);
+                FILE* fp = fopen(path, "wb");
+                free(path);
+                if (!fp) return val_bool(false);
+                RcArray* arr = a[1].as.arr;
+                for (int64_t i = 0; i < arr->length; i++) {
+                    Value e = arr->data[i];
+                    int byte = (int)((e.kind == VAL_FLOAT ? (int64_t)e.as.f : e.as.i) & 0xFF);
+                    fputc(byte, fp);
+                }
+                fclose(fp);
+                return val_bool(true);
+            }
     }
     fatal("builtin nativo desconhecido");
     return val_null();

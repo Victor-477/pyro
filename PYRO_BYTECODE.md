@@ -97,6 +97,7 @@ a VM (`native()` em `vm/main.go`):
 | | | | | 24 | `http_get` |
 | | | | | 25 | `http_post` |
 | | | | | 26 | `sleep` |
+| | | | | 27 | `write_bytes` |
 
 Enums não geram código: cada membro (`Nivel_ALTO`) vira uma constante inteira
 em tempo de compilação.

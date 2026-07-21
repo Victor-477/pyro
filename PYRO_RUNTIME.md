@@ -120,17 +120,22 @@ resultado. A tabela de ids é **espelhada** entre o gerador
 | 6 | `ceil` | 15 | `contains` | 24 | `http_get` |
 | 7 | `round` | 16 | `find` | 25 | `http_post` |
 | 8 | `to_string` | 17 | `replace` | 26 | `sleep` |
+| | | | | 27 | `write_bytes` |
 
 - **`input(prompt)`** lê uma linha de stdin (I/O).
 - **`json_encode`/`json_decode`** serializam/desserializam a árvore de valores
   (chaves de objeto viram maps; inteiros JSON viram `int`).
 - **`http_get`/`http_post`** fazem requisições de rede; **`sleep(ms)`** pausa.
+- **`write_bytes(path, int[]) -> bool`** grava um array de inteiros como bytes
+  (cada elemento truncado a `& 0xFF`) num arquivo — a saída binária que permite
+  a um programa na VM emitir um `.pyro` (habilita o compilador auto-hospedado).
 - `to_int`/`to_number` de string não numérica **abortam** (fail-fast).
 
 ### Política de sandbox
 O runtime expõe `pyro_sandboxed` (ligado pelo host via flag `bit2` do `.pyro`
-ou `PYRO_SANDBOX=1`). Quando ativo, os nativos de **rede** (`http_get`,
-`http_post`) são recusados com abort de segurança. `sleep` permanece liberado.
+ou `PYRO_SANDBOX=1`). Quando ativo, os nativos de **rede/máquina** (`http_get`,
+`http_post`, `write_bytes`) são recusados com abort de segurança. `sleep`
+permanece liberado.
 
 ---
 
