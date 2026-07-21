@@ -80,13 +80,13 @@ int get_line_number(uint32_t target_pc, Program* program) {
 void print_stack_trace(Program* program) {
     // paridade com a VM Go: sem seção de depuração -> sem stack trace.
     if (!program->dbg || program->ndebug == 0) return;
-    fprintf(stderr, "  stack trace (mais recente primeiro):\n");
+    fprintf(stderr, "  stack trace (most recent first):\n");
     for (int i = fp - 1; i >= 0; i--) {
         Frame fr = frames[i];
         const char* name = (fr.fn >= 0 && fr.fn < (int)program->nfuncs)
                            ? program->funcs[fr.fn].name : "?";
         int line = get_line_number(i == fp - 1 ? (uint32_t)pc : (uint32_t)fr.retpc, program);
-        fprintf(stderr, "    em %s (linha %d)\n", name, line);
+        fprintf(stderr, "    at %s (line %d)\n", name, line);
     }
 }
 
@@ -124,10 +124,10 @@ bool raise_exception(Value v) {
 // ── Bytecode Loader ──────────────────────────────────────────
 Program* load_program(const uint8_t* data, size_t size) {
     if (size < 6 || memcmp(data, "PYRO", 4) != 0) {
-        fatal("arquivo .pyro inválido (magic)");
+        fatal("invalid .pyro file (magic)");
     }
     if (data[4] != 2) {
-        fatal("versão de .pyro não suportada (esperada v2)");
+        fatal("unsupported .pyro version (expected v2)");
     }
     uint8_t flags = data[5];
     Program* p = malloc(sizeof(Program));
@@ -163,7 +163,7 @@ Program* load_program(const uint8_t* data, size_t size) {
                 p->consts[i] = val_bool(data[pos++] != 0);
                 break;
             default:
-                fatal("tag de constante desconhecida");
+                fatal("unknown constant tag");
         }
     }
     
@@ -463,7 +463,7 @@ void run_program(Program* p) {
                     Value val = stack[--sp];
                     Value arr = stack[sp - 1];
                     if (arr.kind != VAL_ARRAY) {
-                        fatal("push em valor que não é array");
+                        fatal("push on a non-array value");
                     }
                     rc_array_push(arr.as.arr, val);
                     release_value(val);
@@ -487,7 +487,7 @@ void run_program(Program* p) {
                 {
                     Value mp = stack[sp - 1];
                     if (mp.kind != VAL_MAP) {
-                        fatal("keys() aplicado a valor que não é map");
+                        fatal("keys() applied to a non-map value");
                     }
                     RcArray* keys_arr = rc_map_keys_sorted(mp.as.map);
                     release_value(mp);
@@ -523,7 +523,7 @@ void run_program(Program* p) {
                     if (!raise_exception(v)) {
                         char* s = value_to_string(v);
                         char err[1024];
-                        sprintf(err, "exceção não capturada: %s", s);
+                        sprintf(err, "uncaught exception: %s", s);
                         free(s);
                         fatal(err);
                     }
@@ -546,7 +546,7 @@ void run_program(Program* p) {
                 {
                     Value a = stack[sp - 1];
                     if (a.kind == VAL_NULL) {
-                        const char* um = "[Cryo Seguranca] unwrap de valor nulo";
+                        const char* um = "[Cryo Security] unwrap of null value";
                         Value err_msg = val_str(um, (int64_t)strlen(um));
                         if (!raise_exception(err_msg)) {
                             fatal(um);
@@ -556,7 +556,7 @@ void run_program(Program* p) {
                 }
                 break;
             default:
-                fatal("operador inválido no bytecode");
+                fatal("invalid opcode in bytecode");
         }
     }
 }
@@ -564,13 +564,13 @@ void run_program(Program* p) {
 // ── Main Entry Point ─────────────────────────────────────────
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Erro fatal: uso: pyrovm programa.pyro\n");
+        fprintf(stderr, "[Pyro VM] usage: pyrovm program.pyro\n");
         return 1;
     }
     
     FILE* f = fopen(argv[1], "rb");
     if (!f) {
-        fprintf(stderr, "Erro fatal: não foi possível ler: %s\n", argv[1]);
+        fprintf(stderr, "[Pyro VM] could not read: %s\n", argv[1]);
         return 1;
     }
     

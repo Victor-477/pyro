@@ -281,7 +281,7 @@ func stackTrace() string {
 	}
 	fr := *dbgFrames
 	var b strings.Builder
-	b.WriteString("  stack trace (mais recente primeiro):\n")
+	b.WriteString("  stack trace (most recent first):\n")
 	for i := len(fr) - 1; i >= 0; i-- {
 		// onde este quadro está pausado: o topo está no pc atual; os
 		// demais, no endereço de retorno do quadro que eles chamaram.
@@ -295,7 +295,7 @@ func stackTrace() string {
 		if fr[i].fn >= 0 && fr[i].fn < len(dbgFuncs) {
 			name = dbgFuncs[fr[i].fn].name
 		}
-		fmt.Fprintf(&b, "    em %s (linha %d)\n", name, lineAt(at))
+		fmt.Fprintf(&b, "    at %s (line %d)\n", name, lineAt(at))
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
@@ -312,10 +312,10 @@ func fatal(msg string) {
 
 func load(data []byte) *Program {
 	if len(data) < 6 || string(data[0:4]) != "PYRO" {
-		fatal("arquivo .pyro inválido (magic)")
+		fatal("invalid .pyro file (magic)")
 	}
 	if data[4] != 2 {
-		fatal("versão de .pyro não suportada (esperada v2)")
+		fatal("unsupported .pyro version (expected v2)")
 	}
 	flags := data[5]
 	p := &Program{}
@@ -343,7 +343,7 @@ func load(data []byte) *Program {
 			p.consts[i] = vBool(data[pos] != 0)
 			pos++
 		default:
-			fatal("tag de constante desconhecida")
+			fatal("unknown constant tag")
 		}
 	}
 	nfuncs := rd16()
@@ -405,7 +405,7 @@ func lengthOf(v Value) int64 {
 	case kMap:
 		return int64(len(v.m))
 	default:
-		fatal("len() aplicado a valor sem tamanho")
+		fatal("len() applied to a value without length")
 		return 0
 	}
 }
@@ -415,7 +415,7 @@ func indexGet(cont, key Value) Value {
 	case kArray:
 		idx := key.i
 		if idx < 0 || idx >= int64(len(*cont.arr)) {
-			fatal(fmt.Sprintf("[Cryo Seguranca] IndexError: índice %d fora dos limites (len=%d)", idx, len(*cont.arr)))
+			fatal(fmt.Sprintf("[Cryo Security] IndexError: index %d out of bounds (len=%d)", idx, len(*cont.arr)))
 		}
 		return (*cont.arr)[idx]
 	case kMap:
@@ -426,11 +426,11 @@ func indexGet(cont, key Value) Value {
 	case kStr:
 		idx := key.i
 		if idx < 0 || idx >= int64(len(cont.s)) {
-			fatal("[Cryo Seguranca] IndexError: índice de string fora dos limites")
+			fatal("[Cryo Security] IndexError: string index out of bounds")
 		}
 		return vStr(string(cont.s[idx]))
 	default:
-		fatal("indexação de valor não indexável")
+		fatal("indexing a non-indexable value")
 		return vNull()
 	}
 }
@@ -440,13 +440,13 @@ func indexSet(cont, key, val Value) {
 	case kArray:
 		idx := key.i
 		if idx < 0 || idx >= int64(len(*cont.arr)) {
-			fatal(fmt.Sprintf("[Cryo Seguranca] IndexError: índice %d fora dos limites", idx))
+			fatal(fmt.Sprintf("[Cryo Security] IndexError: index %d out of bounds", idx))
 		}
 		(*cont.arr)[idx] = val
 	case kMap:
 		cont.m[keyOf(key)] = val
 	default:
-		fatal("atribuição indexada em valor não indexável")
+		fatal("indexed assignment on a non-indexable value")
 	}
 }
 
@@ -597,7 +597,7 @@ func run(p *Program) {
 		case opTHROW:
 			v := pop()
 			if !raise(v) {
-				fatal("exceção não capturada: " + v.String())
+				fatal("uncaught exception: " + v.String())
 			}
 		case opCOALESCE:
 			b := pop()
@@ -610,8 +610,8 @@ func run(p *Program) {
 		case opUNWRAP:
 			a := pop()
 			if a.k == kNull {
-				if !raise(vStr("[Cryo Seguranca] unwrap de valor nulo")) {
-					fatal("[Cryo Seguranca] unwrap de valor nulo")
+				if !raise(vStr("[Cryo Security] unwrap of null value")) {
+					fatal("[Cryo Security] unwrap of null value")
 				}
 			} else {
 				push(a)
@@ -647,7 +647,7 @@ func run(p *Program) {
 			val := pop()
 			arr := pop()
 			if arr.k != kArray {
-				fatal("push em valor que não é array")
+				fatal("push on a non-array value")
 			}
 			*arr.arr = append(*arr.arr, val)
 			push(vInt(int64(len(*arr.arr))))
@@ -663,7 +663,7 @@ func run(p *Program) {
 		case opKEYS:
 			mp := pop()
 			if mp.k != kMap {
-				fatal("keys() aplicado a valor que não é map")
+				fatal("keys() applied to a non-map value")
 			}
 			ks := mapKeysSorted(mp.m)
 			out := make([]Value, len(ks))
@@ -681,7 +681,7 @@ func run(p *Program) {
 			stack = stack[:base]
 			push(native(nid, args))
 		default:
-			fatal(fmt.Sprintf("opcode desconhecido 0x%02X em pc=%d", op, pc-1))
+			fatal(fmt.Sprintf("unknown opcode 0x%02X at pc=%d", op, pc-1))
 		}
 	}
 }
@@ -827,11 +827,11 @@ func native(id int, a []Value) Value {
 		case kStr:
 			n, err := strconv.ParseInt(strings.TrimSpace(a[0].s), 10, 64)
 			if err != nil {
-				fatal("[Cryo Seguranca] to_int: '" + a[0].s + "' não é um inteiro válido")
+				fatal("[Cryo Security] to_int: '" + a[0].s + "' is not a valid integer")
 			}
 			return vInt(n)
 		}
-		fatal("to_int: tipo não conversível")
+		fatal("to_int: non-convertible type")
 	case 10: // to_number
 		switch a[0].k {
 		case kFloat:
@@ -841,14 +841,14 @@ func native(id int, a []Value) Value {
 		case kStr:
 			f, err := strconv.ParseFloat(strings.TrimSpace(a[0].s), 64)
 			if err != nil {
-				fatal("[Cryo Seguranca] to_number: '" + a[0].s + "' não é um número válido")
+				fatal("[Cryo Security] to_number: '" + a[0].s + "' is not a valid number")
 			}
 			return vFloat(f)
 		}
-		fatal("to_number: tipo não conversível")
+		fatal("to_number: non-convertible type")
 	case 11: // remove(map, key)
 		if a[0].k != kMap {
-			fatal("remove() aplicado a valor que não é map")
+			fatal("remove() applied to a non-map value")
 		}
 		delete(a[0].m, keyOf(a[1]))
 		return vNull()
@@ -887,7 +887,7 @@ func native(id int, a []Value) Value {
 		return vArr(out)
 	case 20: // join(arr, sep)
 		if a[0].k != kArray {
-			fatal("join() aplicado a valor que não é array")
+			fatal("join() applied to a non-array value")
 		}
 		parts := make([]string, len(*a[0].arr))
 		for i, v := range *a[0].arr {
@@ -907,17 +907,17 @@ func native(id int, a []Value) Value {
 	case 23: // json_decode(s) -> valor dinâmico (map/array/escalar)
 		var raw interface{}
 		if err := json.Unmarshal([]byte(a[0].String()), &raw); err != nil {
-			fatal("[Cryo] json_decode: JSON inválido: " + err.Error())
+			fatal("[Cryo] json_decode: invalid JSON: " + err.Error())
 		}
 		return goToValue(raw)
 	case 24: // http_get(url) -> corpo (string); "" em caso de erro
 		if sandboxed {
-			fatal("[Cryo Seguranca] Sandbox: http_get() bloqueado por política de sandbox")
+			fatal("[Cryo Security] Sandbox: http_get() blocked by sandbox policy")
 		}
 		return vStr(httpGet(a[0].String()))
 	case 25: // http_post(url, body) -> corpo da resposta (string)
 		if sandboxed {
-			fatal("[Cryo Seguranca] Sandbox: http_post() bloqueado por política de sandbox")
+			fatal("[Cryo Security] Sandbox: http_post() blocked by sandbox policy")
 		}
 		return vStr(httpPost(a[0].String(), a[1].String()))
 	case 26: // sleep(ms) -> pausa; devolve null
@@ -931,7 +931,7 @@ func native(id int, a []Value) Value {
 		return vNull()
 	case 27: // write_bytes(path, int[]) -> bool: grava os bytes num arquivo
 		if sandboxed {
-			fatal("[Cryo Seguranca] Sandbox: write_bytes() bloqueado por política de sandbox")
+			fatal("[Cryo Security] Sandbox: write_bytes() blocked by sandbox policy")
 		}
 		if a[1].k != kArray {
 			return vBool(false)
@@ -943,7 +943,7 @@ func native(id int, a []Value) Value {
 		}
 		return vBool(os.WriteFile(a[0].String(), buf, 0644) == nil)
 	}
-	fatal(fmt.Sprintf("builtin nativo desconhecido: id=%d", id))
+	fatal(fmt.Sprintf("unknown native builtin: id=%d", id))
 	return vNull()
 }
 
@@ -1003,15 +1003,15 @@ func binOp(op byte, a, b Value) Value {
 		return vInt(x * y)
 	case opDIV:
 		if y == 0 {
-			fatal("[Cryo Seguranca] DivisaoPorZero: divisão inteira")
+			fatal("[Cryo Security] DivByZero: integer division")
 		}
 		if x == -1<<63 && y == -1 {
-			fatal("[Cryo Seguranca] Overflow: INT64_MIN / -1")
+			fatal("[Cryo Security] Overflow: INT64_MIN / -1")
 		}
 		return vInt(x / y)
 	case opMOD:
 		if y == 0 {
-			fatal("[Cryo Seguranca] DivisaoPorZero: módulo")
+			fatal("[Cryo Security] DivByZero: modulo")
 		}
 		if x == -1<<63 && y == -1 {
 			return vInt(0) // INT64_MIN % -1 = 0 (bem-definido); só a divisão estoura
@@ -1036,7 +1036,7 @@ func binOp(op byte, a, b Value) Value {
 	case opGE:
 		return vBool(x >= y)
 	}
-	fatal("operador inválido no bytecode")
+	fatal("invalid opcode in bytecode")
 	return vNull()
 }
 
@@ -1055,11 +1055,11 @@ func valueEq(a, b Value) bool {
 
 func main() {
 	if len(os.Args) < 2 {
-		fatal("uso: pyrovm programa.pyro")
+		fatal("usage: pyrovm program.pyro")
 	}
 	data, err := os.ReadFile(os.Args[1])
 	if err != nil {
-		fatal("não foi possível ler: " + err.Error())
+		fatal("could not read: " + err.Error())
 	}
 	if os.Getenv("PYRO_SANDBOX") == "1" {
 		sandboxed = true

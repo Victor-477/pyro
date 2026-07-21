@@ -150,29 +150,23 @@ There are two regimes:
 
 `fatal(msg)` is the **host callback**: it prints `"[Pyro VM] " + msg` to stderr,
 followed by the stack trace (if a debug section is present), and exits with code 1.
-The messages are standardized and **identical** across implementations.
-
-> **Note:** the runtime abort messages are currently emitted in Portuguese
-> (`[Cryo Seguranca]` = "Cryo Security", `divisão inteira` = "integer division",
-> etc.). They are shown below **verbatim** because that is the exact byte output
-> the VMs produce (and which the parity tests assert on). Translating these
-> user-facing strings to English is a separate, coordinated change (both VMs +
-> tests).
+The messages are standardized and **identical** across implementations (the Go VM
+and the C VM produce byte-for-byte the same output, verified by the parity tests):
 
 ```
-[Pyro VM] [Cryo Seguranca] DivisaoPorZero: divisão inteira
-  stack trace (mais recente primeiro):
-    em divide (linha 2)
-    em main (linha 8)
+[Pyro VM] [Cryo Security] DivByZero: integer division
+  stack trace (most recent first):
+    at divide (line 2)
+    at main (line 8)
 ```
 
-Canonical messages (prefix `[Cryo Seguranca]` for safety):
-`DivisaoPorZero: divisão inteira` / `: módulo`; `Overflow: INT64_MIN / -1`;
-`IndexError: índice N fora dos limites (len=M)` (array get), `IndexError: índice N
-fora dos limites` (array set), `IndexError: índice de string fora dos limites`;
-`unwrap de valor nulo`; `to_int: '…' não é um inteiro válido`; `to_number: '…' não
-é um número válido`; `Sandbox: http_get() bloqueado por política de sandbox`.
-Outside safety: `[Cryo Assert] <msg>` and `exceção não capturada: <value>`.
+Canonical messages (prefix `[Cryo Security]` for safety):
+`DivByZero: integer division` / `: modulo`; `Overflow: INT64_MIN / -1`;
+`IndexError: index N out of bounds (len=M)` (array get), `IndexError: index N out
+of bounds` (array set), `IndexError: string index out of bounds`;
+`unwrap of null value`; `to_int: '…' is not a valid integer`; `to_number: '…' is
+not a valid number`; `Sandbox: http_get() blocked by sandbox policy`. Outside
+safety: `[Cryo Assert] <msg>` and `uncaught exception: <value>`.
 
 ---
 

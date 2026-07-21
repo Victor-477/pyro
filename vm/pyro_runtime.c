@@ -283,7 +283,7 @@ Value rc_array_get(RcArray* a, int64_t idx) {
     if (idx < 0 || idx >= a->length) {
         // paridade com a VM Go: fail-fast (não capturável), mesma mensagem
         char err[128];
-        sprintf(err, "[Cryo Seguranca] IndexError: índice %lld fora dos limites (len=%lld)", (long long)idx, (long long)a->length);
+        sprintf(err, "[Cryo Security] IndexError: index %lld out of bounds (len=%lld)", (long long)idx, (long long)a->length);
         fatal(err);
         return val_null();
     }
@@ -293,7 +293,7 @@ Value rc_array_get(RcArray* a, int64_t idx) {
 void rc_array_set(RcArray* a, int64_t idx, Value v) {
     if (idx < 0 || idx >= a->length) {
         char err[128];
-        sprintf(err, "[Cryo Seguranca] IndexError: índice %lld fora dos limites", (long long)idx);
+        sprintf(err, "[Cryo Security] IndexError: index %lld out of bounds", (long long)idx);
         fatal(err);
         return;
     }
@@ -478,13 +478,13 @@ Value index_get(Value cont, Value key) {
         int64_t idx = key.as.i;
         if (idx < 0 || idx >= cont.as.str->length) {
             // paridade com a VM Go: fail-fast, mesma mensagem
-            fatal("[Cryo Seguranca] IndexError: índice de string fora dos limites");
+            fatal("[Cryo Security] IndexError: string index out of bounds");
             return val_null();
         }
         char ch = cont.as.str->chars[idx];
         return val_str(&ch, 1);
     }
-    fatal("indexação de valor não indexável");
+    fatal("indexing a non-indexable value");
     return val_null();
 }
 
@@ -498,7 +498,7 @@ void index_set(Value cont, Value key, Value val) {
         rc_map_set(cont.as.map, key, val);
         return;
     }
-    fatal("atribuição indexada em valor não indexável");
+    fatal("indexed assignment on a non-indexable value");
 }
 
 // ── Bytecode Reader Helpers ──────────────────────────────────
@@ -920,14 +920,14 @@ Value native(int id, Value* a, int argc) {
                         while (*end && isspace((unsigned char)*end)) end++;
                         if (*end != '\0' || end == s) {
                             char err[1024];
-                            sprintf(err, "[Cryo Seguranca] to_int: '%s' não é um inteiro válido", a[0].as.str->chars);
+                            sprintf(err, "[Cryo Security] to_int: '%s' is not a valid integer", a[0].as.str->chars);
                             fatal(err);   // paridade Go: fail-fast (não capturável)
                             return val_null();
                         }
                         return val_int(val);
                     }
                 default:
-                    fatal("to_int: tipo não conversível");
+                    fatal("to_int: non-convertible type");
             }
             break;
         case 10: // to_number
@@ -943,19 +943,19 @@ Value native(int id, Value* a, int argc) {
                         while (*end && isspace((unsigned char)*end)) end++;
                         if (*end != '\0' || end == s) {
                             char err[1024];
-                            sprintf(err, "[Cryo Seguranca] to_number: '%s' não é um número válido", a[0].as.str->chars);
+                            sprintf(err, "[Cryo Security] to_number: '%s' is not a valid number", a[0].as.str->chars);
                             fatal(err);   // paridade Go: fail-fast (não capturável)
                             return val_null();
                         }
                         return val_float(val);
                     }
                 default:
-                    fatal("to_number: tipo não conversível");
+                    fatal("to_number: non-convertible type");
             }
             break;
         case 11: // remove(map, key)
             if (a[0].kind != VAL_MAP) {
-                fatal("remove() aplicado a valor que não é map");
+                fatal("remove() applied to a non-map value");
             }
             rc_map_remove(a[0].as.map, a[1]);
             return val_null();
@@ -1069,7 +1069,7 @@ Value native(int id, Value* a, int argc) {
         case 20: // join
             {
                 if (a[0].kind != VAL_ARRAY) {
-                    fatal("join() aplicado a valor que não é array");
+                    fatal("join() applied to a non-array value");
                 }
                 char* sep = value_to_string(a[1]);
                 RcString* rstr = join_arr(a[0].as.arr, sep);
@@ -1110,7 +1110,7 @@ Value native(int id, Value* a, int argc) {
             }
         case 24: // http_get
             if (pyro_sandboxed) {
-                fatal("[Cryo Seguranca] Sandbox: http_get() bloqueado por política de sandbox");
+                fatal("[Cryo Security] Sandbox: http_get() blocked by sandbox policy");
             }
             {
                 char* url = value_to_string(a[0]);
@@ -1121,7 +1121,7 @@ Value native(int id, Value* a, int argc) {
             }
         case 25: // http_post
             if (pyro_sandboxed) {
-                fatal("[Cryo Seguranca] Sandbox: http_post() bloqueado por política de sandbox");
+                fatal("[Cryo Security] Sandbox: http_post() blocked by sandbox policy");
             }
             {
                 char* url = value_to_string(a[0]);
@@ -1140,7 +1140,7 @@ Value native(int id, Value* a, int argc) {
         case 27: // write_bytes(path, int[]) -> bool: grava os bytes num arquivo
             {
                 if (pyro_sandboxed) {
-                    fatal("[Cryo Seguranca] Sandbox: write_bytes() bloqueado por política de sandbox");
+                    fatal("[Cryo Security] Sandbox: write_bytes() blocked by sandbox policy");
                 }
                 if (a[1].kind != VAL_ARRAY) return val_bool(false);
                 char* path = value_to_string(a[0]);
@@ -1157,7 +1157,7 @@ Value native(int id, Value* a, int argc) {
                 return val_bool(true);
             }
     }
-    fatal("builtin nativo desconhecido");
+    fatal("unknown native builtin");
     return val_null();
 }
 
@@ -1262,15 +1262,15 @@ Value bin_op(uint8_t op, Value a, Value b) {
         case opMUL: return val_int(x * y);
         case opDIV:
             if (y == 0) {
-                fatal("[Cryo Seguranca] DivisaoPorZero: divisão inteira");
+                fatal("[Cryo Security] DivByZero: integer division");
             }
             if (x == INT64_MIN && y == -1) {
-                fatal("[Cryo Seguranca] Overflow: INT64_MIN / -1");
+                fatal("[Cryo Security] Overflow: INT64_MIN / -1");
             }
             return val_int(x / y);
         case opMOD:
             if (y == 0) {
-                fatal("[Cryo Seguranca] DivisaoPorZero: módulo");
+                fatal("[Cryo Security] DivByZero: modulo");
             }
             if (x == INT64_MIN && y == -1) {
                 return val_int(0);
@@ -1286,7 +1286,7 @@ Value bin_op(uint8_t op, Value a, Value b) {
         case opLE:   return val_bool(x <= y);
         case opGE:   return val_bool(x >= y);
     }
-    fatal("operador inválido no bytecode");
+    fatal("invalid opcode in bytecode");
     return val_null();
 }
 

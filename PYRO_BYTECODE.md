@@ -112,7 +112,7 @@ are resolved by the VM:
 - `ADD` with a string operand → **concatenation** (the other is converted).
 - Arithmetic with any `float` → promotion to float; otherwise, integer.
 - `EQ`/`NE` compare by value between compatible types.
-- **Safety:** integer `DIV`/`MOD` by zero **abort** (`[Cryo Seguranca] DivisaoPorZero`);
+- **Safety:** integer `DIV`/`MOD` by zero **abort** (`[Cryo Security] DivByZero`);
   `ASSERT` aborts with the message if the condition is false.
 
 ## Code section encoding (flags bit0)
