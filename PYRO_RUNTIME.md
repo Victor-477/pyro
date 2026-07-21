@@ -1,115 +1,114 @@
-# Pyro Runtime — Especificação do runtime mínimo
+# Pyro Runtime — minimal runtime specification
 
-Este documento especifica o **runtime** da linguagem-alvo Pyro: o modelo de
-valores, o gerenciamento de memória, a semântica de containers/strings, a
-E/S, os builtins nativos (`NATIVE`) e o contrato de erros/abortos.
+This document specifies the **runtime** of the Pyro target language: the value
+model, memory management, container/string semantics, I/O, the native builtins
+(`NATIVE`) and the error/abort contract.
 
-O runtime é **independente do motor** de execução. Hoje há duas
-implementações do runtime que devem ser **semanticamente idênticas**:
+The runtime is **independent of the execution engine**. Today there are two
+runtime implementations that must be **semantically identical**:
 
-| Implementação | Arquivos | Toolchain |
+| Implementation | Files | Toolchain |
 |---|---|---|
-| Runtime C (isolado) | `pyro/vm/pyro_runtime.h` + `pyro_runtime.c` | gcc / MinGW / MSVC |
-| Runtime Go (embutido na VM Go) | `pyro/vm/main.go` | Go |
+| C runtime (isolated) | `pyro/vm/pyro_runtime.h` + `pyro_runtime.c` | gcc / MinGW / MSVC |
+| Go runtime (embedded in the Go VM) | `pyro/vm/main.go` | Go |
 
-A VM em C (`pyro/vm/main.c`) é apenas o **motor** (carregamento, decodificação
-e laço de despacho); ela depende somente de `pyro_runtime.h`. Futuros alvos
-(ex.: código C nativo, WASM) reutilizam o mesmo runtime e herdam esta
-semântica sem reimplementá-la.
+The C VM (`pyro/vm/main.c`) is only the **engine** (loading, decoding and the
+dispatch loop); it depends solely on `pyro_runtime.h`. Future targets (e.g. native
+C code, WASM) reuse the same runtime and inherit this semantics without
+reimplementing it.
 
-> A ISA (opcodes, formato `.pyro`) é especificada em [`PYRO_BYTECODE.md`](PYRO_BYTECODE.md).
-> Aqui tratamos apenas do runtime.
+> The ISA (opcodes, `.pyro` format) is specified in [`PYRO_BYTECODE.md`](PYRO_BYTECODE.md).
+> Here we cover only the runtime.
 
 ---
 
-## 1. Modelo de valores
+## 1. Value model
 
-Um `Value` é dinâmico e carrega sua tag de tipo em runtime:
+A `Value` is dynamic and carries its type tag at runtime:
 
-| Tipo | Representação | Observações |
+| Type | Representation | Notes |
 |---|---|---|
-| `int` | inteiro com sinal de 64 bits (`int64`) | overflow de `+ - *` aborta (fail-fast) |
-| `float` | ponto flutuante de 64 bits (`double`) | |
-| `bool` | booleano | |
-| `string` | UTF-8, imutável, contada por referência | comprimento em **bytes** |
-| `null` | ausência de valor | |
-| `array` | lista contígua de `Value`, contada por referência | |
-| `map` | tabela hash `Value → Value`, contada por referência | chaves por igualdade de valor |
+| `int` | signed 64-bit integer (`int64`) | `+ - *` overflow aborts (fail-fast) |
+| `float` | 64-bit floating point (`double`) | |
+| `bool` | boolean | |
+| `string` | UTF-8, immutable, reference-counted | length in **bytes** |
+| `null` | absence of value | |
+| `array` | contiguous list of `Value`, reference-counted | |
+| `map` | hash table `Value → Value`, reference-counted | keys by value equality |
 
-Não há um tipo `struct` distinto: **structs e variantes de enum são maps** de
-chaves string (ex.: `Ok(v)` → `{"tag": "Ok", "val0": v}`). Enums sem dados são
-constantes inteiras resolvidas em tempo de compilação.
+There is no distinct `struct` type: **structs and enum variants are maps** of
+string keys (e.g. `Ok(v)` → `{"tag": "Ok", "val0": v}`). Data-less enums are
+integer constants resolved at compile time.
 
-### Promoção numérica
-Operações mistas `int`/`float` promovem o inteiro a `float`; o resultado é
-`float`. Entre dois `int`, a aritmética é inteira (divisão trunca em direção a
-zero).
+### Numeric promotion
+Mixed `int`/`float` operations promote the integer to `float`; the result is
+`float`. Between two `int`s, arithmetic is integer (division truncates toward zero).
 
-### Igualdade (`value_eq`)
-- Mesma categoria numérica compara por valor (com promoção `int`/`float`).
-- `string` compara por conteúdo; `bool` por valor; `null == null` é verdadeiro.
-- `array`/`map` comparam por **identidade de referência**.
+### Equality (`value_eq`)
+- Same numeric category compares by value (with `int`/`float` promotion).
+- `string` compares by content; `bool` by value; `null == null` is true.
+- `array`/`map` compare by **reference identity**.
 
-### Veracidade (`value_truthy`)
-`false`, `null`, `0` (int), `0.0` (float) e `""` são falsos; o resto é verdadeiro.
+### Truthiness (`value_truthy`)
+`false`, `null`, `0` (int), `0.0` (float) and `""` are falsy; everything else is truthy.
 
 ---
 
-## 2. Gerenciamento de memória (contagem de referências)
+## 2. Memory management (reference counting)
 
-`string`, `array` e `map` são objetos contados por referência (`ref_count`).
-`int`, `float`, `bool` e `null` são valores imediatos (sem alocação).
+`string`, `array` and `map` are reference-counted objects (`ref_count`). `int`,
+`float`, `bool` and `null` are immediate values (no allocation).
 
-Invariantes:
+Invariants:
 
-- **`retain_value(v)`** incrementa o `ref_count` do objeto (no-op para imediatos).
-- **`release_value(v)`** decrementa; ao chegar a zero, libera o objeto e
-  **release recursivo** de seus elementos (array) ou pares chave/valor (map).
-- Um objeto recém-criado nasce com `ref_count = 1`.
-- Ao **guardar** um valor num slot/container que passa a possuí-lo, faz-se
-  `retain`; ao **sobrescrever/descartar**, faz-se `release`.
-- Não há coletor de ciclos: como arrays/maps comparam por identidade e a
-  linguagem não expõe mutação que crie ciclos de posse, refcount é suficiente.
+- **`retain_value(v)`** increments the object's `ref_count` (no-op for immediates).
+- **`release_value(v)`** decrements; at zero, it frees the object and
+  **recursively releases** its elements (array) or key/value pairs (map).
+- A freshly created object starts with `ref_count = 1`.
+- When **storing** a value into a slot/container that takes ownership, `retain`;
+  when **overwriting/discarding**, `release`.
+- There is no cycle collector: since arrays/maps compare by identity and the
+  language exposes no mutation that creates ownership cycles, refcount is enough.
 
-> A semântica de referência de arrays/maps (aliasing por referência) é parte
-> do contrato: passar um array a uma função compartilha o mesmo objeto.
+> The reference semantics of arrays/maps (aliasing by reference) is part of the
+> contract: passing an array to a function shares the same object.
 
 ---
 
 ## 3. Strings
 
-- Imutáveis; comprimento medido em **bytes** (`len(s)`).
-- Indexação `s[i]` devolve o byte `i` como string de 1 caractere; índice fora
-  da faixa **aborta** (ver §6).
-- Concatenação `a + b` com pelo menos um operando string converte o outro via
-  `value_to_string` e produz uma nova string.
-- `value_to_string` define a forma textual canônica de cada tipo (usada por
-  `print`, concatenação e `json_encode` de chaves).
+- Immutable; length measured in **bytes** (`len(s)`).
+- Indexing `s[i]` returns byte `i` as a 1-character string; out-of-range index
+  **aborts** (see §6).
+- Concatenation `a + b` with at least one string operand converts the other via
+  `value_to_string` and produces a new string.
+- `value_to_string` defines the canonical textual form of each type (used by
+  `print`, concatenation and `json_encode` of keys).
 
 ---
 
 ## 4. Containers
 
 ### Arrays
-- `arr.push(v)` acrescenta ao fim (cresce a capacidade conforme necessário).
-- `len(arr)` devolve o número de elementos.
-- `arr[i]` lê/escreve por índice; fora da faixa **aborta** (fail-fast).
+- `arr.push(v)` appends to the end (grows capacity as needed).
+- `len(arr)` returns the number of elements.
+- `arr[i]` reads/writes by index; out-of-range **aborts** (fail-fast).
 
 ### Maps
-- Tabela hash com redimensionamento; chaves comparadas por `value_eq`.
-- `m[k]` lê (chave ausente → `null`) e escreve; `has(m, k)` testa a presença;
-  `remove(m, k)` remove; `keys(m)` devolve as chaves **ordenadas pela forma
-  textual** (determinístico — garante paridade entre implementações).
+- Hash table with resizing; keys compared via `value_eq`.
+- `m[k]` reads (missing key → `null`) and writes; `has(m, k)` tests presence;
+  `remove(m, k)` removes; `keys(m)` returns the keys **sorted by their textual
+  form** (deterministic — guarantees parity across implementations).
 
 ---
 
-## 5. E/S e builtins nativos (`NATIVE`)
+## 5. I/O and native builtins (`NATIVE`)
 
-A instrução `NATIVE id, argc` consome `argc` valores da pilha e empilha o
-resultado. A tabela de ids é **espelhada** entre o gerador
-(`NATIVES` em `burnout/codegen_pyro.py`) e cada runtime:
+The `NATIVE id, argc` instruction consumes `argc` values from the stack and pushes
+the result. The id table is **mirrored** between the generator (`NATIVES` in
+`burnout/codegen_pyro.py`) and each runtime:
 
-| id | nome | id | nome | id | nome |
+| id | name | id | name | id | name |
 |---|---|---|---|---|---|
 | 0 | `sqrt` | 9 | `to_int` | 18 | `substr` |
 | 1 | `pow` | 10 | `to_number` | 19 | `split` |
@@ -122,37 +121,43 @@ resultado. A tabela de ids é **espelhada** entre o gerador
 | 8 | `to_string` | 17 | `replace` | 26 | `sleep` |
 | | | | | 27 | `write_bytes` |
 
-- **`input(prompt)`** lê uma linha de stdin (I/O).
-- **`json_encode`/`json_decode`** serializam/desserializam a árvore de valores
-  (chaves de objeto viram maps; inteiros JSON viram `int`).
-- **`http_get`/`http_post`** fazem requisições de rede; **`sleep(ms)`** pausa.
-- **`write_bytes(path, int[]) -> bool`** grava um array de inteiros como bytes
-  (cada elemento truncado a `& 0xFF`) num arquivo — a saída binária que permite
-  a um programa na VM emitir um `.pyro` (habilita o compilador auto-hospedado).
-- `to_int`/`to_number` de string não numérica **abortam** (fail-fast).
+- **`input(prompt)`** reads a line from stdin (I/O).
+- **`json_encode`/`json_decode`** serialize/deserialize the value tree (object keys
+  become maps; JSON integers become `int`).
+- **`http_get`/`http_post`** make network requests; **`sleep(ms)`** pauses.
+- **`write_bytes(path, int[]) -> bool`** writes an integer array as raw bytes
+  (each element truncated to `& 0xFF`) to a file — the binary output that lets a
+  program on the VM emit a `.pyro` (enables the self-hosted compiler).
+- `to_int`/`to_number` of a non-numeric string **abort** (fail-fast).
 
-### Política de sandbox
-O runtime expõe `pyro_sandboxed` (ligado pelo host via flag `bit2` do `.pyro`
-ou `PYRO_SANDBOX=1`). Quando ativo, os nativos de **rede/máquina** (`http_get`,
-`http_post`, `write_bytes`) são recusados com abort de segurança. `sleep`
-permanece liberado.
+### Sandbox policy
+The runtime exposes `pyro_sandboxed` (turned on by the host via the `.pyro` `bit2`
+flag or `PYRO_SANDBOX=1`). When active, the **network/machine** natives (`http_get`,
+`http_post`, `write_bytes`) are refused with a security abort. `sleep` stays allowed.
 
 ---
 
-## 6. Contrato de erros e abortos
+## 6. Error and abort contract
 
-Há dois regimes:
+There are two regimes:
 
-- **Fail-fast (não capturável)** — segurança de baixo nível: overflow de
-  inteiro, divisão/módulo por zero, índice fora da faixa (array/string),
-  `to_int`/`to_number` inválidos, sandbox. Chamam `fatal()`.
-- **Capturável (`try`/`catch`)** — `throw`, `assert` que falha e `unwrap`
-  (`x!`) de `null`. Levantam uma exceção; se não houver handler ativo, viram
+- **Fail-fast (non-catchable)** — low-level safety: integer overflow,
+  division/modulo by zero, out-of-range index (array/string), invalid
+  `to_int`/`to_number`, sandbox. They call `fatal()`.
+- **Catchable (`try`/`catch`)** — `throw`, a failing `assert`, and `unwrap`
+  (`x!`) of `null`. They raise an exception; if no handler is active, they become
   `fatal()`.
 
-`fatal(msg)` é o **callback do host**: imprime `"[Pyro VM] " + msg` em stderr,
-seguido do stack trace (se houver seção de depuração), e encerra com código 1.
-As mensagens são padronizadas e **idênticas** entre as implementações:
+`fatal(msg)` is the **host callback**: it prints `"[Pyro VM] " + msg` to stderr,
+followed by the stack trace (if a debug section is present), and exits with code 1.
+The messages are standardized and **identical** across implementations.
+
+> **Note:** the runtime abort messages are currently emitted in Portuguese
+> (`[Cryo Seguranca]` = "Cryo Security", `divisão inteira` = "integer division",
+> etc.). They are shown below **verbatim** because that is the exact byte output
+> the VMs produce (and which the parity tests assert on). Translating these
+> user-facing strings to English is a separate, coordinated change (both VMs +
+> tests).
 
 ```
 [Pyro VM] [Cryo Seguranca] DivisaoPorZero: divisão inteira
@@ -161,27 +166,26 @@ As mensagens são padronizadas e **idênticas** entre as implementações:
     em main (linha 8)
 ```
 
-Mensagens canônicas (prefixo `[Cryo Seguranca]` para segurança):
+Canonical messages (prefix `[Cryo Seguranca]` for safety):
 `DivisaoPorZero: divisão inteira` / `: módulo`; `Overflow: INT64_MIN / -1`;
-`IndexError: índice N fora dos limites (len=M)` (array get), `IndexError:
-índice N fora dos limites` (array set), `IndexError: índice de string fora dos
-limites`; `unwrap de valor nulo`; `to_int: '…' não é um inteiro válido`;
-`to_number: '…' não é um número válido`; `Sandbox: http_get() bloqueado por
-política de sandbox`. Fora de segurança: `[Cryo Assert] <msg>` e `exceção não
-capturada: <valor>`.
+`IndexError: índice N fora dos limites (len=M)` (array get), `IndexError: índice N
+fora dos limites` (array set), `IndexError: índice de string fora dos limites`;
+`unwrap de valor nulo`; `to_int: '…' não é um inteiro válido`; `to_number: '…' não
+é um número válido`; `Sandbox: http_get() bloqueado por política de sandbox`.
+Outside safety: `[Cryo Assert] <msg>` and `exceção não capturada: <value>`.
 
 ---
 
-## 7. Fronteira runtime ↔ host
+## 7. Runtime ↔ host boundary
 
-O runtime é agnóstico ao motor; ele só depende de:
+The runtime is engine-agnostic; it depends only on:
 
-| Símbolo | Direção | Papel |
+| Symbol | Direction | Role |
 |---|---|---|
-| `void fatal(const char* msg)` | host → runtime | aborta com mensagem + stack trace |
-| `bool pyro_sandboxed` | host define, runtime lê | política de sandbox |
+| `void fatal(const char* msg)` | host → runtime | aborts with a message + stack trace |
+| `bool pyro_sandboxed` | host sets, runtime reads | sandbox policy |
 
-Tudo o mais (pilha de operandos, quadros de chamada, handlers de exceção,
-seção de depuração, decodificação e despacho) pertence ao **motor** e não é
-visível ao runtime. Assim, qualquer motor (VM de pilha, tradutor para C
-nativo, etc.) que forneça esses dois símbolos obtém semântica idêntica.
+Everything else (the operand stack, call frames, exception handlers, the debug
+section, decoding and dispatch) belongs to the **engine** and is not visible to the
+runtime. Thus any engine (stack VM, native-C translator, etc.) that provides these
+two symbols gets identical semantics.

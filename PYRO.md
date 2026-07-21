@@ -1,40 +1,40 @@
-# Pyro — a camada nativa de máquina
+# Pyro — the native machine layer
 
-**Cryo** é a linguagem de alto nível. **Pyro** é a camada nativa em que a Cryo é
-compilada — a parte que fala *diretamente com a máquina*: código nativo, acesso
-ao sistema operacional e as *skills* de LLM embutidas no próprio binário.
+**Cryo** is the high-level language. **Pyro** is the native layer that Cryo is
+compiled into — the part that talks *directly to the machine*: native code,
+operating-system access, and the LLM *skills* baked into the binary itself.
 
-> Regra mental: você **escreve Cryo**, o compilador **gera Pyro** (código nativo),
-> e o Pyro **executa na máquina**. Cryo é o gelo (ergonômico, seguro); Pyro é o
-> fogo (rápido, direto ao metal).
+> Mental rule: you **write Cryo**, the compiler **generates Pyro** (native code),
+> and Pyro **runs on the machine**. Cryo is the ice (ergonomic, safe); Pyro is the
+> fire (fast, close to the metal).
 
-## Como funciona o pipeline
+## How the pipeline works
 
 ```
-  app.cryo ──(lexer→parser→AST)──►  gerador de código  ──►  Pyro  ──►  binário
+  app.cryo ──(lexer→parser→AST)──►  code generator  ──►  Pyro  ──►  binary
                                           │
                     ┌─────────────────────┼─────────────────────┐
                     ▼                     ▼                      ▼
-              Go nativo (.go)       C nativo (.pyro)      x86-64 (.s)
-              base atual            runtime C             ABIs win64/sysv
+              native Go (.go)       native C (.pyro)      x86-64 (.s)
+              current base          C runtime             win64/sysv ABIs
 ```
 
-O nome do artefato C gerado é `.pyro` justamente porque é a forma "quente"/nativa
-do programa. Hoje a **base é o backend Go**: a Cryo baixa para Go idiomático e usa
-a stdlib madura (`os`, `os/exec`, `encoding/json`, goroutines) por baixo — sem
-runtime externo. A instrumentação de segurança (overflow, divisão por zero,
-`assert`, null-safety) é embutida no próprio código gerado.
+The generated C artifact is named `.pyro` precisely because it is the "hot"/native
+form of the program. Today the **base is the Go backend**: Cryo lowers to idiomatic
+Go and uses the mature stdlib (`os`, `os/exec`, `encoding/json`, goroutines)
+underneath — with no external runtime. The safety instrumentation (overflow,
+division by zero, `assert`, null-safety) is inlined into the generated code itself.
 
-## Skills nativas de LLM (sem arquivos `.md`)
+## Native LLM skills (no `.md` files)
 
-Ferramentas de LLM costumam descrever *skills* em arquivos `SKILL.md` (markdown com
-frontmatter). Para uma linguagem de máquina isso é o oposto de otimizado: exige I/O
-de arquivo e parsing de texto em runtime. No Pyro, uma **skill é um construto da
-linguagem**, compilado como struct nativo dentro do binário:
+LLM tools usually describe *skills* in `SKILL.md` files (markdown with
+frontmatter). For a machine language that is the opposite of optimal: it needs file
+I/O and text parsing at runtime. In Pyro, a **skill is a language construct**,
+compiled as a native struct inside the binary:
 
 ```cryo
 skill resumir {
-    desc:        "Resume um texto em bullets objetivos";
+    desc:        "Summarize a text into objective bullets";
     model:       "gpt-x";
     temperature: 0.2;
     max_tokens:  512;
@@ -42,46 +42,46 @@ skill resumir {
 }
 ```
 
-Isso vira, no binário, uma entrada num registro global `map[string]Skill` — zero
-markdown, zero leitura de arquivo, introspecção O(1). Campos conhecidos (`desc`,
-`model`, `tools`) viram campos tipados; os demais (`temperature`, `max_tokens`, …)
-vão para um `Config map[string]string` compacto. O tipo `Skill` é serializável em
-JSON nativamente (tags `json`).
+In the binary this becomes an entry in a global `map[string]Skill` registry — zero
+markdown, zero file reads, O(1) introspection. Known fields (`desc`, `model`,
+`tools`) become typed fields; the rest (`temperature`, `max_tokens`, …) go into a
+compact `Config map[string]string`. The `Skill` type is natively JSON-serializable
+(`json` tags).
 
-### Introspecção nativa
+### Native introspection
 
-| Função | Retorno | O que faz |
+| Function | Returns | What it does |
 |---|---|---|
-| `skills()` | `string[]` | Nomes de todas as skills (ordenados) |
-| `skill_get(nome)` | `Skill` | A skill e sua configuração |
-| `skill_has(nome)` | `bool` | Se a skill existe |
-| `skills_json()` | `string` | Catálogo completo em JSON (para interop/LLM) |
+| `skills()` | `string[]` | Names of all skills (sorted) |
+| `skill_get(name)` | `Skill` | The skill and its configuration |
+| `skill_has(name)` | `bool` | Whether the skill exists |
+| `skills_json()` | `string` | Full catalog in JSON (for interop/LLM) |
 
 ```cryo
 Skill s = skill_get("resumir");
 print(s.desc);
 print(s.model);
 print(s.config["temperature"]);     // "0.2"
-string catalogo = skills_json();      // exporta tudo em JSON, sem .md
+string catalogo = skills_json();      // export everything as JSON, no .md
 ```
 
-Um agente/LLM lê o catálogo com `skills_json()` — um único valor compacto, gerado
-em memória a partir de dados que já vivem no binário.
+An agent/LLM reads the catalog with `skills_json()` — a single compact value,
+generated in memory from data that already lives in the binary.
 
-## Acesso direto à máquina
+## Direct machine access
 
-O Pyro expõe *builtins* que conversam com o sistema operacional (baixam para
-`os`/`os/exec`/`time` do Go):
+Pyro exposes *builtins* that talk to the operating system (lowering to Go's
+`os`/`os/exec`/`time`):
 
-| Função | Retorno | Descrição |
+| Function | Returns | Description |
 |---|---|---|
-| `pyro_exec(cmd)` | `string` | Executa um comando de shell e retorna a saída (stdout+stderr). Multiplataforma (`cmd /c` no Windows, `sh -c` nos demais) |
-| `pyro_env(nome)` | `string` | Lê uma variável de ambiente |
-| `pyro_args()` | `string[]` | Argumentos da linha de comando |
-| `pyro_time()` | `int` | Timestamp atual (milissegundos Unix) |
-| `pyro_write(s)` | — | Escreve em stdout sem quebra de linha |
-| `pyro_read()` | `string` | Lê uma linha de stdin |
-| `pyro_exit(cod)` | — | Encerra o processo com o código dado |
+| `pyro_exec(cmd)` | `string` | Runs a shell command and returns its output (stdout+stderr). Cross-platform (`cmd /c` on Windows, `sh -c` elsewhere) |
+| `pyro_env(name)` | `string` | Reads an environment variable |
+| `pyro_args()` | `string[]` | Command-line arguments |
+| `pyro_time()` | `int` | Current timestamp (Unix milliseconds) |
+| `pyro_write(s)` | — | Writes to stdout without a newline |
+| `pyro_read()` | `string` | Reads a line from stdin |
+| `pyro_exit(code)` | — | Ends the process with the given code |
 
 ```cryo
 string usuario = pyro_env("USERNAME");
@@ -89,17 +89,17 @@ string saida   = pyro_exec("go version");
 int    agora   = pyro_time();
 ```
 
-Para um agente de IA, `pyro_exec` é a primitiva-chave: a "tool" que a skill declara
-pode ser um comando que o agente roda direto na máquina.
+For an AI agent, `pyro_exec` is the key primitive: the "tool" a skill declares can
+be a command the agent runs directly on the machine.
 
-## Disponibilidade por backend
+## Availability by backend
 
-`skill`, as funções `skills*`/`skill_*` e os builtins `pyro_*` são recursos da
-camada **Pyro sobre Go** (backend padrão). Os backends `c` e `asm` emitem um erro
-claro apontando `--backend go` quando encontram esses construtos.
+`skill`, the `skills*`/`skill_*` functions and the `pyro_*` builtins are features of
+the **Pyro-over-Go** layer (the default backend). The `c` and `asm` backends emit a
+clear error pointing to `--backend go` when they hit these constructs.
 
-## Exemplo completo
+## Full example
 
-Veja [`examples/example_pyro.cryo`](../examples/example_pyro.cryo): declara duas
-skills, faz introspecção nativa e acessa a máquina — tudo compilado num único
-binário, sem nenhum arquivo `.md`.
+See [`examples/example_pyro.cryo`](../examples/example_pyro.cryo): it declares two
+skills, does native introspection and accesses the machine — all compiled into a
+single binary, with no `.md` file at all.

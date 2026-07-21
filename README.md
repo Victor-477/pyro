@@ -1,45 +1,47 @@
-# PYRO — a linguagem-alvo nativa (`.pyro`)
+# PYRO — the native target language (`.pyro`)
 
-O **Pyro** é a **linguagem-alvo própria** do sistema: um **bytecode binário** com um
-conjunto de instruções (ISA) inventado aqui — **não é** x86, Go nem C. O compilador
-(**Burnout**) gera `.pyro` a partir de `.cryo`, e a **VM Pyro** (em Go) carrega e
-executa esse bytecode na máquina.
+**Pyro** is the system's **custom target language**: a **binary bytecode** with an
+instruction set (ISA) invented here — it is **not** x86, Go or C. The compiler
+(**Burnout**) generates `.pyro` from `.cryo`, and the **Pyro VM** (in Go) loads and
+runs that bytecode on the machine.
 
 ```
-  .cryo ──►  Burnout (compilador)  ──►  .pyro (bytecode próprio)  ──►  VM Pyro (Go)  ──►  execução
+  .cryo ──►  Burnout (compiler)  ──►  .pyro (custom bytecode)  ──►  Pyro VM (Go)  ──►  execution
 ```
 
-## Conteúdo
+## Contents
 
-| Caminho | Papel |
+| Path | Role |
 |---|---|
-| `vm/main.go` · `vm/go.mod` | A **VM Pyro** (em Go): carrega, decodifica e executa `.pyro` |
-| `PYRO_BYTECODE.md` | Especificação da ISA e do formato do `.pyro` |
-| `PYRO.md` | Notas de rumo da camada nativa (histórico) |
+| `vm/main.go` · `vm/go.mod` | The **Pyro VM** (in Go): loads, decodes and runs `.pyro` |
+| `vm/main.c` · `vm/pyro_runtime.{c,h}` | The **Pyro VM in C** (no Go dependency) + isolated runtime |
+| `PYRO_BYTECODE.md` | ISA and `.pyro` format specification |
+| `PYRO_RUNTIME.md` | Specification of the minimal shared runtime |
+| `PYRO.md` | Native-layer direction notes (historical) |
 
-## O que a VM suporta
+## What the VM supports
 
-- Escalares: `int`, `number` (float64), `bool`, `string` (tipagem dinâmica).
-- Aritmética, comparação, bit a bit, lógica (curto-circuito), unários.
-- Variáveis, `if/else`, `while`, `do/while`, `for`, `for-each`, `switch`, ternário,
+- Scalars: `int`, `number` (float64), `bool`, `string` (dynamic typing).
+- Arithmetic, comparison, bitwise, logic (short-circuit), unary.
+- Variables, `if/else`, `while`, `do/while`, `for`, `for-each`, `switch`, ternary,
   `break`/`continue`.
-- Funções, recursão, chamadas (quadros de pilha próprios).
-- **Containers**: arrays (`[...]`, `push`, indexação, `len`), maps (`{k:v}`, `has`,
-  `keys`, indexação), structs (= map de campos, `s.campo`).
-- Segurança: divisão por zero e `assert` abortam; índices fora dos limites abortam.
+- Functions, recursion, calls (their own stack frames).
+- **Containers**: arrays (`[...]`, `push`, indexing, `len`), maps (`{k:v}`, `has`,
+  `keys`, indexing), structs (= map of fields, `s.field`).
+- Safety: division by zero and `assert` abort; out-of-bounds indices abort.
 
-## Por que é sua própria linguagem
+## Why it is its own language
 
-- **Roda na máquina** via a VM (portável: um binário Go).
-- **Compacta/opaca** ("criptografada") — a seção de código é codificada (XOR rolling).
-- **Nativa do sistema**, ótima como dado de treino para agentes de IA (instruções já
-  na forma que a máquina executa).
-- **Própria** — não derivada de linguagens existentes.
+- **Runs on the machine** via the VM (portable: a single Go binary).
+- **Compact/opaque** ("encrypted") — the code section is encoded (rolling XOR).
+- **Native to the system**, great as training data for AI agents (instructions
+  already in the form the machine executes).
+- **Custom** — not derived from existing languages.
 
-Especificação completa da ISA e do formato em [PYRO_BYTECODE.md](PYRO_BYTECODE.md).
-Desassemblador (`.pyro` → texto legível) no compilador: `--backend pyro --dis`.
+Full ISA and format spec in [PYRO_BYTECODE.md](PYRO_BYTECODE.md). Disassembler
+(`.pyro` → readable text) in the compiler: `--backend pyro --dis`.
 
-## Dependências
+## Dependencies
 
-A VM é **autocontida** (só a biblioteca padrão do Go). O `.pyro` que ela executa é
-produzido pelo **Burnout**. Distribuída como repositório próprio (a linguagem-alvo).
+The VM is **self-contained** (Go standard library only). The `.pyro` it runs is
+produced by **Burnout**. Distributed as its own repository (the target language).
