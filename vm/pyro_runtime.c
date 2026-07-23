@@ -490,7 +490,12 @@ int64_t value_length(Value v) {
 Value index_get(Value cont, Value key) {
     if (cont.kind == VAL_ARRAY) {
         int64_t idx = key.as.i;
-        return rc_array_get(cont.as.arr, idx);
+        // rc_array_get borrows; callers of index_get own (and release) the
+        // result, so retain here exactly as the map branch below does.
+        // Without this the element is freed while still in the array.
+        Value res = rc_array_get(cont.as.arr, idx);
+        retain_value(res);
+        return res;
     }
     if (cont.kind == VAL_MAP) {
         Value res = rc_map_get(cont.as.map, key);
@@ -1442,7 +1447,7 @@ Value bin_op(uint8_t op, Value a, Value b) {
         double y = value_as_float(b);
         switch (op) {
             case opADD: return val_float(x + y);
-            case opSUB: return val_float(x * y);
+            case opSUB: return val_float(x - y);
             case opMUL: return val_float(x * y);
             case opDIV: return val_float(x / y);
             case opMOD: return val_float(fmod(x, y));

@@ -460,14 +460,20 @@ void run_program(Program* p) {
                 break;
             case opAPPEND:
                 {
+                    // contract: pop val, pop arr -> push new size (net -1).
+                    // Peeking arr here would leave a stranded slot, and paths
+                    // that merge after a conditional push would then disagree
+                    // on the stack depth.
                     Value val = stack[--sp];
-                    Value arr = stack[sp - 1];
+                    Value arr = stack[--sp];
                     if (arr.kind != VAL_ARRAY) {
                         fatal("push on a non-array value");
                     }
                     rc_array_push(arr.as.arr, val);
                     release_value(val);
-                    stack[sp++] = val_int(arr.as.arr->length);
+                    int64_t new_len = arr.as.arr->length;
+                    release_value(arr);
+                    stack[sp++] = val_int(new_len);
                 }
                 break;
             case opHAS:
