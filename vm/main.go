@@ -774,6 +774,7 @@ func httpPost(url, body string) string {
 // Enabled by the bit2 flag of .pyro (--sandbox in the compiler) or by
 // PYRO_SANDBOX=1 in the environment (runtime policy on artifacts).
 var sandboxed bool
+var progArgs []string   // program args after the .pyro path (for the args() native)
 
 func native(id int, a []Value) Value {
 	switch id {
@@ -942,6 +943,21 @@ func native(id int, a []Value) Value {
 			buf[i] = byte(e.i & 0xFF)
 		}
 		return vBool(os.WriteFile(a[0].String(), buf, 0644) == nil)
+	case 28: // read_file(path) -> string ("" on error)
+		if sandboxed {
+			fatal("[Cryo Security] Sandbox: read_file() blocked by sandbox policy")
+		}
+		data, err := os.ReadFile(a[0].String())
+		if err != nil {
+			return vStr("")
+		}
+		return vStr(string(data))
+	case 29: // args() -> string[]: program args after the .pyro path
+		out := make([]Value, len(progArgs))
+		for i, s := range progArgs {
+			out[i] = vStr(s)
+		}
+		return vArr(out)
 	}
 	fatal(fmt.Sprintf("unknown native builtin: id=%d", id))
 	return vNull()
@@ -1064,5 +1080,6 @@ func main() {
 	if os.Getenv("PYRO_SANDBOX") == "1" {
 		sandboxed = true
 	}
+	progArgs = os.Args[2:]   // exposed to the program via the args() native
 	run(load(data))
 }
