@@ -67,7 +67,7 @@ Each instruction = 1 opcode byte + fixed-size operands.
 | `NEWMAP` | 61 | u16 n | map from `n` (key, value) pairs |
 | `INDEX`/`SETIDX` | 62/63 | — | indexed read/write (bounds-checked) |
 | `LEN` | 64 | — | length of string/array/map |
-| `APPEND` | 65 | — | `arr.push(v)`; pushes the new length |
+| `APPEND` | 65 | — | `pop v, pop arr`; `arr.push(v)`; pushes the new length (net −1) |
 | `HAS`/`KEYS` | 66/67 | — | key presence / array of keys |
 | `NATIVE` | 70 | u8 id, u8 argc | calls a native VM builtin (table below) |
 | `TRYPUSH` | 71 | i32 rel, u16 slot | installs an exception handler (catch at `rel`; `slot`=var, 0xFFFF=none) |
@@ -79,8 +79,11 @@ Each instruction = 1 opcode byte + fixed-size operands.
 ### Native builtins (`NATIVE`)
 
 The `NATIVE` instruction consumes `argc` arguments from the stack and pushes the
-result. The id table is mirrored between the generator (`NATIVES` in
-`codegen_pyro.py`) and the VM (`native()` in `vm/main.go`):
+result. The id table is mirrored across **four** places, all of which must agree:
+the generator (`NATIVES` in `codegen_pyro.py`), the Go VM (`native()` in
+`vm/main.go`), the C runtime (`native()` in `vm/pyro_runtime.c`, shared by the C VM
+and the AOT), and the self-hosted generator (`nativeId` in
+`cryo/selfhost/codegen.cryo`):
 
 | id | name | id | name | id | name |
 |---|---|---|---|---|---|
@@ -98,9 +101,19 @@ result. The id table is mirrored between the generator (`NATIVES` in
 | | | | | 25 | `http_post` |
 | | | | | 26 | `sleep` |
 | | | | | 27 | `write_bytes` |
+| | | | | 28 | `read_file` |
+| | | | | 29 | `args` |
+| | | | | 30 | `http_serve` |
 
 Enums generate no code: each member (`Nivel_ALTO`) becomes an integer constant at
 compile time.
+
+> **Stack effects are normative.** Every engine (Go VM, C VM, AOT) must pop and
+> push exactly what the table says. An engine that *peeks* an operand instead of
+> popping it still works on straight-line code, but leaves the operand stranded:
+> two paths merging after a conditional then disagree on the stack depth, and
+> later reads take the wrong value. `APPEND` is the easy one to get wrong — it
+> pops **both** the value and the array.
 
 Jumps are **relative** to the end of the instruction itself (`rel = target − (pc_after_operand)`).
 

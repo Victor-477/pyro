@@ -15,8 +15,9 @@
   - **Go VM:** Multi-platform VM implemented in Go, featuring fast execution, reflection-based parsing, and automated garbage collection.
   - **C VM:** Lightweight VM implemented in pure C, featuring deterministic **Reference Counting** memory management (`retain`/`release`) and absolute portability.
 * **Code Obfuscation:** The bytecode section of `.pyro` executables is obfuscated using a rolling XOR key system to prevent trivial decompilation.
-* **Native VM Capabilities:** Direct system integration including native I/O (`input`, `write_bytes`), HTTP networking (`http_get`, `http_post`), runtime control (`pyro_exec`, `pyro_env`, `pyro_exit`), and JSON serialization.
-* **Complete Parity System:** The C VM features byte-for-byte stdout, stderr, and exit code parity against the Go VM (validated on every build).
+* **Native VM Capabilities:** Direct system integration including native I/O (`input`, `read_file`, `write_bytes`, `args`), HTTP networking (`http_get`, `http_post`) and **serving** (`http_serve`), runtime control (`pyro_exec`, `pyro_env`, `pyro_exit`), and JSON serialization.
+* **Complete Parity System:** The C VM features byte-for-byte stdout, stderr, and exit code parity against the Go VM (validated on every build) — extending to HTTP responses served by `http_serve`.
+* **Ahead-of-Time Native Compilation:** A `.pyro` can be lowered to C ([`aot_pyro.py`](../Burnout/aot_pyro.py)) and linked against this same runtime, producing an executable that carries no VM and no bytecode at runtime. The AOT is a second engine over the runtime, so it inherits VM semantics by construction.
 
 ---
 
@@ -69,15 +70,27 @@ cd Pyro/vm
 go build -o pyrovm_go.exe main.go
 ```
 
-**C VM Compilation (using MSVC on Windows):**
+**C VM Compilation (GCC/MinGW/Clang):**
 ```bash
-cd Pyro/vm
-cl /O2 /utf-8 /Fe:pyrovm.exe main.c pyro_runtime.c
+gcc -O2 -std=c11 -o pyrovm.exe Pyro/vm/main.c Pyro/vm/pyro_runtime.c -lm -lws2_32
 ```
+
+`-lws2_32` is Windows-only: the runtime uses sockets for `http_serve`. With MSVC,
+the equivalent is `cl /O2 /utf-8 /Fe:pyrovm.exe main.c pyro_runtime.c ws2_32.lib`
+(`/utf-8` keeps the accented error messages byte-identical to the Go VM's).
+
+The runtime compiles under strict ISO mode. Note that `strdup`, `_popen`,
+`_pclose` and `_getpid` are POSIX/MSVCRT rather than ISO C, so `-std=c11` hides
+their declarations — the runtime supplies its own `strdup` and declares the others
+explicitly, because leaving them implicit makes them return `int` and silently
+truncate pointers on 64-bit hosts.
 
 ### Running the Parity Tests
 To verify absolute parity between the virtual machines, run the integration test runner:
 ```bash
 python Burnout/tests/test_c_vm.py
 ```
-This script compiles both interpreters and verifies their stdout, stderr, and exit codes over 25+ end-to-end integration scenarios.
+It builds both interpreters (auto-detecting gcc/clang/MSVC) and compares stdout,
+stderr and exit codes across the examples, abort/try-catch cases, `write_bytes`
+output, runtime semantics regressions, and the responses served by `http_serve` —
+33 scenarios. It skips cleanly when no C toolchain is present.
