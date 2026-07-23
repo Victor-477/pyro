@@ -958,6 +958,23 @@ func native(id int, a []Value) Value {
 			out[i] = vStr(s)
 		}
 		return vArr(out)
+	case 30: // http_serve(port, dir) -> serve a static directory (blocking)
+		if sandboxed {
+			fatal("[Cryo Security] Sandbox: http_serve() blocked by sandbox policy")
+		}
+		dir := a[1].String()
+		fsrv := http.FileServer(http.Dir(dir))
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, ".wasm") {
+				w.Header().Set("Content-Type", "application/wasm")
+			}
+			fsrv.ServeHTTP(w, r)
+		})
+		fmt.Printf("[pyro] serving %s on http://localhost:%d\n", dir, a[0].i)
+		if err := http.ListenAndServe(fmt.Sprintf(":%d", a[0].i), h); err != nil {
+			fatal("http_serve: " + err.Error())
+		}
+		return vNull()
 	}
 	fatal(fmt.Sprintf("unknown native builtin: id=%d", id))
 	return vNull()
