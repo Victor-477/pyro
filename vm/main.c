@@ -567,7 +567,11 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "[Pyro VM] usage: pyrovm program.pyro\n");
         return 1;
     }
-    
+
+    // program args seen by args(): everything after the .pyro path
+    pyro_argc = argc - 2;
+    pyro_argv = argv + 2;
+
     FILE* f = fopen(argv[1], "rb");
     if (!f) {
         fprintf(stderr, "[Pyro VM] could not read: %s\n", argv[1]);

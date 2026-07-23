@@ -136,6 +136,8 @@ struct RcMap {
 // ── boundary with the host ─────────────────────────────────────
 void fatal(const char* msg);      // fail-fast abort (defined in the engine)
 extern bool pyro_sandboxed;       // sandbox policy (network disabled)
+extern int    pyro_argc;          // program args (argv[0] excluded), for args()
+extern char** pyro_argv;
 
 // ── runtime API ───────────────────────────────────────────
 // Value creators
@@ -182,6 +184,9 @@ RcString* join_arr(RcArray* arr, const char* sep);
 Value native(int id, Value* a, int argc);
 // bytecode reading (little-endian) + code section decoding
 uint16_t read_u16(const uint8_t* data, int* pos);
+int32_t  read_i32(const uint8_t* data, int* pos);
+// static file server backing http_serve(); blocks, only returns on fatal error
+void http_serve_dir(const char* dir, int port);
 uint32_t read_u32(const uint8_t* data, int* pos);
 uint64_t read_u64(const uint8_t* data, int* pos);
 void xor_decode(uint8_t* code, uint32_t len);
