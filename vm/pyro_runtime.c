@@ -1029,6 +1029,28 @@ void http_serve_dir(const char* dir, int port) {
     }
 }
 
+// native_pad: pad_start/pad_end with JS padStart/padEnd semantics — the pad
+// string is repeated and truncated to fill exactly (width-len) bytes. Caller frees.
+static char* native_pad(const char* s, int width, const char* pad, bool at_start) {
+    size_t sl = strlen(s), pl = strlen(pad);
+    if ((int)sl >= width || pl == 0) {
+        char* out = (char*)malloc(sl + 1);
+        memcpy(out, s, sl + 1);
+        return out;
+    }
+    size_t need = (size_t)width - sl;
+    char* out = (char*)malloc(need + sl + 1);
+    if (at_start) {
+        for (size_t i = 0; i < need; i++) out[i] = pad[i % pl];
+        memcpy(out + need, s, sl);
+    } else {
+        memcpy(out, s, sl);
+        for (size_t i = 0; i < need; i++) out[sl + i] = pad[i % pl];
+    }
+    out[need + sl] = '\0';
+    return out;
+}
+
 // native_less: the total order used by sort() — numbers compare numerically,
 // everything else by its string form. Matches the Go VM's nativeLess exactly.
 static bool native_less(Value a, Value b) {
@@ -1480,6 +1502,51 @@ Value native(int id, Value* a, int argc) {
                     if (value_eq(src->data[i], a[1])) return val_int(i);
                 }
                 return val_int(-1);
+            }
+        case 42: // pad_start(s, width, pad) -> string
+        case 43: // pad_end(s, width, pad) -> string
+            {
+                char* s = value_to_string(a[0]);
+                char* pad = value_to_string(a[2]);
+                int width = (a[1].kind == VAL_INT) ? (int)a[1].as.i : (int)value_as_float(a[1]);
+                char* padded = native_pad(s, width, pad, id == 42);
+                Value res = val_str(padded, (int64_t)strlen(padded));
+                free(s); free(pad); free(padded);
+                return res;
+            }
+        case 44: // concat(a, b) -> new array (elements of a then b)
+            {
+                if (a[0].kind != VAL_ARRAY || a[1].kind != VAL_ARRAY)
+                    fatal("concat() expects two arrays");
+                RcArray* out = rc_array_new();
+                for (int64_t i = 0; i < a[0].as.arr->length; i++) rc_array_push(out, a[0].as.arr->data[i]);
+                for (int64_t i = 0; i < a[1].as.arr->length; i++) rc_array_push(out, a[1].as.arr->data[i]);
+                return val_array(out);
+            }
+        case 45: // count(arr, x) -> number of elements equal to x
+            {
+                if (a[0].kind != VAL_ARRAY) fatal("count() expects an array");
+                RcArray* src = a[0].as.arr;
+                int64_t n = 0;
+                for (int64_t i = 0; i < src->length; i++)
+                    if (value_eq(src->data[i], a[1])) n++;
+                return val_int(n);
+            }
+        case 46: // sum(arr) -> int if all int, else number
+            {
+                if (a[0].kind != VAL_ARRAY) fatal("sum() expects an array");
+                RcArray* src = a[0].as.arr;
+                bool all_int = true;
+                for (int64_t i = 0; i < src->length; i++)
+                    if (src->data[i].kind == VAL_FLOAT) all_int = false;
+                if (all_int) {
+                    int64_t t = 0;
+                    for (int64_t i = 0; i < src->length; i++) t += src->data[i].as.i;
+                    return val_int(t);
+                }
+                double t = 0;
+                for (int64_t i = 0; i < src->length; i++) t += value_as_float(src->data[i]);
+                return val_float(t);
             }
     }
     fatal("unknown native builtin");

@@ -179,6 +179,24 @@ func nativeInt(v Value) int64 {
 	return int64(v.asFloat())
 }
 
+// nativePad implements pad_start/pad_end with JS padStart/padEnd semantics:
+// the pad string is repeated and truncated to fill exactly (width-len) bytes.
+func nativePad(s string, width int, pad string, atStart bool) string {
+	if len(s) >= width || pad == "" {
+		return s
+	}
+	need := width - len(s)
+	var b strings.Builder
+	for b.Len() < need {
+		b.WriteString(pad)
+	}
+	filler := b.String()[:need]
+	if atStart {
+		return filler + s
+	}
+	return s + filler
+}
+
 // nativeLess is the total order used by sort(): numbers compare numerically,
 // everything else by its string form. Deterministic and identical to the C VM.
 func nativeLess(a, b Value) bool {
@@ -1094,6 +1112,53 @@ func native(id int, a []Value) Value {
 			}
 		}
 		return vInt(-1)
+	case 42: // pad_start(s, width, pad) -> string
+		return vStr(nativePad(a[0].String(), int(nativeInt(a[1])), a[2].String(), true))
+	case 43: // pad_end(s, width, pad) -> string
+		return vStr(nativePad(a[0].String(), int(nativeInt(a[1])), a[2].String(), false))
+	case 44: // concat(a, b) -> new array (elements of a then b)
+		if a[0].k != kArray || a[1].k != kArray {
+			fatal("concat() expects two arrays")
+		}
+		s1, s2 := *a[0].arr, *a[1].arr
+		cp := make([]Value, 0, len(s1)+len(s2))
+		cp = append(cp, s1...)
+		cp = append(cp, s2...)
+		return vArr(cp)
+	case 45: // count(arr, x) -> number of elements equal to x
+		if a[0].k != kArray {
+			fatal("count() expects an array")
+		}
+		var n int64
+		for _, e := range *a[0].arr {
+			if valueEq(e, a[1]) {
+				n++
+			}
+		}
+		return vInt(n)
+	case 46: // sum(arr) -> int if all int, else number
+		if a[0].k != kArray {
+			fatal("sum() expects an array")
+		}
+		src := *a[0].arr
+		allInt := true
+		for _, e := range src {
+			if e.k == kFloat {
+				allInt = false
+			}
+		}
+		if allInt {
+			var t int64
+			for _, e := range src {
+				t += e.i
+			}
+			return vInt(t)
+		}
+		var t float64
+		for _, e := range src {
+			t += e.asFloat()
+		}
+		return vFloat(t)
 	}
 	fatal(fmt.Sprintf("unknown native builtin: id=%d", id))
 	return vNull()
