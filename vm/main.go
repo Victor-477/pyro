@@ -171,6 +171,14 @@ func (v Value) asFloat() float64 {
 	return float64(v.i)
 }
 
+// nativeInt reads a Value as int64 for integer-only natives (gcd, repeat count).
+func nativeInt(v Value) int64 {
+	if v.k == kInt {
+		return v.i
+	}
+	return int64(v.asFloat())
+}
+
 func (v Value) String() string {
 	switch v.k {
 	case kInt:
@@ -975,6 +983,58 @@ func native(id int, a []Value) Value {
 			fatal("http_serve: " + err.Error())
 		}
 		return vNull()
+	case 31: // clamp(x, lo, hi)
+		if a[0].k == kInt && a[1].k == kInt && a[2].k == kInt {
+			x, lo, hi := a[0].i, a[1].i, a[2].i
+			if x < lo {
+				return vInt(lo)
+			}
+			if x > hi {
+				return vInt(hi)
+			}
+			return vInt(x)
+		}
+		x, lo, hi := a[0].asFloat(), a[1].asFloat(), a[2].asFloat()
+		if x < lo {
+			return vFloat(lo)
+		}
+		if x > hi {
+			return vFloat(hi)
+		}
+		return vFloat(x)
+	case 32: // sign(x) -> int (-1, 0, 1)
+		f := a[0].asFloat()
+		if f < 0 {
+			return vInt(-1)
+		}
+		if f > 0 {
+			return vInt(1)
+		}
+		return vInt(0)
+	case 33: // gcd(a, b) -> int
+		gx, gy := nativeInt(a[0]), nativeInt(a[1])
+		if gx < 0 {
+			gx = -gx
+		}
+		if gy < 0 {
+			gy = -gy
+		}
+		for gy != 0 {
+			gx, gy = gy, gx%gy
+		}
+		return vInt(gx)
+	case 34: // hypot(a, b) -> number
+		return vFloat(math.Hypot(a[0].asFloat(), a[1].asFloat()))
+	case 35: // starts_with(s, prefix) -> bool
+		return vBool(strings.HasPrefix(a[0].String(), a[1].String()))
+	case 36: // ends_with(s, suffix) -> bool
+		return vBool(strings.HasSuffix(a[0].String(), a[1].String()))
+	case 37: // repeat(s, n) -> string  (n<0 treated as 0)
+		n := nativeInt(a[1])
+		if n < 0 {
+			n = 0
+		}
+		return vStr(strings.Repeat(a[0].String(), int(n)))
 	}
 	fatal(fmt.Sprintf("unknown native builtin: id=%d", id))
 	return vNull()

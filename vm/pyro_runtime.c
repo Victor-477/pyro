@@ -1359,6 +1359,66 @@ Value native(int id, Value* a, int argc) {
                 free(dir);
                 return val_null();
             }
+        case 31: // clamp(x, lo, hi)
+            if (a[0].kind == VAL_INT && a[1].kind == VAL_INT && a[2].kind == VAL_INT) {
+                int64_t x = a[0].as.i, lo = a[1].as.i, hi = a[2].as.i;
+                if (x < lo) return val_int(lo);
+                if (x > hi) return val_int(hi);
+                return val_int(x);
+            } else {
+                double x = value_as_float(a[0]), lo = value_as_float(a[1]), hi = value_as_float(a[2]);
+                if (x < lo) return val_float(lo);
+                if (x > hi) return val_float(hi);
+                return val_float(x);
+            }
+        case 32: // sign(x) -> int (-1, 0, 1)
+            {
+                double f = value_as_float(a[0]);
+                return val_int(f < 0 ? -1 : (f > 0 ? 1 : 0));
+            }
+        case 33: // gcd(a, b) -> int
+            {
+                int64_t gx = (a[0].kind == VAL_INT) ? a[0].as.i : (int64_t)value_as_float(a[0]);
+                int64_t gy = (a[1].kind == VAL_INT) ? a[1].as.i : (int64_t)value_as_float(a[1]);
+                if (gx < 0) gx = -gx;
+                if (gy < 0) gy = -gy;
+                while (gy != 0) { int64_t t = gx % gy; gx = gy; gy = t; }
+                return val_int(gx);
+            }
+        case 34: // hypot(a, b) -> number
+            return val_float(hypot(value_as_float(a[0]), value_as_float(a[1])));
+        case 35: // starts_with(s, prefix) -> bool
+            {
+                char* s = value_to_string(a[0]);
+                char* p = value_to_string(a[1]);
+                size_t pl = strlen(p);
+                bool r = strlen(s) >= pl && strncmp(s, p, pl) == 0;
+                free(s); free(p);
+                return val_bool(r);
+            }
+        case 36: // ends_with(s, suffix) -> bool
+            {
+                char* s = value_to_string(a[0]);
+                char* p = value_to_string(a[1]);
+                size_t sl = strlen(s), pl = strlen(p);
+                bool r = sl >= pl && strcmp(s + sl - pl, p) == 0;
+                free(s); free(p);
+                return val_bool(r);
+            }
+        case 37: // repeat(s, n) -> string  (n<0 treated as 0)
+            {
+                char* s = value_to_string(a[0]);
+                int64_t n = (a[1].kind == VAL_INT) ? a[1].as.i : (int64_t)value_as_float(a[1]);
+                if (n < 0) n = 0;
+                size_t sl = strlen(s);
+                char* buf = (char*)malloc(sl * (size_t)n + 1);
+                if (!buf) { free(s); return val_str("", 0); }
+                for (int64_t i = 0; i < n; i++) memcpy(buf + i * sl, s, sl);
+                buf[sl * (size_t)n] = '\0';
+                Value res = val_str(buf, (int64_t)(sl * (size_t)n));
+                free(buf); free(s);
+                return res;
+            }
     }
     fatal("unknown native builtin");
     return val_null();
