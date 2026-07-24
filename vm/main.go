@@ -179,6 +179,17 @@ func nativeInt(v Value) int64 {
 	return int64(v.asFloat())
 }
 
+// nativeLess is the total order used by sort(): numbers compare numerically,
+// everything else by its string form. Deterministic and identical to the C VM.
+func nativeLess(a, b Value) bool {
+	an := a.k == kInt || a.k == kFloat
+	bn := b.k == kInt || b.k == kFloat
+	if an && bn {
+		return a.asFloat() < b.asFloat()
+	}
+	return a.String() < b.String()
+}
+
 func (v Value) String() string {
 	switch v.k {
 	case kInt:
@@ -1035,6 +1046,54 @@ func native(id int, a []Value) Value {
 			n = 0
 		}
 		return vStr(strings.Repeat(a[0].String(), int(n)))
+	case 38: // sort(arr) -> new array sorted ascending (stable)
+		if a[0].k != kArray {
+			fatal("sort() expects an array")
+		}
+		src := *a[0].arr
+		cp := make([]Value, len(src))
+		copy(cp, src)
+		sort.SliceStable(cp, func(i, j int) bool { return nativeLess(cp[i], cp[j]) })
+		return vArr(cp)
+	case 39: // reverse(arr) -> new reversed array
+		if a[0].k != kArray {
+			fatal("reverse() expects an array")
+		}
+		src := *a[0].arr
+		cp := make([]Value, len(src))
+		for i, e := range src {
+			cp[len(src)-1-i] = e
+		}
+		return vArr(cp)
+	case 40: // slice(arr, start, end) -> new subarray [start, end) with safe bounds
+		if a[0].k != kArray {
+			fatal("slice() expects an array")
+		}
+		src := *a[0].arr
+		n := int64(len(src))
+		start, end := nativeInt(a[1]), nativeInt(a[2])
+		if start < 0 {
+			start = 0
+		}
+		if end > n {
+			end = n
+		}
+		if start > end {
+			start = end
+		}
+		cp := make([]Value, end-start)
+		copy(cp, src[start:end])
+		return vArr(cp)
+	case 41: // index_of(arr, x) -> first index of x by value equality, else -1
+		if a[0].k != kArray {
+			fatal("index_of() expects an array")
+		}
+		for i, e := range *a[0].arr {
+			if valueEq(e, a[1]) {
+				return vInt(int64(i))
+			}
+		}
+		return vInt(-1)
 	}
 	fatal(fmt.Sprintf("unknown native builtin: id=%d", id))
 	return vNull()

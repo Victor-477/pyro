@@ -1029,6 +1029,19 @@ void http_serve_dir(const char* dir, int port) {
     }
 }
 
+// native_less: the total order used by sort() — numbers compare numerically,
+// everything else by its string form. Matches the Go VM's nativeLess exactly.
+static bool native_less(Value a, Value b) {
+    bool an = a.kind == VAL_INT || a.kind == VAL_FLOAT;
+    bool bn = b.kind == VAL_INT || b.kind == VAL_FLOAT;
+    if (an && bn) return value_as_float(a) < value_as_float(b);
+    char* sa = value_to_string(a);
+    char* sb = value_to_string(b);
+    bool r = strcmp(sa, sb) < 0;
+    free(sa); free(sb);
+    return r;
+}
+
 // ── Native Builtins ──────────────────────────────────────────
 Value native(int id, Value* a, int argc) {
     switch (id) {
@@ -1418,6 +1431,55 @@ Value native(int id, Value* a, int argc) {
                 Value res = val_str(buf, (int64_t)(sl * (size_t)n));
                 free(buf); free(s);
                 return res;
+            }
+        case 38: // sort(arr) -> new array sorted ascending (stable)
+            {
+                if (a[0].kind != VAL_ARRAY) fatal("sort() expects an array");
+                RcArray* src = a[0].as.arr;
+                RcArray* out = rc_array_new();
+                for (int64_t i = 0; i < src->length; i++) rc_array_push(out, src->data[i]);
+                // stable insertion sort (matches Go's SliceStable ordering)
+                for (int64_t i = 1; i < out->length; i++) {
+                    Value key = out->data[i];
+                    int64_t j = i - 1;
+                    while (j >= 0 && native_less(key, out->data[j])) {
+                        out->data[j + 1] = out->data[j];
+                        j--;
+                    }
+                    out->data[j + 1] = key;
+                }
+                return val_array(out);
+            }
+        case 39: // reverse(arr) -> new reversed array
+            {
+                if (a[0].kind != VAL_ARRAY) fatal("reverse() expects an array");
+                RcArray* src = a[0].as.arr;
+                RcArray* out = rc_array_new();
+                for (int64_t i = src->length - 1; i >= 0; i--) rc_array_push(out, src->data[i]);
+                return val_array(out);
+            }
+        case 40: // slice(arr, start, end) -> new subarray [start, end), safe bounds
+            {
+                if (a[0].kind != VAL_ARRAY) fatal("slice() expects an array");
+                RcArray* src = a[0].as.arr;
+                int64_t n = src->length;
+                int64_t start = (a[1].kind == VAL_INT) ? a[1].as.i : (int64_t)value_as_float(a[1]);
+                int64_t end   = (a[2].kind == VAL_INT) ? a[2].as.i : (int64_t)value_as_float(a[2]);
+                if (start < 0) start = 0;
+                if (end > n) end = n;
+                if (start > end) start = end;
+                RcArray* out = rc_array_new();
+                for (int64_t i = start; i < end; i++) rc_array_push(out, src->data[i]);
+                return val_array(out);
+            }
+        case 41: // index_of(arr, x) -> first index by value equality, else -1
+            {
+                if (a[0].kind != VAL_ARRAY) fatal("index_of() expects an array");
+                RcArray* src = a[0].as.arr;
+                for (int64_t i = 0; i < src->length; i++) {
+                    if (value_eq(src->data[i], a[1])) return val_int(i);
+                }
+                return val_int(-1);
             }
     }
     fatal("unknown native builtin");
