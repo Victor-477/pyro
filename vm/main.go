@@ -63,6 +63,8 @@ const (
 	opJMPT    = 0x32
 	opCALL    = 0x40
 	opRET     = 0x41
+	opPUSHFN     = 0x42 // u16 funcidx -> push a function value
+	opCALLVALUE  = 0x43 // u8 argc -> call the function value beneath the args
 	opPRINT   = 0x50
 	opASSERT  = 0x51
 	opPRINTLN = 0x52
@@ -93,6 +95,7 @@ const (
 	kNull
 	kArray // *[]Value (reference: push/setidx mutate the shared array)
 	kMap   // map[any]Value (structs also use this type)
+	kFunc  // first-class function value (i = function index)
 )
 
 type Value struct {
@@ -112,6 +115,7 @@ func vStr(s string) Value     { return Value{k: kStr, s: s} }
 func vNull() Value            { return Value{k: kNull} }
 func vArr(a []Value) Value    { return Value{k: kArray, arr: &a} }
 func vMap(m map[any]Value) Value { return Value{k: kMap, m: m} }
+func vFunc(idx int64) Value    { return Value{k: kFunc, i: idx} }
 
 // comparable key (Go) from a Value
 func keyOf(v Value) any {
@@ -159,6 +163,8 @@ func (v Value) truthy() bool {
 		return len(*v.arr) > 0
 	case kMap:
 		return len(v.m) > 0
+	case kFunc:
+		return true
 	default:
 		return false
 	}
@@ -234,6 +240,8 @@ func (v Value) String() string {
 			parts[i] = keyToValue(k).String() + ": " + v.m[k].String()
 		}
 		return "{" + join(parts, ", ") + "}"
+	case kFunc:
+		return "<fn#" + strconv.FormatInt(v.i, 10) + ">"
 	default:
 		return "null"
 	}
@@ -599,6 +607,23 @@ func run(p *Program) {
 			base := len(stack) - argc
 			copy(locals, stack[base:])
 			stack = stack[:base]
+			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi})
+			pc = int(fn.entry)
+		case opPUSHFN:
+			push(vFunc(int64(rd16())))
+		case opCALLVALUE:
+			argc := int(code[pc])
+			pc++
+			base := len(stack) - argc
+			fnval := stack[base-1]
+			if fnval.k != kFunc {
+				fatal("call of a non-function value")
+			}
+			fi := int(fnval.i)
+			fn := p.funcs[fi]
+			locals := make([]Value, fn.nlocals)
+			copy(locals, stack[base:])
+			stack = stack[:base-1] // drop the args and the fn value beneath them
 			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi})
 			pc = int(fn.entry)
 		case opRET:

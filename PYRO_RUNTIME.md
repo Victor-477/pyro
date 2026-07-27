@@ -36,6 +36,7 @@ A `Value` is dynamic and carries its type tag at runtime:
 | `null` | absence of value | |
 | `array` | contiguous list of `Value`, reference-counted | |
 | `map` | hash table `Value → Value`, reference-counted | keys by value equality |
+| `function` | first-class function value (holds a function-table index) | immediate; prints as `<fn#N>` |
 
 There is no distinct `struct` type: **structs and enum variants are maps** of
 string keys (e.g. `Ok(v)` → `{"tag": "Ok", "val0": v}`). Data-less enums are

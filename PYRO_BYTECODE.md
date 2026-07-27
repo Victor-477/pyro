@@ -60,6 +60,8 @@ Each instruction = 1 opcode byte + fixed-size operands.
 | `JMPF`/`JMPT` | 31/32 | i32 rel | `pop`; jumps if false/true |
 | `CALL`  | 40 | u16 fn, u8 argc | calls function (new frame) |
 | `RET`   | 41 | — | returns the top to the caller |
+| `PUSHFN` | 42 | u16 funcidx | pushes a **function value** (first-class function) |
+| `CALL_VALUE` | 43 | u8 argc | calls the function value beneath the `argc` args (net −argc−1, +1 result) |
 | `PRINT` | 50 | — | prints `pop()` per its type |
 | `ASSERT`| 51 | — | `pop cond, msg`; aborts if false |
 | `PRINTLN` | 52 | — | prints an empty line |

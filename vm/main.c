@@ -357,6 +357,36 @@ void run_program(Program* p) {
                     pc = fn.entry;
                 }
                 break;
+            case opPUSHFN:
+                {
+                    uint16_t fi = read_u16(code, &pc);
+                    Value v = { .kind = VAL_FUNC };
+                    v.as.i = fi;
+                    stack[sp++] = v;
+                }
+                break;
+            case opCALLVALUE:
+                {
+                    uint8_t argc = code[pc++];
+                    int base = sp - argc;
+                    Value fnval = stack[base - 1];
+                    if (fnval.kind != VAL_FUNC) {
+                        fatal("call of a non-function value");
+                    }
+                    int fi = (int)fnval.as.i;
+                    FuncInfo fn = p->funcs[fi];
+                    int next_base = frames[fp - 1].locals_base + frames[fp - 1].nlocals;
+                    for (int i = 0; i < fn.nlocals; i++) {
+                        locals_stack[next_base + i] = val_null();
+                    }
+                    for (int i = 0; i < argc; i++) {
+                        locals_stack[next_base + i] = stack[base + i];
+                    }
+                    sp = base - 1;   // drop the args and the fn value beneath them
+                    frames[fp++] = (Frame){ .retpc = pc, .locals_base = next_base, .nlocals = fn.nlocals, .fn = fi };
+                    pc = fn.entry;
+                }
+                break;
             case opRET:
                 {
                     Value ret = stack[--sp];

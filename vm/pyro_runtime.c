@@ -355,6 +355,9 @@ char* value_to_string(Value v) {
         return strdup(buf);
     } else if (v.kind == VAL_STR) {
         return strdup(v.as.str ? v.as.str->chars : "");
+    } else if (v.kind == VAL_FUNC) {
+        sprintf(buf, "<fn#%lld>", (long long)v.as.i);
+        return strdup(buf);
     } else if (v.kind == VAL_ARRAY) {
         size_t capacity = 1004;
         size_t length = 1;
@@ -460,6 +463,7 @@ bool value_eq(Value a, Value b) {
     if (a.kind == VAL_NULL && b.kind == VAL_NULL) return true;
     if (a.kind != b.kind) return false;
     if (a.kind == VAL_INT) return a.as.i == b.as.i;
+    if (a.kind == VAL_FUNC) return a.as.i == b.as.i;
     return false;
 }
 
@@ -471,6 +475,7 @@ bool value_truthy(Value v) {
         case VAL_STR: return v.as.str && v.as.str->length > 0;
         case VAL_ARRAY: return v.as.arr && v.as.arr->length > 0;
         case VAL_MAP: return v.as.map && v.as.map->size > 0;
+        case VAL_FUNC: return true;
         default: return false;
     }
 }

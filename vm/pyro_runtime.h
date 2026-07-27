@@ -51,6 +51,8 @@
 #define opJMPT       0x32
 #define opCALL       0x40
 #define opRET        0x41
+#define opPUSHFN     0x42
+#define opCALLVALUE  0x43
 #define opPRINT      0x50
 #define opASSERT     0x51
 #define opPRINTLN    0x52
@@ -89,7 +91,8 @@ typedef enum {
     VAL_STR,
     VAL_NULL,
     VAL_ARRAY,
-    VAL_MAP
+    VAL_MAP,
+    VAL_FUNC    // first-class function value (as.i = function index)
 } ValueKind;
 
 struct Value {
