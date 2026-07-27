@@ -1148,9 +1148,26 @@ func native(id int, a []Value) Value {
 			cp[len(src)-1-i] = e
 		}
 		return vArr(cp)
-	case 40: // slice(arr, start, end) -> new subarray [start, end) with safe bounds
+	case 40: // slice(x, start, end) -> subarray/substring [start, end), safe bounds
+		// Polymorphic over array|string so `xs[a..b]` and `s[a..b]` can lower to
+		// the SAME call — the parser cannot know the operand's type (10.9).
+		if a[0].k == kStr {
+			s := a[0].s
+			n := int64(len(s))
+			start, end := nativeInt(a[1]), nativeInt(a[2])
+			if start < 0 {
+				start = 0
+			}
+			if end > n {
+				end = n
+			}
+			if start > end {
+				start = end
+			}
+			return vStr(s[start:end])
+		}
 		if a[0].k != kArray {
-			fatal("slice() expects an array")
+			fatal("slice() expects an array or a string")
 		}
 		src := *a[0].arr
 		n := int64(len(src))

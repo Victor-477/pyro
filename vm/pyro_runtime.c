@@ -1544,9 +1544,24 @@ Value native(int id, Value* a, int argc) {
                 for (int64_t i = src->length - 1; i >= 0; i--) rc_array_push(out, src->data[i]);
                 return val_array(out);
             }
-        case 40: // slice(arr, start, end) -> new subarray [start, end), safe bounds
+        case 40: // slice(x, start, end) -> subarray/substring [start, end), safe bounds
             {
-                if (a[0].kind != VAL_ARRAY) fatal("slice() expects an array");
+                // Polymorphic over array|string so `xs[a..b]` and `s[a..b]` can
+                // lower to the SAME call — the parser cannot know the operand's
+                // type (10.9). Must mirror main.go case 40 exactly.
+                if (a[0].kind == VAL_STR) {
+                    char* s = value_to_string(a[0]);
+                    int64_t n = (int64_t)strlen(s);
+                    int64_t st = (a[1].kind == VAL_INT) ? a[1].as.i : (int64_t)value_as_float(a[1]);
+                    int64_t en = (a[2].kind == VAL_INT) ? a[2].as.i : (int64_t)value_as_float(a[2]);
+                    if (st < 0) st = 0;
+                    if (en > n) en = n;
+                    if (st > en) st = en;
+                    Value res = val_str(s + st, en - st);
+                    free(s);
+                    return res;
+                }
+                if (a[0].kind != VAL_ARRAY) fatal("slice() expects an array or a string");
                 RcArray* src = a[0].as.arr;
                 int64_t n = src->length;
                 int64_t start = (a[1].kind == VAL_INT) ? a[1].as.i : (int64_t)value_as_float(a[1]);

@@ -124,7 +124,17 @@ the result. The id table is **mirrored** between the generator (`NATIVES` in
 | | | | | 27 | `write_bytes` |
 | | | | | 28 | `read_file` |
 | | | | | 29 | `args` |
-| | | | | 30 | `http_serve` |
+| 31 | `clamp` | 38 | `sort` | 45 | `count` |
+| 32 | `sign` | 39 | `reverse` | 46 | `sum` |
+| 33 | `gcd` | 40 | `slice` | 47 | `now_ms` |
+| 34 | `hypot` | 41 | `index_of` | 48 | `monotonic_ms` |
+| 35 | `starts_with` | 42 | `pad_start` | 49 | `random` |
+| 36 | `ends_with` | 43 | `pad_end` | 50 | `random_int` |
+| 37 | `repeat` | 44 | `concat` | 51 | `seed` |
+
+Ids 30 and below are listed in the left three columns above; 31–51 continue here.
+An id is **permanent** once shipped: renumbering silently breaks every `.pyro`
+already on disk, so new builtins only ever append.
 
 - **`input(prompt)`** reads a line from stdin (I/O).
 - **`json_encode`/`json_decode`** serialize/deserialize the value tree (object keys
@@ -144,6 +154,14 @@ the result. The id table is **mirrored** between the generator (`NATIVES` in
   stream-compile it; missing paths give 404 and any attempt to escape the root
   (`..`, backslash, drive letter) gives 403. This is what makes a Cryo program a
   web server — see the full-stack example in `cryo/examples/fullstack/`.
+- **`slice(x, start, end)`** is **polymorphic over arrays and strings** — it
+  returns a new array for an array and a new (byte-indexed) string for a string.
+  It is the single lowering target for the slice syntax `xs[a..b]` / `s[a..b]`
+  (roadmap 10.9): the parser desugars slicing *before* types are known, so it
+  cannot pick an array-only or string-only builtin. Both bounds are **clamped**,
+  never an error — `start` below 0 becomes 0, `end` past the length becomes the
+  length, and `start > end` yields an empty result. Any other operand type
+  aborts. The result is always a **copy**; mutating it never affects the source.
 - `to_int`/`to_number` of a non-numeric string **abort** (fail-fast).
 
 ### Sandbox policy
