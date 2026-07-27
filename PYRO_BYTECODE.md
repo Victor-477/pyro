@@ -11,7 +11,7 @@ own frames of local variables).
 
 ```
 magic     4    "PYRO"
-version   1    0x02
+version   1    0x03   (v2 still accepted by both VMs)
 flags     1    bit0 = code section encoded (rolling XOR)
                bit1 = debug section present (pc → line)
                bit2 = sandbox (VM refuses network/machine natives)
@@ -19,7 +19,7 @@ nconsts   u16
 consts    nconsts × [ tag(1) + payload ]
               tag 1 int64   → 8 bytes
               tag 2 float64 → 8 bytes
-              tag 3 string  → u16 len + UTF-8 bytes
+              tag 3 string  → u32 len + UTF-8 bytes   (u16 in v2)
               tag 4 bool    → 1 byte
 nfuncs    u16
 funcs     nfuncs × [ nameidx u16, entry u32, nparams u8, nlocals u16 ]
@@ -118,6 +118,22 @@ compile time.
 > pops **both** the value and the array.
 
 Jumps are **relative** to the end of the instruction itself (`rel = target − (pc_after_operand)`).
+
+## Format versions
+
+| Version | Change |
+|---|---|
+| v2 | `JMP`/`JMPF`/`JMPT`/`TRYPUSH` use i32 (no ±32 KB limit); optional debug section |
+| **v3** | **string-constant length widened u16 → u32**, lifting the 64 KB literal cap |
+
+Readers **must accept both**: the string length's width is chosen by the version
+byte, and every engine in this repo does so (`main.go`, `main.c`,
+`disasm_pyro.py`, and the self-hosted generator). A v2 file therefore still runs
+unchanged; only the writer moved to v3.
+
+The v2 cap was not theoretical — the self-hosted compiler's own source crossed it
+at ~65 KB and produced a bare `'H' format requires 0 <= number <= 65535` with no
+indication of the cause. See `ISSUES/16`.
 
 ## Dynamic typing in the VM
 

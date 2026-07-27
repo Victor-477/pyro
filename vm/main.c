@@ -126,8 +126,10 @@ Program* load_program(const uint8_t* data, size_t size) {
     if (size < 6 || memcmp(data, "PYRO", 4) != 0) {
         fatal("invalid .pyro file (magic)");
     }
-    if (data[4] != 2) {
-        fatal("unsupported .pyro version (expected v2)");
+    // v3 widened the string-constant length u16 -> u32; v2 is still accepted.
+    uint8_t ver = data[4];
+    if (ver != 2 && ver != 3) {
+        fatal("unsupported .pyro version (expected v2 or v3)");
     }
     uint8_t flags = data[5];
     Program* p = malloc(sizeof(Program));
@@ -154,9 +156,10 @@ Program* load_program(const uint8_t* data, size_t size) {
                 break;
             case TAG_STR:
                 {
-                    uint16_t len = read_u16(data, &pos);
-                    p->consts[i] = val_str((const char*)(data + pos), len);
-                    pos += len;
+                    uint32_t len = (ver >= 3) ? read_u32(data, &pos)
+                                              : (uint32_t)read_u16(data, &pos);
+                    p->consts[i] = val_str((const char*)(data + pos), (int64_t)len);
+                    pos += (int)len;
                 }
                 break;
             case TAG_BOOL:

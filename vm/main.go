@@ -366,8 +366,10 @@ func load(data []byte) *Program {
 	if len(data) < 6 || string(data[0:4]) != "PYRO" {
 		fatal("invalid .pyro file (magic)")
 	}
-	if data[4] != 2 {
-		fatal("unsupported .pyro version (expected v2)")
+	// v3 widened the string-constant length u16 -> u32; v2 is still accepted.
+	ver := data[4]
+	if ver != 2 && ver != 3 {
+		fatal("unsupported .pyro version (expected v2 or v3)")
 	}
 	flags := data[5]
 	p := &Program{}
@@ -388,7 +390,13 @@ func load(data []byte) *Program {
 			p.consts[i] = vFloat(math.Float64frombits(binary.LittleEndian.Uint64(data[pos:])))
 			pos += 8
 		case 3:
-			n := rd16()
+			// v3 stores the length as u32; v2 as u16.
+			n := 0
+			if ver >= 3 {
+				n = int(rd32())
+			} else {
+				n = rd16()
+			}
 			p.consts[i] = vStr(string(data[pos : pos+n]))
 			pos += n
 		case 4:
