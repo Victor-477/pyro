@@ -1062,6 +1062,37 @@ void http_serve_dir(const char* dir, int port) {
     }
 }
 
+static uint64_t g_c_prng_state = 0x853c49e6748fea9bULL;
+static int64_t g_c_start_ms = 0;
+
+static uint64_t splitmix64_next(void) {
+    g_c_prng_state += 0x9e3779b97f4a7c15ULL;
+    uint64_t z = g_c_prng_state;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+static int64_t pyro_get_now_ms(void) {
+#ifdef _WIN32
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return (int64_t)((t - 116444736000000000ULL) / 10000ULL);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)ts.tv_nsec / 1000000;
+#endif
+}
+
+static int64_t pyro_get_mono_ms(void) {
+    if (g_c_start_ms == 0) {
+        g_c_start_ms = pyro_get_now_ms();
+    }
+    return pyro_get_now_ms() - g_c_start_ms;
+}
+
 // native_pad: pad_start/pad_end with JS padStart/padEnd semantics — the pad
 // string is repeated and truncated to fill exactly (width-len) bytes. Caller frees.
 static char* native_pad(const char* s, int width, const char* pad, bool at_start) {
@@ -1580,6 +1611,30 @@ Value native(int id, Value* a, int argc) {
                 double t = 0;
                 for (int64_t i = 0; i < src->length; i++) t += value_as_float(src->data[i]);
                 return val_float(t);
+            }
+        case 47: // now_ms() -> int
+            return val_int(pyro_get_now_ms());
+        case 48: // monotonic_ms() -> int
+            return val_int(pyro_get_mono_ms());
+        case 49: // random() -> number [0.0, 1.0)
+            {
+                double r = (double)(splitmix64_next() >> 11) / 9007199254740992.0;
+                return val_float(r);
+            }
+        case 50: // random_int(lo, hi) -> int inclusive
+            {
+                int64_t lo = (a[0].kind == VAL_INT) ? a[0].as.i : (int64_t)value_as_float(a[0]);
+                int64_t hi = (a[1].kind == VAL_INT) ? a[1].as.i : (int64_t)value_as_float(a[1]);
+                if (hi < lo) { int64_t tmp = lo; lo = hi; hi = tmp; }
+                uint64_t span = (uint64_t)(hi - lo + 1);
+                int64_t res = lo + (int64_t)(splitmix64_next() % span);
+                return val_int(res);
+            }
+        case 51: // seed(n) -> void/null
+            {
+                int64_t n = (a[0].kind == VAL_INT) ? a[0].as.i : (int64_t)value_as_float(a[0]);
+                g_c_prng_state = (uint64_t)n;
+                return val_null();
             }
     }
     fatal("unknown native builtin");

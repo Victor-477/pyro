@@ -859,6 +859,16 @@ func httpPost(url, body string) string {
 // PYRO_SANDBOX=1 in the environment (runtime policy on artifacts).
 var sandboxed bool
 var progArgs []string   // program args after the .pyro path (for the args() native)
+var prngState uint64 = 0x853c49e6748fea9b
+var vmStartTime = time.Now()
+
+func splitmix64Next() uint64 {
+	prngState += 0x9e3779b97f4a7c15
+	z := prngState
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	return z ^ (z >> 31)
+}
 
 func native(id int, a []Value) Value {
 	switch id {
@@ -1206,6 +1216,24 @@ func native(id int, a []Value) Value {
 			t += e.asFloat()
 		}
 		return vFloat(t)
+	case 47: // now_ms() -> int
+		return vInt(time.Now().UnixMilli())
+	case 48: // monotonic_ms() -> int
+		return vInt(time.Since(vmStartTime).Milliseconds())
+	case 49: // random() -> number [0.0, 1.0)
+		r := float64(splitmix64Next()>>11) / 9007199254740992.0
+		return vFloat(r)
+	case 50: // random_int(lo, hi) -> int inclusive
+		lo, hi := nativeInt(a[0]), nativeInt(a[1])
+		if hi < lo {
+			lo, hi = hi, lo
+		}
+		span := uint64(hi - lo + 1)
+		val := lo + int64(splitmix64Next()%span)
+		return vInt(val)
+	case 51: // seed(n) -> void/null
+		prngState = uint64(nativeInt(a[0]))
+		return vNull()
 	}
 	fatal(fmt.Sprintf("unknown native builtin: id=%d", id))
 	return vNull()
