@@ -360,9 +360,22 @@ void run_program(Program* p) {
             case opPUSHFN:
                 {
                     uint16_t fi = read_u16(code, &pc);
-                    Value v = { .kind = VAL_FUNC };
-                    v.as.i = fi;
-                    stack[sp++] = v;
+                    stack[sp++] = val_func((int32_t)fi, NULL);
+                }
+                break;
+            case opCLOSURE:
+                {
+                    uint16_t fi = read_u16(code, &pc);
+                    uint8_t ncap = code[pc++];
+                    RcArray* cap = rc_array_new();
+                    for (int i = 0; i < ncap; i++) {
+                        rc_array_push(cap, stack[sp - ncap + i]);
+                    }
+                    for (int i = 0; i < ncap; i++) {
+                        release_value(stack[sp - ncap + i]);
+                    }
+                    sp -= ncap;
+                    stack[sp++] = val_func((int32_t)fi, cap);
                 }
                 break;
             case opCALLVALUE:
@@ -373,16 +386,24 @@ void run_program(Program* p) {
                     if (fnval.kind != VAL_FUNC) {
                         fatal("call of a non-function value");
                     }
-                    int fi = (int)fnval.as.i;
+                    int fi = (int)fnval.fnidx;
                     FuncInfo fn = p->funcs[fi];
                     int next_base = frames[fp - 1].locals_base + frames[fp - 1].nlocals;
                     for (int i = 0; i < fn.nlocals; i++) {
                         locals_stack[next_base + i] = val_null();
                     }
-                    for (int i = 0; i < argc; i++) {
-                        locals_stack[next_base + i] = stack[base + i];
+                    // captured values fill the leading locals, then the arguments
+                    int ncap = fnval.as.arr ? (int)fnval.as.arr->length : 0;
+                    for (int i = 0; i < ncap; i++) {
+                        Value c = fnval.as.arr->data[i];
+                        retain_value(c);
+                        locals_stack[next_base + i] = c;
                     }
-                    sp = base - 1;   // drop the args and the fn value beneath them
+                    for (int i = 0; i < argc; i++) {
+                        locals_stack[next_base + ncap + i] = stack[base + i];
+                    }
+                    release_value(fnval);   // the stack slot's reference is gone
+                    sp = base - 1;          // drop the args and the fn value beneath
                     frames[fp++] = (Frame){ .retpc = pc, .locals_base = next_base, .nlocals = fn.nlocals, .fn = fi };
                     pc = fn.entry;
                 }

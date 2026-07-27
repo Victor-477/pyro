@@ -103,6 +103,15 @@ Value val_array(RcArray* arr) {
     return v;
 }
 
+// function value: `captured` is NULL for a plain function reference, or an
+// array of captured values (taken over, not retained again) for a closure.
+Value val_func(int32_t fnidx, RcArray* captured) {
+    Value v = { .kind = VAL_FUNC };
+    v.fnidx = fnidx;
+    v.as.arr = captured;
+    return v;
+}
+
 Value val_map(RcMap* map) {
     Value v = { .kind = VAL_MAP };
     v.as.map = map;
@@ -112,6 +121,11 @@ Value val_map(RcMap* map) {
 
 // ── Memory Management Implementation ──────────────────────────
 void retain_value(Value v) {
+    if (v.kind == VAL_FUNC) {
+        // a closure owns its captured values; a bare function value has none
+        if (v.as.arr) v.as.arr->ref_count++;
+        return;
+    }
     if (v.kind == VAL_STR && v.as.str) {
         v.as.str->ref_count++;
     } else if (v.kind == VAL_ARRAY && v.as.arr) {
@@ -122,6 +136,20 @@ void retain_value(Value v) {
 }
 
 void release_value(Value v) {
+    if (v.kind == VAL_FUNC) {
+        // releasing a closure releases its captured values (via the array)
+        if (v.as.arr) {
+            v.as.arr->ref_count--;
+            if (v.as.arr->ref_count <= 0) {
+                for (int64_t i = 0; i < v.as.arr->length; i++) {
+                    release_value(v.as.arr->data[i]);
+                }
+                free(v.as.arr->data);
+                free(v.as.arr);
+            }
+        }
+        return;
+    }
     if (v.kind == VAL_STR && v.as.str) {
         v.as.str->ref_count--;
         if (v.as.str->ref_count <= 0) {
@@ -356,7 +384,7 @@ char* value_to_string(Value v) {
     } else if (v.kind == VAL_STR) {
         return strdup(v.as.str ? v.as.str->chars : "");
     } else if (v.kind == VAL_FUNC) {
-        sprintf(buf, "<fn#%lld>", (long long)v.as.i);
+        sprintf(buf, "<fn#%d>", (int)v.fnidx);
         return strdup(buf);
     } else if (v.kind == VAL_ARRAY) {
         size_t capacity = 1004;
@@ -463,7 +491,7 @@ bool value_eq(Value a, Value b) {
     if (a.kind == VAL_NULL && b.kind == VAL_NULL) return true;
     if (a.kind != b.kind) return false;
     if (a.kind == VAL_INT) return a.as.i == b.as.i;
-    if (a.kind == VAL_FUNC) return a.as.i == b.as.i;
+    if (a.kind == VAL_FUNC) return a.fnidx == b.fnidx && a.as.arr == b.as.arr;
     return false;
 }
 

@@ -65,6 +65,7 @@ const (
 	opRET     = 0x41
 	opPUSHFN     = 0x42 // u16 funcidx -> push a function value
 	opCALLVALUE  = 0x43 // u8 argc -> call the function value beneath the args
+	opCLOSURE    = 0x44 // u16 funcidx, u8 ncap -> pop ncap values into a closure
 	opPRINT   = 0x50
 	opASSERT  = 0x51
 	opPRINTLN = 0x52
@@ -116,6 +117,12 @@ func vNull() Value            { return Value{k: kNull} }
 func vArr(a []Value) Value    { return Value{k: kArray, arr: &a} }
 func vMap(m map[any]Value) Value { return Value{k: kMap, m: m} }
 func vFunc(idx int64) Value    { return Value{k: kFunc, i: idx} }
+
+// vClosure: a function value carrying captured values (captured BY VALUE).
+// They are copied into the leading locals of the callee by opCALLVALUE.
+func vClosure(idx int64, captured []Value) Value {
+	return Value{k: kFunc, i: idx, arr: &captured}
+}
 
 // comparable key (Go) from a Value
 func keyOf(v Value) any {
@@ -611,6 +618,15 @@ func run(p *Program) {
 			pc = int(fn.entry)
 		case opPUSHFN:
 			push(vFunc(int64(rd16())))
+		case opCLOSURE:
+			fi := int64(rd16())
+			ncap := int(code[pc])
+			pc++
+			base := len(stack) - ncap
+			cap := make([]Value, ncap)
+			copy(cap, stack[base:])
+			stack = stack[:base]
+			push(vClosure(fi, cap))
 		case opCALLVALUE:
 			argc := int(code[pc])
 			pc++
@@ -622,7 +638,13 @@ func run(p *Program) {
 			fi := int(fnval.i)
 			fn := p.funcs[fi]
 			locals := make([]Value, fn.nlocals)
-			copy(locals, stack[base:])
+			// captured values occupy the leading locals, then the arguments
+			ncap := 0
+			if fnval.arr != nil {
+				ncap = len(*fnval.arr)
+				copy(locals, *fnval.arr)
+			}
+			copy(locals[ncap:], stack[base:])
 			stack = stack[:base-1] // drop the args and the fn value beneath them
 			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi})
 			pc = int(fn.entry)

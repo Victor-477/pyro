@@ -53,6 +53,7 @@
 #define opRET        0x41
 #define opPUSHFN     0x42
 #define opCALLVALUE  0x43
+#define opCLOSURE    0x44
 #define opPRINT      0x50
 #define opASSERT     0x51
 #define opPRINTLN    0x52
@@ -92,17 +93,21 @@ typedef enum {
     VAL_NULL,
     VAL_ARRAY,
     VAL_MAP,
-    VAL_FUNC    // first-class function value (as.i = function index)
+    VAL_FUNC    // function value: fnidx = index, as.arr = captures (or NULL)
 } ValueKind;
 
 struct Value {
     ValueKind kind;
+    // VAL_FUNC only: the function-table index. It lives OUTSIDE the union so a
+    // closure can carry both its index and its captured values (as.arr). It
+    // fits in the padding after `kind`, so Value does not grow.
+    int32_t fnidx;
     union {
         int64_t i;
         double f;
         bool b;
         RcString* str;
-        RcArray* arr;
+        RcArray* arr;   // VAL_FUNC: captured values (NULL when non-capturing)
         RcMap* map;
     } as;
 };
@@ -153,6 +158,7 @@ Value val_str(const char* chars, int64_t len);
 Value val_str_rc(RcString* s);
 Value val_array(RcArray* arr);
 Value val_map(RcMap* map);
+Value val_func(int32_t fnidx, RcArray* captured);   // captured=NULL -> plain fn
 // reference counting
 void retain_value(Value v);
 void release_value(Value v);
