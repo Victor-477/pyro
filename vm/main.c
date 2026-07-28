@@ -126,8 +126,10 @@ Program* load_program(const uint8_t* data, size_t size) {
     if (size < 6 || memcmp(data, "PYRO", 4) != 0) {
         fatal("invalid .pyro file (magic)");
     }
-    if (data[4] != 2) {
-        fatal("unsupported .pyro version (expected v2)");
+    // v3 widened the string-constant length u16 -> u32; v2 is still accepted.
+    uint8_t ver = data[4];
+    if (ver != 2 && ver != 3) {
+        fatal("unsupported .pyro version (expected v2 or v3)");
     }
     uint8_t flags = data[5];
     Program* p = malloc(sizeof(Program));
@@ -154,9 +156,10 @@ Program* load_program(const uint8_t* data, size_t size) {
                 break;
             case TAG_STR:
                 {
-                    uint16_t len = read_u16(data, &pos);
-                    p->consts[i] = val_str((const char*)(data + pos), len);
-                    pos += len;
+                    uint32_t len = (ver >= 3) ? read_u32(data, &pos)
+                                              : (uint32_t)read_u16(data, &pos);
+                    p->consts[i] = val_str((const char*)(data + pos), (int64_t)len);
+                    pos += (int)len;
                 }
                 break;
             case TAG_BOOL:
@@ -357,6 +360,57 @@ void run_program(Program* p) {
                     pc = fn.entry;
                 }
                 break;
+            case opPUSHFN:
+                {
+                    uint16_t fi = read_u16(code, &pc);
+                    stack[sp++] = val_func((int32_t)fi, NULL);
+                }
+                break;
+            case opCLOSURE:
+                {
+                    uint16_t fi = read_u16(code, &pc);
+                    uint8_t ncap = code[pc++];
+                    RcArray* cap = rc_array_new();
+                    for (int i = 0; i < ncap; i++) {
+                        rc_array_push(cap, stack[sp - ncap + i]);
+                    }
+                    for (int i = 0; i < ncap; i++) {
+                        release_value(stack[sp - ncap + i]);
+                    }
+                    sp -= ncap;
+                    stack[sp++] = val_func((int32_t)fi, cap);
+                }
+                break;
+            case opCALLVALUE:
+                {
+                    uint8_t argc = code[pc++];
+                    int base = sp - argc;
+                    Value fnval = stack[base - 1];
+                    if (fnval.kind != VAL_FUNC) {
+                        fatal("call of a non-function value");
+                    }
+                    int fi = (int)fnval.fnidx;
+                    FuncInfo fn = p->funcs[fi];
+                    int next_base = frames[fp - 1].locals_base + frames[fp - 1].nlocals;
+                    for (int i = 0; i < fn.nlocals; i++) {
+                        locals_stack[next_base + i] = val_null();
+                    }
+                    // captured values fill the leading locals, then the arguments
+                    int ncap = fnval.as.arr ? (int)fnval.as.arr->length : 0;
+                    for (int i = 0; i < ncap; i++) {
+                        Value c = fnval.as.arr->data[i];
+                        retain_value(c);
+                        locals_stack[next_base + i] = c;
+                    }
+                    for (int i = 0; i < argc; i++) {
+                        locals_stack[next_base + ncap + i] = stack[base + i];
+                    }
+                    release_value(fnval);   // the stack slot's reference is gone
+                    sp = base - 1;          // drop the args and the fn value beneath
+                    frames[fp++] = (Frame){ .retpc = pc, .locals_base = next_base, .nlocals = fn.nlocals, .fn = fi };
+                    pc = fn.entry;
+                }
+                break;
             case opRET:
                 {
                     Value ret = stack[--sp];
@@ -460,14 +514,20 @@ void run_program(Program* p) {
                 break;
             case opAPPEND:
                 {
+                    // contract: pop val, pop arr -> push new size (net -1).
+                    // Peeking arr here would leave a stranded slot, and paths
+                    // that merge after a conditional push would then disagree
+                    // on the stack depth.
                     Value val = stack[--sp];
-                    Value arr = stack[sp - 1];
+                    Value arr = stack[--sp];
                     if (arr.kind != VAL_ARRAY) {
                         fatal("push on a non-array value");
                     }
                     rc_array_push(arr.as.arr, val);
                     release_value(val);
-                    stack[sp++] = val_int(arr.as.arr->length);
+                    int64_t new_len = arr.as.arr->length;
+                    release_value(arr);
+                    stack[sp++] = val_int(new_len);
                 }
                 break;
             case opHAS:
@@ -567,7 +627,11 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "[Pyro VM] usage: pyrovm program.pyro\n");
         return 1;
     }
-    
+
+    // program args seen by args(): everything after the .pyro path
+    pyro_argc = argc - 2;
+    pyro_argv = argv + 2;
+
     FILE* f = fopen(argv[1], "rb");
     if (!f) {
         fprintf(stderr, "[Pyro VM] could not read: %s\n", argv[1]);

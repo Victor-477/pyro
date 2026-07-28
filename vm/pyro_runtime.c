@@ -11,9 +11,28 @@
 #include <math.h>
 #include <ctype.h>
 
+// strdup is POSIX, not ISO C: strict modes (-std=c11) hide it, and it would
+// then be implicitly declared as returning int — which truncates the pointer
+// on 64-bit hosts. Always use our own, so the build is std-level independent.
+static char* pyro_strdup(const char* s) {
+    size_t n = strlen(s) + 1;
+    char* p = (char*)malloc(n);
+    if (p) memcpy(p, s, n);
+    return p;
+}
+#define strdup pyro_strdup
+
 #ifdef _WIN32
 #include <windows.h>
 #include <process.h>
+// Under strict ISO mode (-std=c11 defines __STRICT_ANSI__) MinGW hides these
+// MSVCRT extensions, so they would be implicitly declared as returning int and
+// the FILE*/pid would be truncated on 64-bit. Declare them ourselves.
+#ifdef __STRICT_ANSI__
+FILE* _popen(const char* command, const char* mode);
+int   _pclose(FILE* stream);
+int   _getpid(void);
+#endif
 #define sleep_ms(ms) Sleep(ms)
 #define getpid _getpid
 #define popen _popen
@@ -25,6 +44,10 @@
 
 // sandbox policy: defined here, linked by the host (engine).
 bool pyro_sandboxed = false;
+
+// program arguments, published by the host (VM main / AOT main) for args().
+int    pyro_argc = 0;
+char** pyro_argv = NULL;
 
 Value val_int(int64_t i) {
     Value v = { .kind = VAL_INT };
@@ -80,6 +103,15 @@ Value val_array(RcArray* arr) {
     return v;
 }
 
+// function value: `captured` is NULL for a plain function reference, or an
+// array of captured values (taken over, not retained again) for a closure.
+Value val_func(int32_t fnidx, RcArray* captured) {
+    Value v = { .kind = VAL_FUNC };
+    v.fnidx = fnidx;
+    v.as.arr = captured;
+    return v;
+}
+
 Value val_map(RcMap* map) {
     Value v = { .kind = VAL_MAP };
     v.as.map = map;
@@ -89,6 +121,11 @@ Value val_map(RcMap* map) {
 
 // ── Memory Management Implementation ──────────────────────────
 void retain_value(Value v) {
+    if (v.kind == VAL_FUNC) {
+        // a closure owns its captured values; a bare function value has none
+        if (v.as.arr) v.as.arr->ref_count++;
+        return;
+    }
     if (v.kind == VAL_STR && v.as.str) {
         v.as.str->ref_count++;
     } else if (v.kind == VAL_ARRAY && v.as.arr) {
@@ -99,6 +136,20 @@ void retain_value(Value v) {
 }
 
 void release_value(Value v) {
+    if (v.kind == VAL_FUNC) {
+        // releasing a closure releases its captured values (via the array)
+        if (v.as.arr) {
+            v.as.arr->ref_count--;
+            if (v.as.arr->ref_count <= 0) {
+                for (int64_t i = 0; i < v.as.arr->length; i++) {
+                    release_value(v.as.arr->data[i]);
+                }
+                free(v.as.arr->data);
+                free(v.as.arr);
+            }
+        }
+        return;
+    }
     if (v.kind == VAL_STR && v.as.str) {
         v.as.str->ref_count--;
         if (v.as.str->ref_count <= 0) {
@@ -332,6 +383,9 @@ char* value_to_string(Value v) {
         return strdup(buf);
     } else if (v.kind == VAL_STR) {
         return strdup(v.as.str ? v.as.str->chars : "");
+    } else if (v.kind == VAL_FUNC) {
+        sprintf(buf, "<fn#%d>", (int)v.fnidx);
+        return strdup(buf);
     } else if (v.kind == VAL_ARRAY) {
         size_t capacity = 1004;
         size_t length = 1;
@@ -437,6 +491,7 @@ bool value_eq(Value a, Value b) {
     if (a.kind == VAL_NULL && b.kind == VAL_NULL) return true;
     if (a.kind != b.kind) return false;
     if (a.kind == VAL_INT) return a.as.i == b.as.i;
+    if (a.kind == VAL_FUNC) return a.fnidx == b.fnidx && a.as.arr == b.as.arr;
     return false;
 }
 
@@ -448,6 +503,7 @@ bool value_truthy(Value v) {
         case VAL_STR: return v.as.str && v.as.str->length > 0;
         case VAL_ARRAY: return v.as.arr && v.as.arr->length > 0;
         case VAL_MAP: return v.as.map && v.as.map->size > 0;
+        case VAL_FUNC: return true;
         default: return false;
     }
 }
@@ -467,7 +523,12 @@ int64_t value_length(Value v) {
 Value index_get(Value cont, Value key) {
     if (cont.kind == VAL_ARRAY) {
         int64_t idx = key.as.i;
-        return rc_array_get(cont.as.arr, idx);
+        // rc_array_get borrows; callers of index_get own (and release) the
+        // result, so retain here exactly as the map branch below does.
+        // Without this the element is freed while still in the array.
+        Value res = rc_array_get(cont.as.arr, idx);
+        retain_value(res);
+        return res;
     }
     if (cont.kind == VAL_MAP) {
         Value res = rc_map_get(cont.as.map, key);
@@ -871,6 +932,202 @@ char* http_post_curl(const char* url, const char* body) {
     return buf;
 }
 
+// ── Minimal static HTTP server (backs http_serve) ────────────
+// Single-threaded HTTP/1.1, one connection at a time: enough to serve a demo
+// (page + .wasm) and to keep the C VM at parity with the Go VM's http_serve.
+#ifdef _WIN32
+#include <winsock2.h>
+typedef SOCKET pyro_sock;
+#define PYRO_BADSOCK  INVALID_SOCKET
+#define pyro_closesock closesocket
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+typedef int pyro_sock;
+#define PYRO_BADSOCK  (-1)
+#define pyro_closesock close
+#endif
+
+static const char* mime_for(const char* path) {
+    const char* dot = strrchr(path, '.');
+    if (!dot) return "application/octet-stream";
+    if (!strcmp(dot, ".wasm")) return "application/wasm";
+    if (!strcmp(dot, ".html") || !strcmp(dot, ".htm")) return "text/html; charset=utf-8";
+    if (!strcmp(dot, ".js"))   return "application/javascript";
+    if (!strcmp(dot, ".css"))  return "text/css";
+    if (!strcmp(dot, ".json")) return "application/json";
+    if (!strcmp(dot, ".svg"))  return "image/svg+xml";
+    if (!strcmp(dot, ".png"))  return "image/png";
+    if (!strcmp(dot, ".txt"))  return "text/plain; charset=utf-8";
+    return "application/octet-stream";
+}
+
+// Reject anything that could escape the served root: absolute paths, drive
+// letters, backslashes and any ".." segment (mirrors Go's http.Dir guard).
+static bool path_is_safe(const char* p) {
+    if (strchr(p, '\\') || strchr(p, ':')) return false;
+    for (const char* s = p; *s; s++) {
+        if (s[0] == '.' && s[1] == '.') return false;
+    }
+    return true;
+}
+
+static void http_send(pyro_sock c, int status, const char* reason,
+                      const char* ctype, const char* body, long blen) {
+    char head[512];
+    int n = snprintf(head, sizeof(head),
+                     "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %ld\r\n"
+                     "Connection: close\r\n\r\n", status, reason, ctype, blen);
+    send(c, head, n, 0);
+    if (body && blen > 0) send(c, body, (int)blen, 0);
+}
+
+void http_serve_dir(const char* dir, int port) {
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) fatal("http_serve: WSAStartup failed");
+#endif
+    pyro_sock srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv == PYRO_BADSOCK) fatal("http_serve: socket() failed");
+    int yes = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((unsigned short)port);
+    if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) != 0) fatal("http_serve: bind failed");
+    if (listen(srv, 16) != 0) fatal("http_serve: listen failed");
+
+    for (;;) {
+        pyro_sock c = accept(srv, NULL, NULL);
+        if (c == PYRO_BADSOCK) continue;
+
+        char req[2048];
+        int got = recv(c, req, (int)sizeof(req) - 1, 0);
+        if (got <= 0) { pyro_closesock(c); continue; }
+        req[got] = '\0';
+
+        // parse "GET /path HTTP/1.1"
+        char path[1024] = "/";
+        if (strncmp(req, "GET ", 4) == 0) {
+            const char* s = req + 4;
+            const char* e = strchr(s, ' ');
+            size_t len = e ? (size_t)(e - s) : strlen(s);
+            if (len >= sizeof(path)) len = sizeof(path) - 1;
+            memcpy(path, s, len);
+            path[len] = '\0';
+        } else {
+            const char* m = "method not allowed";
+            http_send(c, 405, "Method Not Allowed", "text/plain", m, (long)strlen(m));
+            pyro_closesock(c);
+            continue;
+        }
+        char* q = strchr(path, '?');            // drop the query string
+        if (q) *q = '\0';
+        if (strcmp(path, "/") == 0) strcpy(path, "/index.html");
+
+        if (!path_is_safe(path + 1)) {
+            const char* m = "forbidden";
+            http_send(c, 403, "Forbidden", "text/plain", m, (long)strlen(m));
+            pyro_closesock(c);
+            continue;
+        }
+
+        char full[2048];
+        snprintf(full, sizeof(full), "%s/%s", dir, path + 1);
+        FILE* f = fopen(full, "rb");
+        if (!f) {
+            const char* m = "404 page not found";
+            http_send(c, 404, "Not Found", "text/plain", m, (long)strlen(m));
+            pyro_closesock(c);
+            continue;
+        }
+        fseek(f, 0, SEEK_END);
+        long n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        char* body = (char*)malloc((size_t)(n > 0 ? n : 1));
+        size_t rd = body ? fread(body, 1, (size_t)n, f) : 0;
+        fclose(f);
+        if (!body) {
+            const char* m = "out of memory";
+            http_send(c, 500, "Internal Server Error", "text/plain", m, (long)strlen(m));
+        } else {
+            http_send(c, 200, "OK", mime_for(full), body, (long)rd);
+            free(body);
+        }
+        pyro_closesock(c);
+    }
+}
+
+static uint64_t g_c_prng_state = 0x853c49e6748fea9bULL;
+static int64_t g_c_start_ms = 0;
+
+static uint64_t splitmix64_next(void) {
+    g_c_prng_state += 0x9e3779b97f4a7c15ULL;
+    uint64_t z = g_c_prng_state;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+static int64_t pyro_get_now_ms(void) {
+#ifdef _WIN32
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return (int64_t)((t - 116444736000000000ULL) / 10000ULL);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)ts.tv_nsec / 1000000;
+#endif
+}
+
+static int64_t pyro_get_mono_ms(void) {
+    if (g_c_start_ms == 0) {
+        g_c_start_ms = pyro_get_now_ms();
+    }
+    return pyro_get_now_ms() - g_c_start_ms;
+}
+
+// native_pad: pad_start/pad_end with JS padStart/padEnd semantics — the pad
+// string is repeated and truncated to fill exactly (width-len) bytes. Caller frees.
+static char* native_pad(const char* s, int width, const char* pad, bool at_start) {
+    size_t sl = strlen(s), pl = strlen(pad);
+    if ((int)sl >= width || pl == 0) {
+        char* out = (char*)malloc(sl + 1);
+        memcpy(out, s, sl + 1);
+        return out;
+    }
+    size_t need = (size_t)width - sl;
+    char* out = (char*)malloc(need + sl + 1);
+    if (at_start) {
+        for (size_t i = 0; i < need; i++) out[i] = pad[i % pl];
+        memcpy(out + need, s, sl);
+    } else {
+        memcpy(out, s, sl);
+        for (size_t i = 0; i < need; i++) out[sl + i] = pad[i % pl];
+    }
+    out[need + sl] = '\0';
+    return out;
+}
+
+// native_less: the total order used by sort() — numbers compare numerically,
+// everything else by its string form. Matches the Go VM's nativeLess exactly.
+static bool native_less(Value a, Value b) {
+    bool an = a.kind == VAL_INT || a.kind == VAL_FLOAT;
+    bool bn = b.kind == VAL_INT || b.kind == VAL_FLOAT;
+    if (an && bn) return value_as_float(a) < value_as_float(b);
+    char* sa = value_to_string(a);
+    char* sb = value_to_string(b);
+    bool r = strcmp(sa, sb) < 0;
+    free(sa); free(sb);
+    return r;
+}
+
 // ── Native Builtins ──────────────────────────────────────────
 Value native(int id, Value* a, int argc) {
     switch (id) {
@@ -1156,6 +1413,244 @@ Value native(int id, Value* a, int argc) {
                 fclose(fp);
                 return val_bool(true);
             }
+        case 28: // read_file(path) -> string ("" on error)
+            {
+                if (pyro_sandboxed) {
+                    fatal("[Cryo Security] Sandbox: read_file() blocked by sandbox policy");
+                }
+                char* path = value_to_string(a[0]);
+                FILE* fp = fopen(path, "rb");
+                free(path);
+                if (!fp) return val_str("", 0);
+                fseek(fp, 0, SEEK_END);
+                long n = ftell(fp);
+                fseek(fp, 0, SEEK_SET);
+                if (n < 0) { fclose(fp); return val_str("", 0); }
+                char* buf = (char*)malloc((size_t)n + 1);
+                if (!buf) { fclose(fp); return val_str("", 0); }
+                size_t got = fread(buf, 1, (size_t)n, fp);
+                fclose(fp);
+                buf[got] = '\0';
+                Value v = val_str(buf, (int64_t)got);
+                free(buf);
+                return v;
+            }
+        case 29: // args() -> string[]: program args after the .pyro path
+            {
+                RcArray* arr = rc_array_new();
+                for (int i = 0; i < pyro_argc; i++) {
+                    Value s = val_str(pyro_argv[i], (int64_t)strlen(pyro_argv[i]));
+                    rc_array_push(arr, s);
+                    release_value(s);
+                }
+                return val_array(arr);
+            }
+        case 30: // http_serve(port, dir) -> serve a static directory (blocking)
+            {
+                if (pyro_sandboxed) {
+                    fatal("[Cryo Security] Sandbox: http_serve() blocked by sandbox policy");
+                }
+                char* dir = value_to_string(a[1]);
+                int64_t port = (a[0].kind == VAL_FLOAT) ? (int64_t)a[0].as.f : a[0].as.i;
+                printf("[pyro] serving %s on http://localhost:%lld\n", dir, (long long)port);
+                fflush(stdout);
+                http_serve_dir(dir, (int)port);   // only returns on fatal error
+                free(dir);
+                return val_null();
+            }
+        case 31: // clamp(x, lo, hi)
+            if (a[0].kind == VAL_INT && a[1].kind == VAL_INT && a[2].kind == VAL_INT) {
+                int64_t x = a[0].as.i, lo = a[1].as.i, hi = a[2].as.i;
+                if (x < lo) return val_int(lo);
+                if (x > hi) return val_int(hi);
+                return val_int(x);
+            } else {
+                double x = value_as_float(a[0]), lo = value_as_float(a[1]), hi = value_as_float(a[2]);
+                if (x < lo) return val_float(lo);
+                if (x > hi) return val_float(hi);
+                return val_float(x);
+            }
+        case 32: // sign(x) -> int (-1, 0, 1)
+            {
+                double f = value_as_float(a[0]);
+                return val_int(f < 0 ? -1 : (f > 0 ? 1 : 0));
+            }
+        case 33: // gcd(a, b) -> int
+            {
+                int64_t gx = (a[0].kind == VAL_INT) ? a[0].as.i : (int64_t)value_as_float(a[0]);
+                int64_t gy = (a[1].kind == VAL_INT) ? a[1].as.i : (int64_t)value_as_float(a[1]);
+                if (gx < 0) gx = -gx;
+                if (gy < 0) gy = -gy;
+                while (gy != 0) { int64_t t = gx % gy; gx = gy; gy = t; }
+                return val_int(gx);
+            }
+        case 34: // hypot(a, b) -> number
+            return val_float(hypot(value_as_float(a[0]), value_as_float(a[1])));
+        case 35: // starts_with(s, prefix) -> bool
+            {
+                char* s = value_to_string(a[0]);
+                char* p = value_to_string(a[1]);
+                size_t pl = strlen(p);
+                bool r = strlen(s) >= pl && strncmp(s, p, pl) == 0;
+                free(s); free(p);
+                return val_bool(r);
+            }
+        case 36: // ends_with(s, suffix) -> bool
+            {
+                char* s = value_to_string(a[0]);
+                char* p = value_to_string(a[1]);
+                size_t sl = strlen(s), pl = strlen(p);
+                bool r = sl >= pl && strcmp(s + sl - pl, p) == 0;
+                free(s); free(p);
+                return val_bool(r);
+            }
+        case 37: // repeat(s, n) -> string  (n<0 treated as 0)
+            {
+                char* s = value_to_string(a[0]);
+                int64_t n = (a[1].kind == VAL_INT) ? a[1].as.i : (int64_t)value_as_float(a[1]);
+                if (n < 0) n = 0;
+                size_t sl = strlen(s);
+                char* buf = (char*)malloc(sl * (size_t)n + 1);
+                if (!buf) { free(s); return val_str("", 0); }
+                for (int64_t i = 0; i < n; i++) memcpy(buf + i * sl, s, sl);
+                buf[sl * (size_t)n] = '\0';
+                Value res = val_str(buf, (int64_t)(sl * (size_t)n));
+                free(buf); free(s);
+                return res;
+            }
+        case 38: // sort(arr) -> new array sorted ascending (stable)
+            {
+                if (a[0].kind != VAL_ARRAY) fatal("sort() expects an array");
+                RcArray* src = a[0].as.arr;
+                RcArray* out = rc_array_new();
+                for (int64_t i = 0; i < src->length; i++) rc_array_push(out, src->data[i]);
+                // stable insertion sort (matches Go's SliceStable ordering)
+                for (int64_t i = 1; i < out->length; i++) {
+                    Value key = out->data[i];
+                    int64_t j = i - 1;
+                    while (j >= 0 && native_less(key, out->data[j])) {
+                        out->data[j + 1] = out->data[j];
+                        j--;
+                    }
+                    out->data[j + 1] = key;
+                }
+                return val_array(out);
+            }
+        case 39: // reverse(arr) -> new reversed array
+            {
+                if (a[0].kind != VAL_ARRAY) fatal("reverse() expects an array");
+                RcArray* src = a[0].as.arr;
+                RcArray* out = rc_array_new();
+                for (int64_t i = src->length - 1; i >= 0; i--) rc_array_push(out, src->data[i]);
+                return val_array(out);
+            }
+        case 40: // slice(x, start, end) -> subarray/substring [start, end), safe bounds
+            {
+                // Polymorphic over array|string so `xs[a..b]` and `s[a..b]` can
+                // lower to the SAME call — the parser cannot know the operand's
+                // type (10.9). Must mirror main.go case 40 exactly.
+                if (a[0].kind == VAL_STR) {
+                    char* s = value_to_string(a[0]);
+                    int64_t n = (int64_t)strlen(s);
+                    int64_t st = (a[1].kind == VAL_INT) ? a[1].as.i : (int64_t)value_as_float(a[1]);
+                    int64_t en = (a[2].kind == VAL_INT) ? a[2].as.i : (int64_t)value_as_float(a[2]);
+                    if (st < 0) st = 0;
+                    if (en > n) en = n;
+                    if (st > en) st = en;
+                    Value res = val_str(s + st, en - st);
+                    free(s);
+                    return res;
+                }
+                if (a[0].kind != VAL_ARRAY) fatal("slice() expects an array or a string");
+                RcArray* src = a[0].as.arr;
+                int64_t n = src->length;
+                int64_t start = (a[1].kind == VAL_INT) ? a[1].as.i : (int64_t)value_as_float(a[1]);
+                int64_t end   = (a[2].kind == VAL_INT) ? a[2].as.i : (int64_t)value_as_float(a[2]);
+                if (start < 0) start = 0;
+                if (end > n) end = n;
+                if (start > end) start = end;
+                RcArray* out = rc_array_new();
+                for (int64_t i = start; i < end; i++) rc_array_push(out, src->data[i]);
+                return val_array(out);
+            }
+        case 41: // index_of(arr, x) -> first index by value equality, else -1
+            {
+                if (a[0].kind != VAL_ARRAY) fatal("index_of() expects an array");
+                RcArray* src = a[0].as.arr;
+                for (int64_t i = 0; i < src->length; i++) {
+                    if (value_eq(src->data[i], a[1])) return val_int(i);
+                }
+                return val_int(-1);
+            }
+        case 42: // pad_start(s, width, pad) -> string
+        case 43: // pad_end(s, width, pad) -> string
+            {
+                char* s = value_to_string(a[0]);
+                char* pad = value_to_string(a[2]);
+                int width = (a[1].kind == VAL_INT) ? (int)a[1].as.i : (int)value_as_float(a[1]);
+                char* padded = native_pad(s, width, pad, id == 42);
+                Value res = val_str(padded, (int64_t)strlen(padded));
+                free(s); free(pad); free(padded);
+                return res;
+            }
+        case 44: // concat(a, b) -> new array (elements of a then b)
+            {
+                if (a[0].kind != VAL_ARRAY || a[1].kind != VAL_ARRAY)
+                    fatal("concat() expects two arrays");
+                RcArray* out = rc_array_new();
+                for (int64_t i = 0; i < a[0].as.arr->length; i++) rc_array_push(out, a[0].as.arr->data[i]);
+                for (int64_t i = 0; i < a[1].as.arr->length; i++) rc_array_push(out, a[1].as.arr->data[i]);
+                return val_array(out);
+            }
+        case 45: // count(arr, x) -> number of elements equal to x
+            {
+                if (a[0].kind != VAL_ARRAY) fatal("count() expects an array");
+                RcArray* src = a[0].as.arr;
+                int64_t n = 0;
+                for (int64_t i = 0; i < src->length; i++)
+                    if (value_eq(src->data[i], a[1])) n++;
+                return val_int(n);
+            }
+        case 46: // sum(arr) -> int if all int, else number
+            {
+                if (a[0].kind != VAL_ARRAY) fatal("sum() expects an array");
+                RcArray* src = a[0].as.arr;
+                bool all_int = true;
+                for (int64_t i = 0; i < src->length; i++)
+                    if (src->data[i].kind == VAL_FLOAT) all_int = false;
+                if (all_int) {
+                    int64_t t = 0;
+                    for (int64_t i = 0; i < src->length; i++) t += src->data[i].as.i;
+                    return val_int(t);
+                }
+                double t = 0;
+                for (int64_t i = 0; i < src->length; i++) t += value_as_float(src->data[i]);
+                return val_float(t);
+            }
+        case 47: // now_ms() -> int
+            return val_int(pyro_get_now_ms());
+        case 48: // monotonic_ms() -> int
+            return val_int(pyro_get_mono_ms());
+        case 49: // random() -> number [0.0, 1.0)
+            {
+                double r = (double)(splitmix64_next() >> 11) / 9007199254740992.0;
+                return val_float(r);
+            }
+        case 50: // random_int(lo, hi) -> int inclusive
+            {
+                int64_t lo = (a[0].kind == VAL_INT) ? a[0].as.i : (int64_t)value_as_float(a[0]);
+                int64_t hi = (a[1].kind == VAL_INT) ? a[1].as.i : (int64_t)value_as_float(a[1]);
+                if (hi < lo) { int64_t tmp = lo; lo = hi; hi = tmp; }
+                uint64_t span = (uint64_t)(hi - lo + 1);
+                int64_t res = lo + (int64_t)(splitmix64_next() % span);
+                return val_int(res);
+            }
+        case 51: // seed(n) -> void/null
+            {
+                int64_t n = (a[0].kind == VAL_INT) ? a[0].as.i : (int64_t)value_as_float(a[0]);
+                g_c_prng_state = (uint64_t)n;
+                return val_null();
+            }
     }
     fatal("unknown native builtin");
     return val_null();
@@ -1244,7 +1739,7 @@ Value bin_op(uint8_t op, Value a, Value b) {
         double y = value_as_float(b);
         switch (op) {
             case opADD: return val_float(x + y);
-            case opSUB: return val_float(x * y);
+            case opSUB: return val_float(x - y);
             case opMUL: return val_float(x * y);
             case opDIV: return val_float(x / y);
             case opMOD: return val_float(fmod(x, y));

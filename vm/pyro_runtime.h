@@ -51,6 +51,9 @@
 #define opJMPT       0x32
 #define opCALL       0x40
 #define opRET        0x41
+#define opPUSHFN     0x42
+#define opCALLVALUE  0x43
+#define opCLOSURE    0x44
 #define opPRINT      0x50
 #define opASSERT     0x51
 #define opPRINTLN    0x52
@@ -89,17 +92,22 @@ typedef enum {
     VAL_STR,
     VAL_NULL,
     VAL_ARRAY,
-    VAL_MAP
+    VAL_MAP,
+    VAL_FUNC    // function value: fnidx = index, as.arr = captures (or NULL)
 } ValueKind;
 
 struct Value {
     ValueKind kind;
+    // VAL_FUNC only: the function-table index. It lives OUTSIDE the union so a
+    // closure can carry both its index and its captured values (as.arr). It
+    // fits in the padding after `kind`, so Value does not grow.
+    int32_t fnidx;
     union {
         int64_t i;
         double f;
         bool b;
         RcString* str;
-        RcArray* arr;
+        RcArray* arr;   // VAL_FUNC: captured values (NULL when non-capturing)
         RcMap* map;
     } as;
 };
@@ -136,6 +144,8 @@ struct RcMap {
 // ── boundary with the host ─────────────────────────────────────
 void fatal(const char* msg);      // fail-fast abort (defined in the engine)
 extern bool pyro_sandboxed;       // sandbox policy (network disabled)
+extern int    pyro_argc;          // program args (argv[0] excluded), for args()
+extern char** pyro_argv;
 
 // ── runtime API ───────────────────────────────────────────
 // Value creators
@@ -148,6 +158,7 @@ Value val_str(const char* chars, int64_t len);
 Value val_str_rc(RcString* s);
 Value val_array(RcArray* arr);
 Value val_map(RcMap* map);
+Value val_func(int32_t fnidx, RcArray* captured);   // captured=NULL -> plain fn
 // reference counting
 void retain_value(Value v);
 void release_value(Value v);
@@ -182,6 +193,9 @@ RcString* join_arr(RcArray* arr, const char* sep);
 Value native(int id, Value* a, int argc);
 // bytecode reading (little-endian) + code section decoding
 uint16_t read_u16(const uint8_t* data, int* pos);
+int32_t  read_i32(const uint8_t* data, int* pos);
+// static file server backing http_serve(); blocks, only returns on fatal error
+void http_serve_dir(const char* dir, int port);
 uint32_t read_u32(const uint8_t* data, int* pos);
 uint64_t read_u64(const uint8_t* data, int* pos);
 void xor_decode(uint8_t* code, uint32_t len);

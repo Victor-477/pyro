@@ -63,6 +63,9 @@ const (
 	opJMPT    = 0x32
 	opCALL    = 0x40
 	opRET     = 0x41
+	opPUSHFN     = 0x42 // u16 funcidx -> push a function value
+	opCALLVALUE  = 0x43 // u8 argc -> call the function value beneath the args
+	opCLOSURE    = 0x44 // u16 funcidx, u8 ncap -> pop ncap values into a closure
 	opPRINT   = 0x50
 	opASSERT  = 0x51
 	opPRINTLN = 0x52
@@ -93,6 +96,7 @@ const (
 	kNull
 	kArray // *[]Value (reference: push/setidx mutate the shared array)
 	kMap   // map[any]Value (structs also use this type)
+	kFunc  // first-class function value (i = function index)
 )
 
 type Value struct {
@@ -112,6 +116,13 @@ func vStr(s string) Value     { return Value{k: kStr, s: s} }
 func vNull() Value            { return Value{k: kNull} }
 func vArr(a []Value) Value    { return Value{k: kArray, arr: &a} }
 func vMap(m map[any]Value) Value { return Value{k: kMap, m: m} }
+func vFunc(idx int64) Value    { return Value{k: kFunc, i: idx} }
+
+// vClosure: a function value carrying captured values (captured BY VALUE).
+// They are copied into the leading locals of the callee by opCALLVALUE.
+func vClosure(idx int64, captured []Value) Value {
+	return Value{k: kFunc, i: idx, arr: &captured}
+}
 
 // comparable key (Go) from a Value
 func keyOf(v Value) any {
@@ -159,6 +170,8 @@ func (v Value) truthy() bool {
 		return len(*v.arr) > 0
 	case kMap:
 		return len(v.m) > 0
+	case kFunc:
+		return true
 	default:
 		return false
 	}
@@ -169,6 +182,43 @@ func (v Value) asFloat() float64 {
 		return v.f
 	}
 	return float64(v.i)
+}
+
+// nativeInt reads a Value as int64 for integer-only natives (gcd, repeat count).
+func nativeInt(v Value) int64 {
+	if v.k == kInt {
+		return v.i
+	}
+	return int64(v.asFloat())
+}
+
+// nativePad implements pad_start/pad_end with JS padStart/padEnd semantics:
+// the pad string is repeated and truncated to fill exactly (width-len) bytes.
+func nativePad(s string, width int, pad string, atStart bool) string {
+	if len(s) >= width || pad == "" {
+		return s
+	}
+	need := width - len(s)
+	var b strings.Builder
+	for b.Len() < need {
+		b.WriteString(pad)
+	}
+	filler := b.String()[:need]
+	if atStart {
+		return filler + s
+	}
+	return s + filler
+}
+
+// nativeLess is the total order used by sort(): numbers compare numerically,
+// everything else by its string form. Deterministic and identical to the C VM.
+func nativeLess(a, b Value) bool {
+	an := a.k == kInt || a.k == kFloat
+	bn := b.k == kInt || b.k == kFloat
+	if an && bn {
+		return a.asFloat() < b.asFloat()
+	}
+	return a.String() < b.String()
 }
 
 func (v Value) String() string {
@@ -197,6 +247,8 @@ func (v Value) String() string {
 			parts[i] = keyToValue(k).String() + ": " + v.m[k].String()
 		}
 		return "{" + join(parts, ", ") + "}"
+	case kFunc:
+		return "<fn#" + strconv.FormatInt(v.i, 10) + ">"
 	default:
 		return "null"
 	}
@@ -314,8 +366,10 @@ func load(data []byte) *Program {
 	if len(data) < 6 || string(data[0:4]) != "PYRO" {
 		fatal("invalid .pyro file (magic)")
 	}
-	if data[4] != 2 {
-		fatal("unsupported .pyro version (expected v2)")
+	// v3 widened the string-constant length u16 -> u32; v2 is still accepted.
+	ver := data[4]
+	if ver != 2 && ver != 3 {
+		fatal("unsupported .pyro version (expected v2 or v3)")
 	}
 	flags := data[5]
 	p := &Program{}
@@ -336,7 +390,13 @@ func load(data []byte) *Program {
 			p.consts[i] = vFloat(math.Float64frombits(binary.LittleEndian.Uint64(data[pos:])))
 			pos += 8
 		case 3:
-			n := rd16()
+			// v3 stores the length as u32; v2 as u16.
+			n := 0
+			if ver >= 3 {
+				n = int(rd32())
+			} else {
+				n = rd16()
+			}
 			p.consts[i] = vStr(string(data[pos : pos+n]))
 			pos += n
 		case 4:
@@ -564,6 +624,38 @@ func run(p *Program) {
 			stack = stack[:base]
 			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi})
 			pc = int(fn.entry)
+		case opPUSHFN:
+			push(vFunc(int64(rd16())))
+		case opCLOSURE:
+			fi := int64(rd16())
+			ncap := int(code[pc])
+			pc++
+			base := len(stack) - ncap
+			cap := make([]Value, ncap)
+			copy(cap, stack[base:])
+			stack = stack[:base]
+			push(vClosure(fi, cap))
+		case opCALLVALUE:
+			argc := int(code[pc])
+			pc++
+			base := len(stack) - argc
+			fnval := stack[base-1]
+			if fnval.k != kFunc {
+				fatal("call of a non-function value")
+			}
+			fi := int(fnval.i)
+			fn := p.funcs[fi]
+			locals := make([]Value, fn.nlocals)
+			// captured values occupy the leading locals, then the arguments
+			ncap := 0
+			if fnval.arr != nil {
+				ncap = len(*fnval.arr)
+				copy(locals, *fnval.arr)
+			}
+			copy(locals[ncap:], stack[base:])
+			stack = stack[:base-1] // drop the args and the fn value beneath them
+			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi})
+			pc = int(fn.entry)
 		case opRET:
 			ret := pop()
 			fr := frames[len(frames)-1]
@@ -774,6 +866,17 @@ func httpPost(url, body string) string {
 // Enabled by the bit2 flag of .pyro (--sandbox in the compiler) or by
 // PYRO_SANDBOX=1 in the environment (runtime policy on artifacts).
 var sandboxed bool
+var progArgs []string   // program args after the .pyro path (for the args() native)
+var prngState uint64 = 0x853c49e6748fea9b
+var vmStartTime = time.Now()
+
+func splitmix64Next() uint64 {
+	prngState += 0x9e3779b97f4a7c15
+	z := prngState
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	return z ^ (z >> 31)
+}
 
 func native(id int, a []Value) Value {
 	switch id {
@@ -942,6 +1045,220 @@ func native(id int, a []Value) Value {
 			buf[i] = byte(e.i & 0xFF)
 		}
 		return vBool(os.WriteFile(a[0].String(), buf, 0644) == nil)
+	case 28: // read_file(path) -> string ("" on error)
+		if sandboxed {
+			fatal("[Cryo Security] Sandbox: read_file() blocked by sandbox policy")
+		}
+		data, err := os.ReadFile(a[0].String())
+		if err != nil {
+			return vStr("")
+		}
+		return vStr(string(data))
+	case 29: // args() -> string[]: program args after the .pyro path
+		out := make([]Value, len(progArgs))
+		for i, s := range progArgs {
+			out[i] = vStr(s)
+		}
+		return vArr(out)
+	case 30: // http_serve(port, dir) -> serve a static directory (blocking)
+		if sandboxed {
+			fatal("[Cryo Security] Sandbox: http_serve() blocked by sandbox policy")
+		}
+		dir := a[1].String()
+		fsrv := http.FileServer(http.Dir(dir))
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, ".wasm") {
+				w.Header().Set("Content-Type", "application/wasm")
+			}
+			fsrv.ServeHTTP(w, r)
+		})
+		fmt.Printf("[pyro] serving %s on http://localhost:%d\n", dir, a[0].i)
+		if err := http.ListenAndServe(fmt.Sprintf(":%d", a[0].i), h); err != nil {
+			fatal("http_serve: " + err.Error())
+		}
+		return vNull()
+	case 31: // clamp(x, lo, hi)
+		if a[0].k == kInt && a[1].k == kInt && a[2].k == kInt {
+			x, lo, hi := a[0].i, a[1].i, a[2].i
+			if x < lo {
+				return vInt(lo)
+			}
+			if x > hi {
+				return vInt(hi)
+			}
+			return vInt(x)
+		}
+		x, lo, hi := a[0].asFloat(), a[1].asFloat(), a[2].asFloat()
+		if x < lo {
+			return vFloat(lo)
+		}
+		if x > hi {
+			return vFloat(hi)
+		}
+		return vFloat(x)
+	case 32: // sign(x) -> int (-1, 0, 1)
+		f := a[0].asFloat()
+		if f < 0 {
+			return vInt(-1)
+		}
+		if f > 0 {
+			return vInt(1)
+		}
+		return vInt(0)
+	case 33: // gcd(a, b) -> int
+		gx, gy := nativeInt(a[0]), nativeInt(a[1])
+		if gx < 0 {
+			gx = -gx
+		}
+		if gy < 0 {
+			gy = -gy
+		}
+		for gy != 0 {
+			gx, gy = gy, gx%gy
+		}
+		return vInt(gx)
+	case 34: // hypot(a, b) -> number
+		return vFloat(math.Hypot(a[0].asFloat(), a[1].asFloat()))
+	case 35: // starts_with(s, prefix) -> bool
+		return vBool(strings.HasPrefix(a[0].String(), a[1].String()))
+	case 36: // ends_with(s, suffix) -> bool
+		return vBool(strings.HasSuffix(a[0].String(), a[1].String()))
+	case 37: // repeat(s, n) -> string  (n<0 treated as 0)
+		n := nativeInt(a[1])
+		if n < 0 {
+			n = 0
+		}
+		return vStr(strings.Repeat(a[0].String(), int(n)))
+	case 38: // sort(arr) -> new array sorted ascending (stable)
+		if a[0].k != kArray {
+			fatal("sort() expects an array")
+		}
+		src := *a[0].arr
+		cp := make([]Value, len(src))
+		copy(cp, src)
+		sort.SliceStable(cp, func(i, j int) bool { return nativeLess(cp[i], cp[j]) })
+		return vArr(cp)
+	case 39: // reverse(arr) -> new reversed array
+		if a[0].k != kArray {
+			fatal("reverse() expects an array")
+		}
+		src := *a[0].arr
+		cp := make([]Value, len(src))
+		for i, e := range src {
+			cp[len(src)-1-i] = e
+		}
+		return vArr(cp)
+	case 40: // slice(x, start, end) -> subarray/substring [start, end), safe bounds
+		// Polymorphic over array|string so `xs[a..b]` and `s[a..b]` can lower to
+		// the SAME call — the parser cannot know the operand's type (10.9).
+		if a[0].k == kStr {
+			s := a[0].s
+			n := int64(len(s))
+			start, end := nativeInt(a[1]), nativeInt(a[2])
+			if start < 0 {
+				start = 0
+			}
+			if end > n {
+				end = n
+			}
+			if start > end {
+				start = end
+			}
+			return vStr(s[start:end])
+		}
+		if a[0].k != kArray {
+			fatal("slice() expects an array or a string")
+		}
+		src := *a[0].arr
+		n := int64(len(src))
+		start, end := nativeInt(a[1]), nativeInt(a[2])
+		if start < 0 {
+			start = 0
+		}
+		if end > n {
+			end = n
+		}
+		if start > end {
+			start = end
+		}
+		cp := make([]Value, end-start)
+		copy(cp, src[start:end])
+		return vArr(cp)
+	case 41: // index_of(arr, x) -> first index of x by value equality, else -1
+		if a[0].k != kArray {
+			fatal("index_of() expects an array")
+		}
+		for i, e := range *a[0].arr {
+			if valueEq(e, a[1]) {
+				return vInt(int64(i))
+			}
+		}
+		return vInt(-1)
+	case 42: // pad_start(s, width, pad) -> string
+		return vStr(nativePad(a[0].String(), int(nativeInt(a[1])), a[2].String(), true))
+	case 43: // pad_end(s, width, pad) -> string
+		return vStr(nativePad(a[0].String(), int(nativeInt(a[1])), a[2].String(), false))
+	case 44: // concat(a, b) -> new array (elements of a then b)
+		if a[0].k != kArray || a[1].k != kArray {
+			fatal("concat() expects two arrays")
+		}
+		s1, s2 := *a[0].arr, *a[1].arr
+		cp := make([]Value, 0, len(s1)+len(s2))
+		cp = append(cp, s1...)
+		cp = append(cp, s2...)
+		return vArr(cp)
+	case 45: // count(arr, x) -> number of elements equal to x
+		if a[0].k != kArray {
+			fatal("count() expects an array")
+		}
+		var n int64
+		for _, e := range *a[0].arr {
+			if valueEq(e, a[1]) {
+				n++
+			}
+		}
+		return vInt(n)
+	case 46: // sum(arr) -> int if all int, else number
+		if a[0].k != kArray {
+			fatal("sum() expects an array")
+		}
+		src := *a[0].arr
+		allInt := true
+		for _, e := range src {
+			if e.k == kFloat {
+				allInt = false
+			}
+		}
+		if allInt {
+			var t int64
+			for _, e := range src {
+				t += e.i
+			}
+			return vInt(t)
+		}
+		var t float64
+		for _, e := range src {
+			t += e.asFloat()
+		}
+		return vFloat(t)
+	case 47: // now_ms() -> int
+		return vInt(time.Now().UnixMilli())
+	case 48: // monotonic_ms() -> int
+		return vInt(time.Since(vmStartTime).Milliseconds())
+	case 49: // random() -> number [0.0, 1.0)
+		r := float64(splitmix64Next()>>11) / 9007199254740992.0
+		return vFloat(r)
+	case 50: // random_int(lo, hi) -> int inclusive
+		lo, hi := nativeInt(a[0]), nativeInt(a[1])
+		if hi < lo {
+			lo, hi = hi, lo
+		}
+		span := uint64(hi - lo + 1)
+		val := lo + int64(splitmix64Next()%span)
+		return vInt(val)
+	case 51: // seed(n) -> void/null
+		prngState = uint64(nativeInt(a[0]))
+		return vNull()
 	}
 	fatal(fmt.Sprintf("unknown native builtin: id=%d", id))
 	return vNull()
@@ -1064,5 +1381,6 @@ func main() {
 	if os.Getenv("PYRO_SANDBOX") == "1" {
 		sandboxed = true
 	}
+	progArgs = os.Args[2:]   // exposed to the program via the args() native
 	run(load(data))
 }

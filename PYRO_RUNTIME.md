@@ -13,9 +13,10 @@ runtime implementations that must be **semantically identical**:
 | Go runtime (embedded in the Go VM) | `pyro/vm/main.go` | Go |
 
 The C VM (`pyro/vm/main.c`) is only the **engine** (loading, decoding and the
-dispatch loop); it depends solely on `pyro_runtime.h`. Future targets (e.g. native
-C code, WASM) reuse the same runtime and inherit this semantics without
-reimplementing it.
+dispatch loop); it depends solely on `pyro_runtime.h`. The **AOT** translator
+(`burnout/aot_pyro.py`, `.pyro` → C) is a second engine over the same runtime, so
+a natively compiled program inherits these semantics by construction rather than
+reimplementing them.
 
 > The ISA (opcodes, `.pyro` format) is specified in [`PYRO_BYTECODE.md`](PYRO_BYTECODE.md).
 > Here we cover only the runtime.
@@ -35,6 +36,7 @@ A `Value` is dynamic and carries its type tag at runtime:
 | `null` | absence of value | |
 | `array` | contiguous list of `Value`, reference-counted | |
 | `map` | hash table `Value → Value`, reference-counted | keys by value equality |
+| `function` | first-class function value (holds a function-table index) | immediate; prints as `<fn#N>` |
 
 There is no distinct `struct` type: **structs and enum variants are maps** of
 string keys (e.g. `Ok(v)` → `{"tag": "Ok", "val0": v}`). Data-less enums are
@@ -120,6 +122,19 @@ the result. The id table is **mirrored** between the generator (`NATIVES` in
 | 7 | `round` | 16 | `find` | 25 | `http_post` |
 | 8 | `to_string` | 17 | `replace` | 26 | `sleep` |
 | | | | | 27 | `write_bytes` |
+| | | | | 28 | `read_file` |
+| | | | | 29 | `args` |
+| 31 | `clamp` | 38 | `sort` | 45 | `count` |
+| 32 | `sign` | 39 | `reverse` | 46 | `sum` |
+| 33 | `gcd` | 40 | `slice` | 47 | `now_ms` |
+| 34 | `hypot` | 41 | `index_of` | 48 | `monotonic_ms` |
+| 35 | `starts_with` | 42 | `pad_start` | 49 | `random` |
+| 36 | `ends_with` | 43 | `pad_end` | 50 | `random_int` |
+| 37 | `repeat` | 44 | `concat` | 51 | `seed` |
+
+Ids 30 and below are listed in the left three columns above; 31–51 continue here.
+An id is **permanent** once shipped: renumbering silently breaks every `.pyro`
+already on disk, so new builtins only ever append.
 
 - **`input(prompt)`** reads a line from stdin (I/O).
 - **`json_encode`/`json_decode`** serialize/deserialize the value tree (object keys
@@ -128,12 +143,32 @@ the result. The id table is **mirrored** between the generator (`NATIVES` in
 - **`write_bytes(path, int[]) -> bool`** writes an integer array as raw bytes
   (each element truncated to `& 0xFF`) to a file — the binary output that lets a
   program on the VM emit a `.pyro` (enables the self-hosted compiler).
+- **`read_file(path) -> string`** reads a whole file, `""` on any error. Together
+  with `args` and `write_bytes` it is what lets the self-hosted compiler run as a
+  real command-line program (`pyroc in.cryo out.pyro`).
+- **`args() -> string[]`** returns the program's arguments — everything after the
+  `.pyro` path for the VMs, everything after `argv[0]` for an AOT binary, so the
+  same program sees the same list either way.
+- **`http_serve(port, dir)`** serves `dir` over HTTP and **blocks** (it only
+  returns on a fatal error). `.wasm` is sent as `application/wasm` so browsers can
+  stream-compile it; missing paths give 404 and any attempt to escape the root
+  (`..`, backslash, drive letter) gives 403. This is what makes a Cryo program a
+  web server — see the full-stack example in `cryo/examples/fullstack/`.
+- **`slice(x, start, end)`** is **polymorphic over arrays and strings** — it
+  returns a new array for an array and a new (byte-indexed) string for a string.
+  It is the single lowering target for the slice syntax `xs[a..b]` / `s[a..b]`
+  (roadmap 10.9): the parser desugars slicing *before* types are known, so it
+  cannot pick an array-only or string-only builtin. Both bounds are **clamped**,
+  never an error — `start` below 0 becomes 0, `end` past the length becomes the
+  length, and `start > end` yields an empty result. Any other operand type
+  aborts. The result is always a **copy**; mutating it never affects the source.
 - `to_int`/`to_number` of a non-numeric string **abort** (fail-fast).
 
 ### Sandbox policy
 The runtime exposes `pyro_sandboxed` (turned on by the host via the `.pyro` `bit2`
 flag or `PYRO_SANDBOX=1`). When active, the **network/machine** natives (`http_get`,
-`http_post`, `write_bytes`) are refused with a security abort. `sleep` stays allowed.
+`http_post`, `write_bytes`, `read_file`, `http_serve`) are refused with a security
+abort. `sleep` and `args` stay allowed.
 
 ---
 
@@ -178,8 +213,43 @@ The runtime is engine-agnostic; it depends only on:
 |---|---|---|
 | `void fatal(const char* msg)` | host → runtime | aborts with a message + stack trace |
 | `bool pyro_sandboxed` | host sets, runtime reads | sandbox policy |
+| `int pyro_argc` / `char** pyro_argv` | host sets, runtime reads | program arguments, returned by `args()` |
 
 Everything else (the operand stack, call frames, exception handlers, the debug
 section, decoding and dispatch) belongs to the **engine** and is not visible to the
 runtime. Thus any engine (stack VM, native-C translator, etc.) that provides these
-two symbols gets identical semantics.
+symbols gets identical semantics.
+
+### Building the C runtime
+
+`pyro_runtime.c` uses sockets for `http_serve`, so on Windows every link that
+includes it also needs winsock:
+
+```bash
+gcc -O2 -std=c11 main.c pyro_runtime.c -lm -lws2_32 -o pyrovm     # -lws2_32: Windows only
+```
+
+The runtime is written to compile under strict ISO mode. `strdup`, `_popen`,
+`_pclose` and `_getpid` are POSIX/MSVCRT rather than ISO C, so `-std=c11` hides
+their declarations; the runtime supplies its own `strdup` and declares the MSVCRT
+ones explicitly. Leaving them implicitly declared makes them return `int`, which
+silently truncates the returned pointer on any 64-bit host.
+
+---
+
+## 8. Parity requirements
+
+The Go and C runtimes must be **observationally identical**; `test_c_vm.py` is the
+executable form of that contract, comparing stdout, stderr and exit code across the
+examples plus targeted cases. Two classes of bug are worth calling out, because
+both hid from the test suite for a long time:
+
+- **Float arithmetic must be exercised through variables.** The front-end
+  constant-folds literal-only expressions, so `print(1.0 - 1.0)` never reaches the
+  runtime's float path. A float `SUB` implemented as `x * y` therefore passed every
+  test until the self-hosted compiler — whose IEEE-754 mantissa loop subtracts
+  `1.0` once per bit — started emitting corrupt float constants.
+- **Reference counting on container reads.** `index_get` returns an **owned**
+  reference: the array branch must `retain`, exactly as the map branch does,
+  because callers release the result. Returning a borrowed reference frees the
+  element while it is still in the array.
