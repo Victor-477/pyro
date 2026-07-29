@@ -145,17 +145,9 @@ the result. The id table is **mirrored** between the generator (`NATIVES` in
 | | | | | 61 | `write_file` |
 | | | | | 62 | `env` |
 | | | | | 63 | `exec` |
-| | | | | 55 | `file_exists` |
-| | | | | 56 | `is_dir` |
-| | | | | 57 | `list_dir` |
-| | | | | 58 | `make_dir` |
-| | | | | 59 | `delete_file` |
-| | | | | 60 | `file_size` |
-| | | | | 61 | `write_file` |
-| | | | | 62 | `env` |
-| | | | | 63 | `exec` |
+| | | | | 64 | `write_file_atomic` |
 
-Ids 30 and below are listed in the left three columns above; 31–63 continue here.
+Ids 30 and below are listed in the left three columns above; 31–64 continue here.
 An id is **permanent** once shipped: renumbering silently breaks every `.pyro`
 already on disk, so new builtins only ever append.
 
@@ -234,6 +226,16 @@ already on disk, so new builtins only ever append.
     removal is not offered yet.
   - `exec(cmd) -> string` returns the command's **stdout**, `""` on failure.
     It runs through `cmd /C` on Windows and `sh -c` elsewhere.
+- **`write_file_atomic(path, content) -> bool` (11.8)** is the durable write.
+  `write_file` truncates the target and *then* writes: a crash in that window
+  leaves a **truncated file** — the application's whole state replaced by a
+  partial one. This writes a **sibling** temp file (`path + ".tmp"`), flushes
+  it, and renames it over the target, so a reader sees either the previous
+  contents or the new ones and never the middle. The temp file is a sibling
+  on purpose: across filesystems a rename becomes a copy, which is not atomic.
+  On failure it returns false, removes the temp file and **leaves the target
+  untouched**. Windows needs `MoveFileEx` rather than `rename`, which fails
+  there when the target already exists. Sandbox-gated.
 - `to_int`/`to_number` of a non-numeric string **abort** (fail-fast).
 - **`replace(s, old, new)`** replaces all occurrences of `old` with `new`. When `old` is an empty string (`""`), `new` is inserted at every position boundary (e.g. `replace("abc", "", "-")` yields `"-a-b-c-"`, and `replace("", "", "-")` yields `"-"`).
 

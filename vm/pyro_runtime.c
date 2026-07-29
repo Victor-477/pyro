@@ -2037,6 +2037,44 @@ Value native(int id, Value* a, int argc) {
                 free(buf);
                 return res;
             }
+        // ── persistence, roadmap 11.8 ──
+        case 64: // write_file_atomic(path, content) -> bool
+            {
+                if (pyro_sandboxed)
+                    fatal("[Cryo Security] Sandbox: write_file_atomic() blocked by sandbox policy");
+                // Sibling temp file + flush + rename. See the note in main.go:
+                // a reader sees the old file or the new one, never the
+                // truncated middle a plain write leaves after a crash.
+                char* path = value_to_string(a[0]);
+                char* data = value_to_string(a[1]);
+                size_t plen = strlen(path);
+                char* tmp = (char*)malloc(plen + 5);
+                bool ok = false;
+                if (tmp) {
+                    memcpy(tmp, path, plen);
+                    memcpy(tmp + plen, ".tmp", 5);
+                    FILE* f = fopen(tmp, "wb");
+                    if (f) {
+                        size_t dlen = strlen(data);
+                        ok = (fwrite(data, 1, dlen, f) == dlen);
+                        if (ok) ok = (fflush(f) == 0);
+                        fclose(f);
+                        if (ok) {
+#ifdef _WIN32
+                            // rename() fails on Windows when the target exists;
+                            // MoveFileEx replaces it in one step.
+                            ok = MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+                            ok = (rename(tmp, path) == 0);
+#endif
+                        }
+                        if (!ok) remove(tmp);
+                    }
+                    free(tmp);
+                }
+                free(path); free(data);
+                return val_bool(ok);
+            }
     }
     fatal("unknown native builtin");
     return val_null();

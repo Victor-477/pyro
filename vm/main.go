@@ -1508,6 +1508,45 @@ func native(id int, a []Value) Value {
 		}
 		return vStr(string(outBytes))
 
+	// ── persistence, roadmap 11.8 ──
+	case 64: // write_file_atomic(path, content) -> bool
+		if sandboxed {
+			fatal("[Cryo Security] Sandbox: write_file_atomic() blocked by sandbox policy")
+		}
+		// Write a sibling temp file, flush it to disk, then rename over the
+		// target. A reader then sees either the old file or the new one, never
+		// the truncated middle that a plain write leaves behind on a crash.
+		// The temp file is a SIBLING so the rename stays on one filesystem —
+		// across devices it would be a copy, which is not atomic.
+		{
+			path := a[0].String()
+			tmp := path + ".tmp"
+			f, err := os.Create(tmp)
+			if err != nil {
+				return vBool(false)
+			}
+			if _, err = f.WriteString(a[1].String()); err != nil {
+				f.Close()
+				os.Remove(tmp)
+				return vBool(false)
+			}
+			if err = f.Sync(); err != nil {
+				f.Close()
+				os.Remove(tmp)
+				return vBool(false)
+			}
+			if err = f.Close(); err != nil {
+				os.Remove(tmp)
+				return vBool(false)
+			}
+			// os.Rename replaces an existing target on Windows too.
+			if err = os.Rename(tmp, path); err != nil {
+				os.Remove(tmp)
+				return vBool(false)
+			}
+			return vBool(true)
+		}
+
 	}
 	fatal(fmt.Sprintf("unknown native builtin: id=%d", id))
 	return vNull()
