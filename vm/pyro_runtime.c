@@ -987,6 +987,239 @@ static void http_send(pyro_sock c, int status, const char* reason,
     if (body && blen > 0) send(c, body, (int)blen, 0);
 }
 
+// ── capability policy (roadmap 11.11) ──────────────────────
+//
+//   (nothing set)   everything allowed
+//   PYRO_SANDBOX=1  everything gated is refused
+//   PYRO_POLICY=... deny by default, grant exactly what is listed
+//
+// Clauses: fs.read= fs.write= net= exec= env=  (comma-separated, * = all)
+// Mirrors capPolicy in main.go, message text included.
+typedef struct { char** items; int n; } CapList;
+
+// getcwd lives in <direct.h> on Windows and <unistd.h> elsewhere; wrapping it
+// keeps the platform test in one place.
+#ifdef _WIN32
+#include <direct.h>
+static bool pyro_getcwd(char* buf, size_t n) { return _getcwd(buf, (int)n) != NULL; }
+#else
+#include <unistd.h>
+static bool pyro_getcwd(char* buf, size_t n) { return getcwd(buf, n) != NULL; }
+#endif
+
+static bool    g_policy_active = false;
+static CapList g_cap_fsread, g_cap_fswrite, g_cap_net, g_cap_exec, g_cap_env;
+
+static void cap_add(CapList* l, const char* item) {
+    char** grown = (char**)realloc(l->items, (size_t)(l->n + 1) * sizeof(char*));
+    if (!grown) return;
+    l->items = grown;
+    l->items[l->n++] = pyro_strdup(item);
+}
+
+static char* cap_trim(char* s) {
+    while (*s == ' ' || *s == '\t') s++;
+    char* e = s + strlen(s);
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t')) *--e = '\0';
+    return s;
+}
+
+// Own case-insensitive compare: _stricmp/strcasecmp are hidden by
+// -std=c11 on MinGW, and an implicit declaration would truncate the result.
+static bool cap_ieq(const char* a, const char* b) {
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return false;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+static bool cap_listed(const CapList* l, const char* want) {
+    for (int i = 0; i < l->n; i++) {
+        if (strcmp(l->items[i], "*") == 0) return true;
+        if (cap_ieq(l->items[i], want)) return true;
+    }
+    return false;
+}
+
+// Absolute + normalised, so "./data/../secret" cannot slip out of a granted
+// root. Separators are folded to '/' so the comparison is uniform.
+// Absolute + normalised, written by hand: _fullpath and strtok_r are both
+// hidden by -std=c11 on MinGW. Separators fold to '/', "." is dropped and
+// ".." pops a segment — that last part is what stops "./data/../secret"
+// slipping out of a granted root.
+static void cap_abs(const char* path, char* out, size_t osz) {
+    char joined[4096];
+    bool absolute = (path[0] == '/' || path[0] == '\\') ||
+                    (path[0] && path[1] == ':');
+    if (absolute) {
+        snprintf(joined, sizeof(joined), "%s", path);
+    } else {
+        char cwd[2048];
+        if (!pyro_getcwd(cwd, sizeof(cwd))) cwd[0] = '\0';
+        snprintf(joined, sizeof(joined), "%s/%s", cwd, path);
+    }
+    for (char* p = joined; *p; p++) if (*p == '\\') *p = '/';
+
+    // keep a leading "C:" or "" prefix, then rebuild from the segments
+    char prefix[8] = "";
+    char* body = joined;
+    if (joined[0] && joined[1] == ':') {
+        prefix[0] = joined[0]; prefix[1] = ':'; prefix[2] = '\0';
+        body = joined + 2;
+    }
+
+    char* seg[256];
+    int nseg = 0;
+    char* p = body;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        char* st = p;
+        while (*p && *p != '/') p++;
+        char saved = *p;
+        *p = '\0';
+        if (strcmp(st, ".") == 0) {
+            /* skip */
+        } else if (strcmp(st, "..") == 0) {
+            if (nseg > 0) nseg--;
+        } else if (nseg < 256) {
+            seg[nseg++] = st;
+        }
+        // Do NOT restore the separator: seg[] points into this buffer and
+        // each entry must stay NUL-terminated. Restoring it made every
+        // segment read to the end of the string.
+        if (saved) p++;
+    }
+
+    size_t used = (size_t)snprintf(out, osz, "%s", prefix);
+    for (int i = 0; i < nseg && used + 1 < osz; i++) {
+        used += (size_t)snprintf(out + used, osz - used, "/%s", seg[i]);
+    }
+    if (used == 0 || (used == strlen(prefix) && osz > used + 1)) {
+        snprintf(out + used, osz - used, "/");
+    }
+}
+
+static bool cap_path_allowed(const CapList* roots, const char* target) {
+    char abs[4096];
+    cap_abs(target, abs, sizeof(abs));
+    for (int i = 0; i < roots->n; i++) {
+        if (strcmp(roots->items[i], "*") == 0) return true;
+        char root[4096];
+        cap_abs(roots->items[i], root, sizeof(root));
+        size_t rl = strlen(root);
+        if (rl && root[rl - 1] == '/') root[--rl] = '\0';
+        if (strncmp(abs, root, rl) == 0 && (abs[rl] == '\0' || abs[rl] == '/')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void cap_denied(const char* what, const char* capability, const char* subject) {
+    char msg[1024];
+    if (!g_policy_active) {
+        snprintf(msg, sizeof(msg),
+                 "[Cryo Security] Sandbox: %s blocked by sandbox policy", what);
+    } else {
+        snprintf(msg, sizeof(msg),
+                 "[Cryo Security] Sandbox: %s denied for %s — grant it with %s=%s "
+                 "in PYRO_POLICY", what, subject, capability, subject);
+    }
+    fatal(msg);
+}
+
+// Splits on `sep`, in place, returning the next token and advancing `*cur`.
+// strtok_r is hidden by -std=c11 on MinGW and strtok is not reentrant, so the
+// parser carries its own.
+static char* cap_next(char** cur, char sep) {
+    if (!*cur || !**cur) return NULL;
+    char* start = *cur;
+    char* p = start;
+    while (*p && *p != sep) p++;
+    if (*p == sep) { *p = '\0'; *cur = p + 1; } else { *cur = p; }
+    return start;
+}
+
+void pyro_policy_init(const char* spec) {
+    if (!spec || !*spec) return;
+    g_policy_active = true;
+    pyro_sandboxed = true;
+    char* buf = pyro_strdup(spec);
+    char* cur = buf;
+    char* clause_raw;
+    while ((clause_raw = cap_next(&cur, ';')) != NULL) {
+        char* clause = cap_trim(clause_raw);
+        if (!*clause) continue;
+        char* eq = strchr(clause, '=');
+        if (!eq) fatal("PYRO_POLICY: expected key=value in clause");
+        *eq = '\0';
+        char* key = cap_trim(clause);
+        CapList* target = NULL;
+        if      (strcmp(key, "fs.read")  == 0) target = &g_cap_fsread;
+        else if (strcmp(key, "fs.write") == 0) target = &g_cap_fswrite;
+        else if (strcmp(key, "net")      == 0) target = &g_cap_net;
+        else if (strcmp(key, "exec")     == 0) target = &g_cap_exec;
+        else if (strcmp(key, "env")      == 0) target = &g_cap_env;
+        else {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "PYRO_POLICY: unknown capability '%s' "
+                     "(known: fs.read, fs.write, net, exec, env)", key);
+            fatal(msg);
+        }
+        char* items = eq + 1;
+        char* it;
+        while ((it = cap_next(&items, ',')) != NULL) {
+            char* v = cap_trim(it);
+            if (*v) cap_add(target, v);
+        }
+    }
+    free(buf);
+}
+
+void cap_fs(bool read, const char* path, const char* what) {
+    if (!pyro_sandboxed && !g_policy_active) return;
+    const CapList* roots = read ? &g_cap_fsread : &g_cap_fswrite;
+    const char* name = read ? "fs.read" : "fs.write";
+    if (!g_policy_active || !cap_path_allowed(roots, path)) cap_denied(what, name, path);
+}
+
+// The host out of a URL, for the net allowlist. Unparseable means refused:
+// failing open here would defeat the allowlist.
+static void cap_host_of(const char* rawurl, char* out, size_t osz) {
+    const char* p = strstr(rawurl, "://");
+    p = p ? p + 3 : rawurl;
+    size_t i = 0;
+    while (p[i] && p[i] != '/' && p[i] != ':' && i < osz - 1) { out[i] = p[i]; i++; }
+    out[i] = '\0';
+}
+
+void cap_net(const char* target, const char* what) {
+    if (!pyro_sandboxed && !g_policy_active) return;
+    char host[512];
+    cap_host_of(target, host, sizeof(host));
+    if (!host[0]) snprintf(host, sizeof(host), "%s", target);
+    if (!g_policy_active || !cap_listed(&g_cap_net, host)) cap_denied(what, "net", host);
+}
+
+void cap_exec(const char* cmd, const char* what) {
+    if (!pyro_sandboxed && !g_policy_active) return;
+    char bin[512];
+    size_t i = 0;
+    while (cmd[i] && cmd[i] != ' ' && i < sizeof(bin) - 1) { bin[i] = cmd[i]; i++; }
+    bin[i] = '\0';
+    const char* base = bin;
+    for (const char* p = bin; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;
+    if (!g_policy_active || !cap_listed(&g_cap_exec, base)) cap_denied(what, "exec", base);
+}
+
+void cap_env(const char* name, const char* what) {
+    if (!pyro_sandboxed && !g_policy_active) return;
+    if (!g_policy_active || !cap_listed(&g_cap_env, name)) cap_denied(what, "env", name);
+}
+
 // ── embedded assets (roadmap 11.9) ─────────────────────────
 // Filled by the loader (C VM) or by the generated program (AOT), so both
 // engines answer asset() from the same table. Names are kept sorted so
@@ -1596,10 +1829,8 @@ Value native(int id, Value* a, int argc) {
                 return v;
             }
         case 24: // http_get
-            if (pyro_sandboxed) {
-                fatal("[Cryo Security] Sandbox: http_get() blocked by sandbox policy");
-            }
             {
+                { char* u = value_to_string(a[0]); cap_net(u, "http_get()"); free(u); }
                 char* url = value_to_string(a[0]);
                 char* res = http_get_curl(url);
                 Value rval = val_str(res, strlen(res));
@@ -1607,10 +1838,8 @@ Value native(int id, Value* a, int argc) {
                 return rval;
             }
         case 25: // http_post
-            if (pyro_sandboxed) {
-                fatal("[Cryo Security] Sandbox: http_post() blocked by sandbox policy");
-            }
             {
+                { char* u = value_to_string(a[0]); cap_net(u, "http_post()"); free(u); }
                 char* url = value_to_string(a[0]);
                 char* body = value_to_string(a[1]);
                 char* res = http_post_curl(url, body);
@@ -1626,9 +1855,8 @@ Value native(int id, Value* a, int argc) {
             }
         case 27: // write_bytes(path, int[]) -> bool: writes bytes to a file
             {
-                if (pyro_sandboxed) {
-                    fatal("[Cryo Security] Sandbox: write_bytes() blocked by sandbox policy");
-                }
+                { char* wp = value_to_string(a[0]);
+                  cap_fs(false, wp, "write_bytes()"); free(wp); }
                 if (a[1].kind != VAL_ARRAY) return val_bool(false);
                 char* path = value_to_string(a[0]);
                 FILE* fp = fopen(path, "wb");
@@ -1645,9 +1873,8 @@ Value native(int id, Value* a, int argc) {
             }
         case 28: // read_file(path) -> string ("" on error)
             {
-                if (pyro_sandboxed) {
-                    fatal("[Cryo Security] Sandbox: read_file() blocked by sandbox policy");
-                }
+                { char* rp = value_to_string(a[0]);
+                  cap_fs(true, rp, "read_file()"); free(rp); }
                 char* path = value_to_string(a[0]);
                 FILE* fp = fopen(path, "rb");
                 free(path);
@@ -1677,9 +1904,11 @@ Value native(int id, Value* a, int argc) {
             }
         case 30: // http_serve(port, dir) -> serve a static directory (blocking)
             {
-                if (pyro_sandboxed) {
-                    fatal("[Cryo Security] Sandbox: http_serve() blocked by sandbox policy");
-                }
+                // Binding a port is a net capability; the directory served
+                  // is also a read capability, so both are required.
+                  { char* sd = value_to_string(a[1]);
+                    cap_net("listen", "http_serve()");
+                    cap_fs(true, sd, "http_serve()"); free(sd); }
                 char* dir = value_to_string(a[1]);
                 int64_t port = (a[0].kind == VAL_FLOAT) ? (int64_t)a[0].as.f : a[0].as.i;
                 printf("[pyro] serving %s on http://localhost:%lld\n", dir, (long long)port);
@@ -1884,8 +2113,7 @@ Value native(int id, Value* a, int argc) {
         // ── HTTP server, roadmap 11.6 ──
         case 52: // http_listen(port) -> bool
             {
-                if (pyro_sandboxed)
-                    fatal("[Cryo Security] Sandbox: http_listen() blocked by sandbox policy");
+                cap_net("listen", "http_listen()");
 #ifdef _WIN32
                 WSADATA wsa;
                 if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return val_bool(false);
@@ -2039,20 +2267,18 @@ Value native(int id, Value* a, int argc) {
             }
         case 58: // make_dir(path) -> bool (creates parents)
             {
-                if (pyro_sandboxed)
-                    fatal("[Cryo Security] Sandbox: make_dir() blocked by sandbox policy");
                 char* p = value_to_string(a[0]);
+                cap_fs(false, p, "make_dir()");
                 bool ok = pyro_mkdir_all(p) != 0;
                 free(p);
                 return val_bool(ok);
             }
         case 59: // delete_file(path) -> bool  (deliberately NOT recursive)
             {
-                if (pyro_sandboxed)
-                    fatal("[Cryo Security] Sandbox: delete_file() blocked by sandbox policy");
                 // FILES ONLY — see the note in main.go case 59. POSIX remove()
                 // would delete an empty directory; MSVCRT's would not.
                 char* p = value_to_string(a[0]);
+                cap_fs(false, p, "delete_file()");
                 bool ok = false;
                 if (!pyro_is_dir(p)) ok = (remove(p) == 0);
                 free(p);
@@ -2068,9 +2294,8 @@ Value native(int id, Value* a, int argc) {
             }
         case 61: // write_file(path, content) -> bool
             {
-                if (pyro_sandboxed)
-                    fatal("[Cryo Security] Sandbox: write_file() blocked by sandbox policy");
                 char* p = value_to_string(a[0]);
+                cap_fs(false, p, "write_file()");
                 char* c = value_to_string(a[1]);
                 FILE* f = fopen(p, "wb");
                 bool ok = false;
@@ -2084,18 +2309,16 @@ Value native(int id, Value* a, int argc) {
             }
         case 62: // env(name) -> string ("" when unset)
             {
-                if (pyro_sandboxed)
-                    fatal("[Cryo Security] Sandbox: env() blocked by sandbox policy");
                 char* n = value_to_string(a[0]);
+                cap_env(n, "env()");
                 const char* v = getenv(n);
                 free(n);
                 return val_str(v ? v : "", v ? (int64_t)strlen(v) : 0);
             }
         case 63: // exec(cmd) -> string (stdout; "" on failure)
             {
-                if (pyro_sandboxed)
-                    fatal("[Cryo Security] Sandbox: exec() blocked by sandbox policy");
                 char* cmd = value_to_string(a[0]);
+                cap_exec(cmd, "exec()");
 #ifdef _WIN32
                 FILE* pipe = _popen(cmd, "r");
 #else
@@ -2131,12 +2354,11 @@ Value native(int id, Value* a, int argc) {
         // ── persistence, roadmap 11.8 ──
         case 64: // write_file_atomic(path, content) -> bool
             {
-                if (pyro_sandboxed)
-                    fatal("[Cryo Security] Sandbox: write_file_atomic() blocked by sandbox policy");
                 // Sibling temp file + flush + rename. See the note in main.go:
                 // a reader sees the old file or the new one, never the
                 // truncated middle a plain write leaves after a crash.
                 char* path = value_to_string(a[0]);
+                cap_fs(false, path, "write_file_atomic()");
                 char* data = value_to_string(a[1]);
                 size_t plen = strlen(path);
                 char* tmp = (char*)malloc(plen + 5);

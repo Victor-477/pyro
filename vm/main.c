@@ -864,6 +864,9 @@ int main(int argc, char* argv[]) {
     }
     fclose(f);
     
+    // 11.11 — a policy implies the sandbox: deny by default, grant what
+    // is listed. Parsed before PYRO_SANDBOX so a flat deny still wins.
+    pyro_policy_init(getenv("PYRO_POLICY"));
     const char* env_sandbox = getenv("PYRO_SANDBOX");
     if (env_sandbox && strcmp(env_sandbox, "1") == 0) {
         pyro_sandboxed = true;

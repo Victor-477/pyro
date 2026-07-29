@@ -18,6 +18,8 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"os/exec"
 	"runtime"
 	"os"
@@ -32,6 +34,163 @@ import (
 var httpClient = &http.Client{Timeout: 15 * time.Second}
 
 var stdin = bufio.NewReader(os.Stdin)
+
+// ── capability policy (roadmap 11.11) ──────────────────────
+//
+// `sandboxed` alone means "refuse everything gated". A POLICY refines that:
+// deny by default, then grant named capabilities. The point is that a program
+// which needs to read ./data and reach one host can be given exactly that,
+// instead of the all-or-nothing choice that pushes people to run unsandboxed.
+type capPolicy struct {
+	active   bool
+	fsRead   []string
+	fsWrite  []string
+	net      []string
+	exec     []string
+	env      []string
+}
+
+var policy capPolicy
+
+func parsePolicy(spec string) {
+	policy = capPolicy{active: true}
+	for _, clause := range strings.Split(spec, ";") {
+		clause = strings.TrimSpace(clause)
+		if clause == "" {
+			continue
+		}
+		key, val, ok := strings.Cut(clause, "=")
+		if !ok {
+			fatal("PYRO_POLICY: expected key=value in clause: " + clause)
+		}
+		items := []string{}
+		for _, it := range strings.Split(val, ",") {
+			if it = strings.TrimSpace(it); it != "" {
+				items = append(items, it)
+			}
+		}
+		switch strings.TrimSpace(key) {
+		case "fs.read":
+			policy.fsRead = append(policy.fsRead, items...)
+		case "fs.write":
+			policy.fsWrite = append(policy.fsWrite, items...)
+		case "net":
+			policy.net = append(policy.net, items...)
+		case "exec":
+			policy.exec = append(policy.exec, items...)
+		case "env":
+			policy.env = append(policy.env, items...)
+		default:
+			fatal("PYRO_POLICY: unknown capability '" + key +
+				"' (known: fs.read, fs.write, net, exec, env)")
+		}
+	}
+}
+
+// denied reports the refusal the same way everywhere: what was attempted, and
+// WHICH capability would have allowed it. A flat "blocked by sandbox policy"
+// tells the operator nothing about what to grant.
+func denied(what, capability, subject string) {
+	if !policy.active {
+		fatal("[Cryo Security] Sandbox: " + what + " blocked by sandbox policy")
+	}
+	fatal("[Cryo Security] Sandbox: " + what + " denied for " + subject +
+		" — grant it with " + capability + " in PYRO_POLICY")
+}
+
+// pathAllowed: the cleaned absolute path must sit inside one of the granted
+// roots. Cleaning first is what stops "./data/../../etc/passwd" walking out of
+// a granted directory.
+func pathAllowed(roots []string, target string) bool {
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		return false
+	}
+	abs = filepath.Clean(abs)
+	for _, r := range roots {
+		if r == "*" {
+			return true
+		}
+		ra, err := filepath.Abs(r)
+		if err != nil {
+			continue
+		}
+		ra = filepath.Clean(ra)
+		if abs == ra || strings.HasPrefix(abs, ra+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+func listed(items []string, want string) bool {
+	for _, it := range items {
+		if it == "*" || strings.EqualFold(it, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// hostOf pulls the host out of a URL for the net allowlist. A URL we cannot
+// parse is refused rather than allowed — failing open here would defeat the
+// allowlist entirely.
+func hostOf(rawurl string) string {
+	u, err := url.Parse(rawurl)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Hostname()
+}
+
+// The five gates. Each aborts with a message naming the capability.
+func capFS(read bool, path, what string) {
+	if !sandboxed && !policy.active {
+		return
+	}
+	roots, name := policy.fsWrite, "fs.write"
+	if read {
+		roots, name = policy.fsRead, "fs.read"
+	}
+	if !policy.active || !pathAllowed(roots, path) {
+		denied(what, name+"="+path, path)
+	}
+}
+
+func capNet(target, what string) {
+	if !sandboxed && !policy.active {
+		return
+	}
+	host := hostOf(target)
+	if host == "" {
+		host = target
+	}
+	if !policy.active || !listed(policy.net, host) {
+		denied(what, "net="+host, host)
+	}
+}
+
+func capExec(cmd, what string) {
+	if !sandboxed && !policy.active {
+		return
+	}
+	bin := cmd
+	if f := strings.Fields(cmd); len(f) > 0 {
+		bin = filepath.Base(f[0])
+	}
+	if !policy.active || !listed(policy.exec, bin) {
+		denied(what, "exec="+bin, bin)
+	}
+}
+
+func capEnv(name, what string) {
+	if !sandboxed && !policy.active {
+		return
+	}
+	if !policy.active || !listed(policy.env, name) {
+		denied(what, "env="+name, name)
+	}
+}
 
 // ── HTTP server (roadmap 11.6) ─────────────────────────────
 // One listener and one in-flight connection: requests are served strictly one
@@ -1161,12 +1320,12 @@ func native(id int, a []Value) Value {
 		return goToValue(raw)
 	case 24: // http_get(url) -> body (string); "" in case of error
 		if sandboxed {
-			fatal("[Cryo Security] Sandbox: http_get() blocked by sandbox policy")
+			capNet(a[0].String(), "http_get()")
 		}
 		return vStr(httpGet(a[0].String()))
 	case 25: // http_post(url, body) -> response body (string)
 		if sandboxed {
-			fatal("[Cryo Security] Sandbox: http_post() blocked by sandbox policy")
+			capNet(a[0].String(), "http_post()")
 		}
 		return vStr(httpPost(a[0].String(), a[1].String()))
 	case 26: // sleep(ms) -> pause; returns null
@@ -1179,9 +1338,7 @@ func native(id int, a []Value) Value {
 		}
 		return vNull()
 	case 27: // write_bytes(path, int[]) -> bool: writes bytes to a file
-		if sandboxed {
-			fatal("[Cryo Security] Sandbox: write_bytes() blocked by sandbox policy")
-		}
+		capFS(false, a[0].String(), "write_bytes()")
 		if a[1].k != kArray {
 			return vBool(false)
 		}
@@ -1192,9 +1349,7 @@ func native(id int, a []Value) Value {
 		}
 		return vBool(os.WriteFile(a[0].String(), buf, 0644) == nil)
 	case 28: // read_file(path) -> string ("" on error)
-		if sandboxed {
-			fatal("[Cryo Security] Sandbox: read_file() blocked by sandbox policy")
-		}
+		capFS(true, a[0].String(), "read_file()")
 		data, err := os.ReadFile(a[0].String())
 		if err != nil {
 			return vStr("")
@@ -1505,14 +1660,10 @@ func native(id int, a []Value) Value {
 		}
 		return vArr(out)
 	case 58: // make_dir(path) -> bool (creates parents; true if it already exists)
-		if sandboxed {
-			fatal("[Cryo Security] Sandbox: make_dir() blocked by sandbox policy")
-		}
+		capFS(false, a[0].String(), "make_dir()")
 		return vBool(os.MkdirAll(a[0].String(), 0o755) == nil)
 	case 59: // delete_file(path) -> bool
-		if sandboxed {
-			fatal("[Cryo Security] Sandbox: delete_file() blocked by sandbox policy")
-		}
+		capFS(false, a[0].String(), "delete_file()")
 		// FILES ONLY, and deliberately not recursive. Go's os.Remove would
 		// also drop an empty directory, but MSVCRT's remove() will not and
 		// POSIX's will — so left alone this one call would mean three
@@ -1528,19 +1679,13 @@ func native(id int, a []Value) Value {
 		}
 		return vInt(st.Size())
 	case 61: // write_file(path, content) -> bool
-		if sandboxed {
-			fatal("[Cryo Security] Sandbox: write_file() blocked by sandbox policy")
-		}
+		capFS(false, a[0].String(), "write_file()")
 		return vBool(os.WriteFile(a[0].String(), []byte(a[1].String()), 0o644) == nil)
 	case 62: // env(name) -> string ("" when unset)
-		if sandboxed {
-			fatal("[Cryo Security] Sandbox: env() blocked by sandbox policy")
-		}
+		capEnv(a[0].String(), "env()")
 		return vStr(os.Getenv(a[0].String()))
 	case 63: // exec(cmd) -> string (stdout; "" on failure)
-		if sandboxed {
-			fatal("[Cryo Security] Sandbox: exec() blocked by sandbox policy")
-		}
+		capExec(a[0].String(), "exec()")
 		var cmd *exec.Cmd
 		if runtime.GOOS == "windows" {
 			cmd = exec.Command("cmd", "/C", a[0].String())
@@ -1556,7 +1701,7 @@ func native(id int, a []Value) Value {
 	// ── persistence, roadmap 11.8 ──
 	case 64: // write_file_atomic(path, content) -> bool
 		if sandboxed {
-			fatal("[Cryo Security] Sandbox: write_file_atomic() blocked by sandbox policy")
+			capFS(false, a[0].String(), "write_file_atomic()")
 		}
 		// Write a sibling temp file, flush it to disk, then rename over the
 		// target. A reader then sees either the old file or the new one, never
@@ -1788,6 +1933,11 @@ func main() {
 	data, err := os.ReadFile(os.Args[1])
 	if err != nil {
 		fatal("could not read: " + err.Error())
+	}
+	if spec := os.Getenv("PYRO_POLICY"); spec != "" {
+		// A policy implies the sandbox: deny by default, grant what is listed.
+		sandboxed = true
+		parsePolicy(spec)
 	}
 	if os.Getenv("PYRO_SANDBOX") == "1" {
 		sandboxed = true

@@ -296,12 +296,47 @@ and bit flips over two seed programs, on both VMs. A crash there is a release
 blocker.
 
 ### Sandbox policy
-The runtime exposes `pyro_sandboxed` (turned on by the host via the `.pyro` `bit2`
-flag or `PYRO_SANDBOX=1`). When active, the **network/machine** natives (`http_get`,
-`http_post`, `write_bytes`, `read_file`, `http_serve`) are refused with a security
-abort. `sleep` and `args` stay allowed.
 
----
+Three modes, in increasing precision:
+
+| | |
+|---|---|
+| nothing set | everything allowed — the default |
+| `PYRO_SANDBOX=1` | every gated native is refused |
+| `PYRO_POLICY=...` | **deny by default**, grant exactly what is listed |
+
+A policy is semicolon-separated clauses; `*` grants a whole class:
+
+```bash
+PYRO_POLICY="fs.read=./data,./config;fs.write=./data;net=api.example.com;exec=git;env=HOME"
+```
+
+| Capability | Gates |
+|---|---|
+| `fs.read` | `read_file`, and the directory `http_serve` publishes |
+| `fs.write` | `write_bytes`, `write_file`, `write_file_atomic`, `make_dir`, `delete_file` |
+| `net` | `http_get`, `http_post` (by **host**), `http_listen`, `http_serve` |
+| `exec` | `exec`, by the **binary name** |
+| `env` | `env`, by **variable name** |
+
+Two properties worth stating:
+
+- **Paths are resolved before they are compared.** A granted root of `./data`
+  does not permit `./data/../secret` — the path is made absolute and `.`/`..`
+  collapsed first, so a traversal cannot leave the root it was granted.
+- **A refusal names what to grant**, e.g.
+  `write_file() denied for data/new.txt — grant it with fs.write=data/new.txt
+  in PYRO_POLICY`. A flat "blocked by sandbox policy" tells the operator
+  nothing about how to proceed, which is what pushes people to disable the
+  sandbox entirely.
+
+An unknown capability is an **error**, not a silent no-op: a typo in a policy
+must not quietly grant less than intended.
+
+> **Not covered:** execution time and memory. A malformed or hostile program
+> can still loop forever, and so can a valid one (see the note on the loader
+> above), so quotas are a separate mechanism.
+
 
 ## 6. Error and abort contract
 

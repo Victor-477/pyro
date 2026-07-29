@@ -81,6 +81,14 @@
 // take ownership of the pointers.
 void pyro_asset_add(char* name, char* data, int64_t len);
 
+// Roadmap 11.11 — capability policy. pyro_policy_init parses PYRO_POLICY;
+// the cap_* gates replace the all-or-nothing sandbox check in each native.
+void pyro_policy_init(const char* spec);
+void cap_fs(bool read, const char* path, const char* what);
+void cap_net(const char* target, const char* what);
+void cap_exec(const char* cmd, const char* what);
+void cap_env(const char* name, const char* what);
+
 // ── Constant Tags ───────────────────────────────────────────
 #define TAG_INT      1
 #define TAG_FLT      2
