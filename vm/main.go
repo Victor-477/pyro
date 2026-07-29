@@ -18,7 +18,10 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"os/exec"
+	"runtime"
 	"os"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -1431,6 +1434,80 @@ func native(id int, a []Value) Value {
 		httpConn = nil
 		return vBool(werr == nil)
 
+	// ── filesystem & process, roadmap 11.7 ──
+	// Pure queries (exists/is_dir/size/list) are ungated: they reveal only what
+	// a path lookup reveals. Everything that MUTATES the machine or reads its
+	// environment is sandbox-gated, matching read_file/write_bytes.
+	case 55: // file_exists(path) -> bool
+		_, err := os.Stat(a[0].String())
+		return vBool(err == nil)
+	case 56: // is_dir(path) -> bool
+		st, err := os.Stat(a[0].String())
+		return vBool(err == nil && st.IsDir())
+	case 57: // list_dir(path) -> string[] (names only, sorted; empty on error)
+		ents, err := os.ReadDir(a[0].String())
+		if err != nil {
+			return vArr([]Value{})
+		}
+		names := make([]string, 0, len(ents))
+		for _, e := range ents {
+			names = append(names, e.Name())
+		}
+		sort.Strings(names) // deterministic: the C runtime sorts too
+		out := make([]Value, len(names))
+		for i, n := range names {
+			out[i] = vStr(n)
+		}
+		return vArr(out)
+	case 58: // make_dir(path) -> bool (creates parents; true if it already exists)
+		if sandboxed {
+			fatal("[Cryo Security] Sandbox: make_dir() blocked by sandbox policy")
+		}
+		return vBool(os.MkdirAll(a[0].String(), 0o755) == nil)
+	case 59: // delete_file(path) -> bool
+		if sandboxed {
+			fatal("[Cryo Security] Sandbox: delete_file() blocked by sandbox policy")
+		}
+		// FILES ONLY, and deliberately not recursive. Go's os.Remove would
+		// also drop an empty directory, but MSVCRT's remove() will not and
+		// POSIX's will — so left alone this one call would mean three
+		// different things. Directory removal is simply not offered yet.
+		if st, err := os.Stat(a[0].String()); err == nil && st.IsDir() {
+			return vBool(false)
+		}
+		return vBool(os.Remove(a[0].String()) == nil)
+	case 60: // file_size(path) -> int (-1 when it cannot be read)
+		st, err := os.Stat(a[0].String())
+		if err != nil {
+			return vInt(-1)
+		}
+		return vInt(st.Size())
+	case 61: // write_file(path, content) -> bool
+		if sandboxed {
+			fatal("[Cryo Security] Sandbox: write_file() blocked by sandbox policy")
+		}
+		return vBool(os.WriteFile(a[0].String(), []byte(a[1].String()), 0o644) == nil)
+	case 62: // env(name) -> string ("" when unset)
+		if sandboxed {
+			fatal("[Cryo Security] Sandbox: env() blocked by sandbox policy")
+		}
+		return vStr(os.Getenv(a[0].String()))
+	case 63: // exec(cmd) -> string (stdout; "" on failure)
+		if sandboxed {
+			fatal("[Cryo Security] Sandbox: exec() blocked by sandbox policy")
+		}
+		var cmd *exec.Cmd
+		if runtime.GOOS == "windows" {
+			cmd = exec.Command("cmd", "/C", a[0].String())
+		} else {
+			cmd = exec.Command("sh", "-c", a[0].String())
+		}
+		outBytes, err := cmd.Output()
+		if err != nil && len(outBytes) == 0 {
+			return vStr("")
+		}
+		return vStr(string(outBytes))
+
 	}
 	fatal(fmt.Sprintf("unknown native builtin: id=%d", id))
 	return vNull()
@@ -1529,7 +1606,20 @@ func binOp(op byte, a, b Value) Value {
 	return vNull()
 }
 
+func sameMap(m1, m2 map[any]Value) bool {
+	if m1 == nil && m2 == nil {
+		return true
+	}
+	if m1 == nil || m2 == nil {
+		return false
+	}
+	return reflect.ValueOf(m1).Pointer() == reflect.ValueOf(m2).Pointer()
+}
+
 func valueEq(a, b Value) bool {
+	if a.k == kNull || b.k == kNull {
+		return a.k == kNull && b.k == kNull
+	}
 	if a.k == kStr || b.k == kStr {
 		return a.String() == b.String()
 	}
@@ -1539,7 +1629,16 @@ func valueEq(a, b Value) bool {
 	if a.k == kBool || b.k == kBool {
 		return a.truthy() == b.truthy()
 	}
-	return a.i == b.i
+	if a.k == kArray || b.k == kArray {
+		return a.k == b.k && a.arr == b.arr
+	}
+	if a.k == kMap || b.k == kMap {
+		return a.k == b.k && sameMap(a.m, b.m)
+	}
+	if a.k == kFunc || b.k == kFunc {
+		return a.k == b.k && a.i == b.i && a.arr == b.arr
+	}
+	return a.k == b.k && a.i == b.i
 }
 
 func main() {

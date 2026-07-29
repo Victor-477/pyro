@@ -471,6 +471,9 @@ char* value_to_string(Value v) {
 }
 
 bool value_eq(Value a, Value b) {
+    if (a.kind == VAL_NULL || b.kind == VAL_NULL) {
+        return a.kind == VAL_NULL && b.kind == VAL_NULL;
+    }
     if (a.kind == VAL_STR || b.kind == VAL_STR) {
         char* sa = value_to_string(a);
         char* sb = value_to_string(b);
@@ -485,12 +488,13 @@ bool value_eq(Value a, Value b) {
     }
     if (a.kind == VAL_BOOL || b.kind == VAL_BOOL) {
         bool ba = (a.kind == VAL_BOOL) ? a.as.b : (a.kind == VAL_INT ? a.as.i != 0 : false);
-        bool bb = (b.kind == VAL_BOOL) ? b.as.b : (b.kind == VAL_INT ? b.as.i != 0 : false);
+        bool bb = (b.kind == VAL_BOOL) ? b.as.b : (a.kind == VAL_INT ? b.as.i != 0 : false);
         return ba == bb;
     }
-    if (a.kind == VAL_NULL && b.kind == VAL_NULL) return true;
     if (a.kind != b.kind) return false;
     if (a.kind == VAL_INT) return a.as.i == b.as.i;
+    if (a.kind == VAL_ARRAY) return a.as.arr == b.as.arr;
+    if (a.kind == VAL_MAP) return a.as.map == b.as.map;
     if (a.kind == VAL_FUNC) return a.fnidx == b.fnidx && a.as.arr == b.as.arr;
     return false;
 }
@@ -983,6 +987,51 @@ static void http_send(pyro_sock c, int status, const char* reason,
     if (body && blen > 0) send(c, body, (int)blen, 0);
 }
 
+// ── filesystem helpers (roadmap 11.7) ──────────────────────
+#include <dirent.h>
+#include <sys/stat.h>
+
+// list_dir sorts its names so the Go VM and this runtime return the same
+// order. Go uses sort.Strings; strcmp gives the same byte ordering.
+static int pyro_name_cmp(const void* a, const void* b) {
+    return strcmp(*(const char* const*)a, *(const char* const*)b);
+}
+
+static int pyro_is_dir(const char* path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    return (st.st_mode & S_IFMT) == S_IFDIR;
+}
+
+// Creates every missing component, like Go's os.MkdirAll. Returns 1 on
+// success or if the directory already exists.
+static int pyro_mkdir_all(const char* path) {
+    char buf[1024];
+    size_t n = strlen(path);
+    if (n >= sizeof(buf)) return 0;
+    memcpy(buf, path, n + 1);
+    for (size_t i = 1; i < n; i++) {
+        if (buf[i] == '/' || buf[i] == '\\') {
+            char save = buf[i];
+            buf[i] = '\0';
+            if (buf[0] && !pyro_is_dir(buf)) {
+#ifdef _WIN32
+                _mkdir(buf);
+#else
+                mkdir(buf, 0755);
+#endif
+            }
+            buf[i] = save;
+        }
+    }
+    if (pyro_is_dir(buf)) return 1;
+#ifdef _WIN32
+    return _mkdir(buf) == 0 || pyro_is_dir(buf);
+#else
+    return mkdir(buf, 0755) == 0 || pyro_is_dir(buf);
+#endif
+}
+
 // ── HTTP server (roadmap 11.6) ─────────────────────────────
 // One listener, one in-flight connection: requests are served strictly one at
 // a time, which is what makes this safe without any locking. Mirrors the Go
@@ -1368,6 +1417,22 @@ Value native(int id, Value* a, int argc) {
                 size_t old_len = strlen(old);
                 size_t new_len = strlen(new_str);
                 
+                if (old_len == 0) {
+                    size_t slen = strlen(s);
+                    size_t res_cap = (slen + 1) * new_len + slen + 1;
+                    char* res = malloc(res_cap);
+                    size_t pos = 0;
+                    for (size_t i = 0; i < slen; i++) {
+                        memcpy(res + pos, new_str, new_len); pos += new_len;
+                        res[pos++] = s[i];
+                    }
+                    memcpy(res + pos, new_str, new_len); pos += new_len;
+                    res[pos] = '\0';
+                    Value rval = val_str(res, pos);
+                    free(s); free(old); free(new_str); free(res);
+                    return rval;
+                }
+
                 size_t capacity = strlen(s) + 1;
                 char* res = malloc(capacity);
                 res[0] = '\0';
@@ -1375,11 +1440,6 @@ Value native(int id, Value* a, int argc) {
                 
                 char* curr = s;
                 char* next;
-                if (old_len == 0) {
-                    Value rval = val_str(s, strlen(s));
-                    free(s); free(old); free(new_str); free(res);
-                    return rval;
-                }
                 while ((next = strstr(curr, old)) != NULL) {
                     size_t diff = next - curr;
                     if (rlen + diff + new_len + 1 >= capacity) {
@@ -1836,6 +1896,146 @@ Value native(int id, Value* a, int argc) {
                 pyro_closesock(g_http_conn);
                 g_http_conn = PYRO_BADSOCK;
                 return val_bool(ok);
+            }
+        // ── filesystem & process, roadmap 11.7 ──
+        // Pure queries are ungated; anything that mutates the machine or reads
+        // its environment is sandbox-gated, matching read_file/write_bytes.
+        case 55: // file_exists(path) -> bool
+            {
+                char* p = value_to_string(a[0]);
+                struct stat st;
+                bool ok = (stat(p, &st) == 0);
+                free(p);
+                return val_bool(ok);
+            }
+        case 56: // is_dir(path) -> bool
+            {
+                char* p = value_to_string(a[0]);
+                bool ok = pyro_is_dir(p) != 0;
+                free(p);
+                return val_bool(ok);
+            }
+        case 57: // list_dir(path) -> string[] (names only, sorted; empty on error)
+            {
+                char* p = value_to_string(a[0]);
+                RcArray* out = rc_array_new();
+                DIR* d = opendir(p);
+                free(p);
+                if (!d) return val_array(out);
+                char** names = NULL;
+                int n = 0, cap = 0;
+                struct dirent* e;
+                while ((e = readdir(d)) != NULL) {
+                    if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+                    if (n == cap) {
+                        cap = cap ? cap * 2 : 16;
+                        char** grown = (char**)realloc(names, (size_t)cap * sizeof(char*));
+                        if (!grown) break;
+                        names = grown;
+                    }
+                    names[n++] = pyro_strdup(e->d_name);
+                }
+                closedir(d);
+                if (names) {
+                    qsort(names, (size_t)n, sizeof(char*), pyro_name_cmp);
+                    for (int i = 0; i < n; i++) {
+                        rc_array_push(out, val_str(names[i], (int64_t)strlen(names[i])));
+                        free(names[i]);
+                    }
+                    free(names);
+                }
+                return val_array(out);
+            }
+        case 58: // make_dir(path) -> bool (creates parents)
+            {
+                if (pyro_sandboxed)
+                    fatal("[Cryo Security] Sandbox: make_dir() blocked by sandbox policy");
+                char* p = value_to_string(a[0]);
+                bool ok = pyro_mkdir_all(p) != 0;
+                free(p);
+                return val_bool(ok);
+            }
+        case 59: // delete_file(path) -> bool  (deliberately NOT recursive)
+            {
+                if (pyro_sandboxed)
+                    fatal("[Cryo Security] Sandbox: delete_file() blocked by sandbox policy");
+                // FILES ONLY — see the note in main.go case 59. POSIX remove()
+                // would delete an empty directory; MSVCRT's would not.
+                char* p = value_to_string(a[0]);
+                bool ok = false;
+                if (!pyro_is_dir(p)) ok = (remove(p) == 0);
+                free(p);
+                return val_bool(ok);
+            }
+        case 60: // file_size(path) -> int (-1 when it cannot be read)
+            {
+                char* p = value_to_string(a[0]);
+                struct stat st;
+                int64_t sz = (stat(p, &st) == 0) ? (int64_t)st.st_size : -1;
+                free(p);
+                return val_int(sz);
+            }
+        case 61: // write_file(path, content) -> bool
+            {
+                if (pyro_sandboxed)
+                    fatal("[Cryo Security] Sandbox: write_file() blocked by sandbox policy");
+                char* p = value_to_string(a[0]);
+                char* c = value_to_string(a[1]);
+                FILE* f = fopen(p, "wb");
+                bool ok = false;
+                if (f) {
+                    size_t len = strlen(c);
+                    ok = (fwrite(c, 1, len, f) == len);
+                    fclose(f);
+                }
+                free(p); free(c);
+                return val_bool(ok);
+            }
+        case 62: // env(name) -> string ("" when unset)
+            {
+                if (pyro_sandboxed)
+                    fatal("[Cryo Security] Sandbox: env() blocked by sandbox policy");
+                char* n = value_to_string(a[0]);
+                const char* v = getenv(n);
+                free(n);
+                return val_str(v ? v : "", v ? (int64_t)strlen(v) : 0);
+            }
+        case 63: // exec(cmd) -> string (stdout; "" on failure)
+            {
+                if (pyro_sandboxed)
+                    fatal("[Cryo Security] Sandbox: exec() blocked by sandbox policy");
+                char* cmd = value_to_string(a[0]);
+#ifdef _WIN32
+                FILE* pipe = _popen(cmd, "r");
+#else
+                FILE* pipe = popen(cmd, "r");
+#endif
+                free(cmd);
+                if (!pipe) return val_str("", 0);
+                char* buf = NULL;
+                size_t len = 0, cap = 0;
+                char chunk[4096];
+                size_t got;
+                while ((got = fread(chunk, 1, sizeof(chunk), pipe)) > 0) {
+                    if (len + got + 1 > cap) {
+                        size_t want = (len + got + 1) * 2;
+                        char* grown = (char*)realloc(buf, want);
+                        if (!grown) break;
+                        buf = grown; cap = want;
+                    }
+                    memcpy(buf + len, chunk, got);
+                    len += got;
+                }
+#ifdef _WIN32
+                _pclose(pipe);
+#else
+                pclose(pipe);
+#endif
+                if (!buf) return val_str("", 0);
+                buf[len] = '\0';
+                Value res = val_str(buf, (int64_t)len);
+                free(buf);
+                return res;
             }
     }
     fatal("unknown native builtin");

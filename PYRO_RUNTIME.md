@@ -48,8 +48,9 @@ Mixed `int`/`float` operations promote the integer to `float`; the result is
 
 ### Equality (`value_eq`)
 - Same numeric category compares by value (with `int`/`float` promotion).
-- `string` compares by content; `bool` by value; `null == null` is true.
-- `array`/`map` compare by **reference identity**.
+- `string` compares by content; `bool` by value.
+- `null` compares equal only to `null` (`null == null` is true; `x == null` is false for any non-null container, scalar or function).
+- `array` and `map` compare by **reference identity** (pointer equality).
 
 ### Truthiness (`value_truthy`)
 `false`, `null`, `0` (int), `0.0` (float) and `""` are falsy; everything else is truthy.
@@ -135,8 +136,26 @@ the result. The id table is **mirrored** between the generator (`NATIVES` in
 | | | | | 52 | `http_listen` |
 | | | | | 53 | `http_accept` |
 | | | | | 54 | `http_respond` |
+| | | | | 55 | `file_exists` |
+| | | | | 56 | `is_dir` |
+| | | | | 57 | `list_dir` |
+| | | | | 58 | `make_dir` |
+| | | | | 59 | `delete_file` |
+| | | | | 60 | `file_size` |
+| | | | | 61 | `write_file` |
+| | | | | 62 | `env` |
+| | | | | 63 | `exec` |
+| | | | | 55 | `file_exists` |
+| | | | | 56 | `is_dir` |
+| | | | | 57 | `list_dir` |
+| | | | | 58 | `make_dir` |
+| | | | | 59 | `delete_file` |
+| | | | | 60 | `file_size` |
+| | | | | 61 | `write_file` |
+| | | | | 62 | `env` |
+| | | | | 63 | `exec` |
 
-Ids 30 and below are listed in the left three columns above; 31–54 continue here.
+Ids 30 and below are listed in the left three columns above; 31–63 continue here.
 An id is **permanent** once shipped: renumbering silently breaks every `.pyro`
 already on disk, so new builtins only ever append.
 
@@ -195,7 +214,28 @@ already on disk, so new builtins only ever append.
   and `body`. Calling `http_accept` before `http_listen` aborts; calling it
   again without responding closes the unanswered connection rather than
   leaking it. `http_listen` is gated by the sandbox.
+- **Filesystem and process (11.7)** — `file_exists`, `is_dir`, `file_size`
+  and `list_dir` are pure queries and ungated: they reveal no more than a path
+  lookup. `make_dir`, `delete_file`, `write_file`, `env` and `exec` **mutate the
+  machine or read its environment** and are sandbox-gated, like
+  `read_file`/`write_bytes`.
+
+  - `list_dir(path) -> string[]` returns entry **names** (not paths), `.` and
+    `..` excluded, **sorted by byte order** so every engine returns the same
+    sequence. An unreadable path gives an empty array, not an error.
+  - `file_size(path) -> int` is `-1` when the path cannot be read, which is
+    distinguishable from a legitimately empty file.
+  - `make_dir(path) -> bool` creates **every missing component** and returns
+    true if the directory already exists.
+  - **`delete_file` removes FILES ONLY** and returns false for a directory.
+    This is a deliberate narrowing: Go's `os.Remove` drops an empty directory,
+    MSVCRT's `remove()` refuses, and POSIX's removes it — one call would have
+    meant three different things. It is also never recursive. Directory
+    removal is not offered yet.
+  - `exec(cmd) -> string` returns the command's **stdout**, `""` on failure.
+    It runs through `cmd /C` on Windows and `sh -c` elsewhere.
 - `to_int`/`to_number` of a non-numeric string **abort** (fail-fast).
+- **`replace(s, old, new)`** replaces all occurrences of `old` with `new`. When `old` is an empty string (`""`), `new` is inserted at every position boundary (e.g. `replace("abc", "", "-")` yields `"-a-b-c-"`, and `replace("", "", "-")` yields `"-"`).
 
 ### Sandbox policy
 The runtime exposes `pyro_sandboxed` (turned on by the host via the `.pyro` `bit2`
