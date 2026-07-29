@@ -983,6 +983,106 @@ static void http_send(pyro_sock c, int status, const char* reason,
     if (body && blen > 0) send(c, body, (int)blen, 0);
 }
 
+// ── HTTP server (roadmap 11.6) ─────────────────────────────
+// One listener, one in-flight connection: requests are served strictly one at
+// a time, which is what makes this safe without any locking. Mirrors the Go
+// VM's implementation in main.go, field for field.
+static pyro_sock g_http_srv  = PYRO_BADSOCK;
+static pyro_sock g_http_conn = PYRO_BADSOCK;
+
+static const char* http_status_text(int64_t code) {
+    switch (code) {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 204: return "No Content";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 500: return "Internal Server Error";
+        default:  return "Status";
+    }
+}
+
+// Reads one HTTP/1.1 request. Returns 0 on a malformed or closed connection.
+// Kept deliberately minimal and behaviour-identical to httpParseRequest in Go.
+static int http_read_request(pyro_sock c, char* method, size_t msz,
+                             char* path, size_t psz, char* query, size_t qsz,
+                             char** body_out) {
+    static char buf[65536];
+    int total = 0;
+    int header_end = -1;
+    *body_out = NULL;
+
+    // read until the end of the headers
+    while (total < (int)sizeof(buf) - 1) {
+        int got = recv(c, buf + total, (int)sizeof(buf) - 1 - total, 0);
+        if (got <= 0) return 0;
+        total += got;
+        buf[total] = '\0';
+        char* p = strstr(buf, "\r\n\r\n");
+        if (p) { header_end = (int)(p - buf) + 4; break; }
+    }
+    if (header_end < 0) return 0;
+
+    // request line: METHOD TARGET HTTP/1.1
+    const char* sp1 = strchr(buf, ' ');
+    if (!sp1) return 0;
+    size_t mlen = (size_t)(sp1 - buf);
+    if (mlen >= msz) mlen = msz - 1;
+    memcpy(method, buf, mlen); method[mlen] = '\0';
+
+    const char* target = sp1 + 1;
+    const char* sp2 = strchr(target, ' ');
+    if (!sp2) return 0;
+    size_t tlen = (size_t)(sp2 - target);
+
+    const char* q = (const char*)memchr(target, '?', tlen);
+    size_t plen = q ? (size_t)(q - target) : tlen;
+    if (plen >= psz) plen = psz - 1;
+    memcpy(path, target, plen); path[plen] = '\0';
+    query[0] = '\0';
+    if (q) {
+        size_t qlen = tlen - plen - 1;
+        if (qlen >= qsz) qlen = qsz - 1;
+        memcpy(query, q + 1, qlen); query[qlen] = '\0';
+    }
+
+    // Content-Length (case-insensitive), then the body
+    long clen = 0;
+    for (const char* h = buf; h && h < buf + header_end; ) {
+        const char* eol = strstr(h, "\r\n");
+        if (!eol || eol >= buf + header_end) break;
+        if ((size_t)(eol - h) > 15) {
+            char name[16];
+            memcpy(name, h, 14); name[14] = '\0';
+            for (int i = 0; name[i]; i++) name[i] = (char)tolower((unsigned char)name[i]);
+            if (strcmp(name, "content-length") == 0) {
+                const char* v = h + 14;
+                while (*v == ':' || *v == ' ') v++;
+                clen = strtol(v, NULL, 10);
+            }
+        }
+        h = eol + 2;
+    }
+    if (clen > 0) {
+        char* body = (char*)malloc((size_t)clen + 1);
+        if (!body) return 0;
+        int have = total - header_end;
+        if (have > clen) have = (int)clen;
+        if (have > 0) memcpy(body, buf + header_end, (size_t)have);
+        while (have < clen) {
+            int got = recv(c, body + have, (int)(clen - have), 0);
+            if (got <= 0) break;
+            have += got;
+        }
+        body[have] = '\0';
+        *body_out = body;
+    }
+    return 1;
+}
+
 void http_serve_dir(const char* dir, int port) {
 #ifdef _WIN32
     WSADATA wsa;
@@ -1650,6 +1750,92 @@ Value native(int id, Value* a, int argc) {
                 int64_t n = (a[0].kind == VAL_INT) ? a[0].as.i : (int64_t)value_as_float(a[0]);
                 g_c_prng_state = (uint64_t)n;
                 return val_null();
+            }
+        // ── HTTP server, roadmap 11.6 ──
+        case 52: // http_listen(port) -> bool
+            {
+                if (pyro_sandboxed)
+                    fatal("[Cryo Security] Sandbox: http_listen() blocked by sandbox policy");
+#ifdef _WIN32
+                WSADATA wsa;
+                if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return val_bool(false);
+#endif
+                if (g_http_srv != PYRO_BADSOCK) pyro_closesock(g_http_srv);
+                int64_t port = (a[0].kind == VAL_INT) ? a[0].as.i : (int64_t)value_as_float(a[0]);
+                pyro_sock srv = socket(AF_INET, SOCK_STREAM, 0);
+                if (srv == PYRO_BADSOCK) return val_bool(false);
+                int yes = 1;
+                setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+                struct sockaddr_in addr;
+                memset(&addr, 0, sizeof(addr));
+                addr.sin_family = AF_INET;
+                addr.sin_addr.s_addr = htonl(INADDR_ANY);
+                addr.sin_port = htons((unsigned short)port);
+                if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+                    pyro_closesock(srv); return val_bool(false);
+                }
+                if (listen(srv, 16) != 0) { pyro_closesock(srv); return val_bool(false); }
+                g_http_srv = srv;
+                return val_bool(true);
+            }
+        case 53: // http_accept() -> map{method,path,query,body} or null
+            {
+                if (g_http_srv == PYRO_BADSOCK)
+                    fatal("http_accept() called before http_listen()");
+                if (g_http_conn != PYRO_BADSOCK) {
+                    // previous request never answered: close rather than leak
+                    pyro_closesock(g_http_conn);
+                    g_http_conn = PYRO_BADSOCK;
+                }
+                // Always returns a MAP, never null — mirrors main.go. `req == null`
+                // cannot be written reliably today (equality compares containers
+                // by their zero int), so a failed or malformed accept is signalled
+                // by an empty method instead.
+                char method[16], path[2048], query[2048];
+                char* body = NULL;
+                method[0] = '\0'; path[0] = '\0'; query[0] = '\0';
+                pyro_sock c = accept(g_http_srv, NULL, NULL);
+                if (c != PYRO_BADSOCK &&
+                    !http_read_request(c, method, sizeof(method), path, sizeof(path),
+                                       query, sizeof(query), &body)) {
+                    pyro_closesock(c);
+                    c = PYRO_BADSOCK;
+                    method[0] = '\0'; path[0] = '\0'; query[0] = '\0';
+                    if (body) { free(body); body = NULL; }
+                }
+                g_http_conn = c;
+                RcMap* m = rc_map_new();
+                rc_map_set(m, val_str("method", 6), val_str(method, (int64_t)strlen(method)));
+                rc_map_set(m, val_str("path",   4), val_str(path,   (int64_t)strlen(path)));
+                rc_map_set(m, val_str("query",  5), val_str(query,  (int64_t)strlen(query)));
+                rc_map_set(m, val_str("body",   4), val_str(body ? body : "",
+                                                            body ? (int64_t)strlen(body) : 0));
+                if (body) free(body);
+                return val_map(m);
+            }
+        case 54: // http_respond(status, content_type, body) -> bool
+            {
+                if (g_http_conn == PYRO_BADSOCK) return val_bool(false);
+                int64_t status = (a[0].kind == VAL_INT) ? a[0].as.i : (int64_t)value_as_float(a[0]);
+                char* ctype = value_to_string(a[1]);
+                char* payload = value_to_string(a[2]);
+                size_t plen = strlen(payload);
+                size_t need = plen + strlen(ctype) + 256;
+                char* resp = (char*)malloc(need);
+                int ok = 0;
+                if (resp) {
+                    int n = snprintf(resp, need,
+                        "HTTP/1.1 %lld %s\r\nContent-Type: %s\r\nContent-Length: %lld\r\n"
+                        "Connection: close\r\n\r\n%s",
+                        (long long)status, http_status_text(status), ctype,
+                        (long long)plen, payload);
+                    ok = (send(g_http_conn, resp, n, 0) == n);
+                    free(resp);
+                }
+                free(ctype); free(payload);
+                pyro_closesock(g_http_conn);
+                g_http_conn = PYRO_BADSOCK;
+                return val_bool(ok);
             }
     }
     fatal("unknown native builtin");

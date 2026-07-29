@@ -124,6 +124,7 @@ the result. The id table is **mirrored** between the generator (`NATIVES` in
 | | | | | 27 | `write_bytes` |
 | | | | | 28 | `read_file` |
 | | | | | 29 | `args` |
+| | | | | 30 | `http_serve` |
 | 31 | `clamp` | 38 | `sort` | 45 | `count` |
 | 32 | `sign` | 39 | `reverse` | 46 | `sum` |
 | 33 | `gcd` | 40 | `slice` | 47 | `now_ms` |
@@ -131,8 +132,11 @@ the result. The id table is **mirrored** between the generator (`NATIVES` in
 | 35 | `starts_with` | 42 | `pad_start` | 49 | `random` |
 | 36 | `ends_with` | 43 | `pad_end` | 50 | `random_int` |
 | 37 | `repeat` | 44 | `concat` | 51 | `seed` |
+| | | | | 52 | `http_listen` |
+| | | | | 53 | `http_accept` |
+| | | | | 54 | `http_respond` |
 
-Ids 30 and below are listed in the left three columns above; 31–51 continue here.
+Ids 30 and below are listed in the left three columns above; 31–54 continue here.
 An id is **permanent** once shipped: renumbering silently breaks every `.pyro`
 already on disk, so new builtins only ever append.
 
@@ -162,6 +166,35 @@ already on disk, so new builtins only ever append.
   never an error — `start` below 0 becomes 0, `end` past the length becomes the
   length, and `start > end` yields an empty result. Any other operand type
   aborts. The result is always a **copy**; mutating it never affects the source.
+- **`http_listen(port) -> bool`**, **`http_accept() -> map`** and
+  **`http_respond(status, content_type, body) -> bool`** are a *dynamic* HTTP
+  server, in contrast to `http_serve` which only serves static files. The
+  program owns the accept loop:
+
+  ```cryo
+  http_listen(8080);
+  while (true) {
+      map<string,string> req = http_accept();
+      if (len(req["method"]) > 0) {
+          http_respond(200, "application/json", route(req));
+      }
+  }
+  ```
+
+  An accept **loop** rather than an `http_api(port, handler)` callback is a
+  deliberate choice: a callback would have to invoke a Cryo function value
+  from inside a native, re-entering the interpreter — and the Go VM keeps its
+  stack/frames/pc as locals of `run()` while the C VM keeps them in file-scope
+  globals, so that is a different refactor per engine. Owning the loop needs
+  no re-entrancy anywhere and makes the sequencing explicit.
+
+  Requests are served **strictly one at a time**: one listener and one
+  in-flight connection, which is what makes this safe with no locking.
+  `http_accept` **always returns a map**, never `null` — a failed or malformed
+  request yields an empty `method`. The keys are `method`, `path`, `query`
+  and `body`. Calling `http_accept` before `http_listen` aborts; calling it
+  again without responding closes the unanswered connection rather than
+  leaking it. `http_listen` is gated by the sandbox.
 - `to_int`/`to_number` of a non-numeric string **abort** (fail-fast).
 
 ### Sandbox policy

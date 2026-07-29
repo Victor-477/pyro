@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -28,6 +29,82 @@ import (
 var httpClient = &http.Client{Timeout: 15 * time.Second}
 
 var stdin = bufio.NewReader(os.Stdin)
+
+// ── HTTP server (roadmap 11.6) ─────────────────────────────
+// One listener and one in-flight connection: requests are served strictly one
+// at a time, which is what makes this safe without locking the VM. Must mirror
+// pyro_runtime.c exactly, including the request map's keys.
+var httpListener net.Listener
+var httpConn net.Conn
+
+// httpParseRequest reads one HTTP/1.1 request and splits it into the four
+// fields the request map exposes. Deliberately minimal and written to behave
+// identically to the C implementation.
+func httpParseRequest(c net.Conn) (method, path, query, body string, ok bool) {
+	r := bufio.NewReader(c)
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return "", "", "", "", false
+	}
+	parts := strings.Fields(strings.TrimSpace(line))
+	if len(parts) < 2 {
+		return "", "", "", "", false
+	}
+	method, target := parts[0], parts[1]
+	if i := strings.IndexByte(target, '?'); i >= 0 {
+		path, query = target[:i], target[i+1:]
+	} else {
+		path = target
+	}
+	length := 0
+	for {
+		h, err := r.ReadString('\n')
+		if err != nil {
+			return "", "", "", "", false
+		}
+		h = strings.TrimSpace(h)
+		if h == "" {
+			break
+		}
+		if k, v, found := strings.Cut(h, ":"); found &&
+			strings.EqualFold(strings.TrimSpace(k), "content-length") {
+			length, _ = strconv.Atoi(strings.TrimSpace(v))
+		}
+	}
+	if length > 0 {
+		buf := make([]byte, length)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return "", "", "", "", false
+		}
+		body = string(buf)
+	}
+	return method, path, query, body, true
+}
+
+func httpStatusText(code int64) string {
+	switch code {
+	case 200:
+		return "OK"
+	case 201:
+		return "Created"
+	case 204:
+		return "No Content"
+	case 400:
+		return "Bad Request"
+	case 401:
+		return "Unauthorized"
+	case 403:
+		return "Forbidden"
+	case 404:
+		return "Not Found"
+	case 405:
+		return "Method Not Allowed"
+	case 500:
+		return "Internal Server Error"
+	default:
+		return "Status"
+	}
+}
 
 // ── Opcodes (mirrors burnout/codegen_pyro.py) ──────────────
 const (
@@ -1286,6 +1363,74 @@ func native(id int, a []Value) Value {
 	case 51: // seed(n) -> void/null
 		prngState = uint64(nativeInt(a[0]))
 		return vNull()
+	// ── HTTP server, roadmap 11.6 ──
+	case 52: // http_listen(port) -> bool
+		if sandboxed {
+			fatal("[Cryo Security] Sandbox: http_listen() blocked by sandbox policy")
+		}
+		if httpListener != nil {
+			httpListener.Close()
+		}
+		ln, err := net.Listen("tcp", ":"+strconv.FormatInt(nativeInt(a[0]), 10))
+		if err != nil {
+			return vBool(false)
+		}
+		httpListener = ln
+		return vBool(true)
+	case 53: // http_accept() -> map{method,path,query,body}, or null
+		if httpListener == nil {
+			fatal("http_accept() called before http_listen()")
+		}
+		if httpConn != nil {
+			// The program skipped http_respond for the previous request; close
+			// it rather than leaking the connection.
+			httpConn.Close()
+			httpConn = nil
+		}
+		// Always returns a MAP, never null: `req == null` cannot be written
+		// reliably today (valueEq compares containers by their zero int, so a
+		// map tests equal to null), and an empty method is a cleaner signal
+		// anyway. A failed or malformed accept yields method "".
+		empty := func() Value {
+			m := map[any]Value{}
+			m["method"] = vStr("")
+			m["path"] = vStr("")
+			m["query"] = vStr("")
+			m["body"] = vStr("")
+			return vMap(m)
+		}
+		c, err := httpListener.Accept()
+		if err != nil {
+			return empty()
+		}
+		method, path, query, body, ok := httpParseRequest(c)
+		if !ok {
+			c.Close()
+			return empty()
+		}
+		httpConn = c
+		m := map[any]Value{}
+		m["method"] = vStr(method)
+		m["path"] = vStr(path)
+		m["query"] = vStr(query)
+		m["body"] = vStr(body)
+		return vMap(m)
+	case 54: // http_respond(status, content_type, body) -> bool
+		if httpConn == nil {
+			return vBool(false)
+		}
+		status := nativeInt(a[0])
+		ctype := a[1].String()
+		payload := a[2].String()
+		resp := "HTTP/1.1 " + strconv.FormatInt(status, 10) + " " + httpStatusText(status) + "\r\n" +
+			"Content-Type: " + ctype + "\r\n" +
+			"Content-Length: " + strconv.Itoa(len(payload)) + "\r\n" +
+			"Connection: close\r\n\r\n" + payload
+		_, werr := httpConn.Write([]byte(resp))
+		httpConn.Close()
+		httpConn = nil
+		return vBool(werr == nil)
+
 	}
 	fatal(fmt.Sprintf("unknown native builtin: id=%d", id))
 	return vNull()
