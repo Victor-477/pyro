@@ -987,6 +987,31 @@ static void http_send(pyro_sock c, int status, const char* reason,
     if (body && blen > 0) send(c, body, (int)blen, 0);
 }
 
+// ── embedded assets (roadmap 11.9) ─────────────────────────
+// Filled by the loader (C VM) or by the generated program (AOT), so both
+// engines answer asset() from the same table. Names are kept sorted so
+// asset_names() matches the Go VM's ordering.
+typedef struct { char* name; char* data; int64_t len; } PyroAsset;
+static PyroAsset* g_assets = NULL;
+static int g_nassets = 0;
+
+static int pyro_asset_cmp(const void* a, const void* b) {
+    return strcmp(((const PyroAsset*)a)->name, ((const PyroAsset*)b)->name);
+}
+
+// Takes ownership of `name` and `data`.
+void pyro_asset_add(char* name, char* data, int64_t len) {
+    PyroAsset* grown = (PyroAsset*)realloc(g_assets,
+                                           (size_t)(g_nassets + 1) * sizeof(PyroAsset));
+    if (!grown) return;
+    g_assets = grown;
+    g_assets[g_nassets].name = name;
+    g_assets[g_nassets].data = data;
+    g_assets[g_nassets].len = len;
+    g_nassets++;
+    qsort(g_assets, (size_t)g_nassets, sizeof(PyroAsset), pyro_asset_cmp);
+}
+
 // ── filesystem helpers (roadmap 11.7) ──────────────────────
 #include <dirent.h>
 #include <sys/stat.h>
@@ -2186,6 +2211,29 @@ Value native(int id, Value* a, int argc) {
                 Value res = val_str(out, (int64_t)j);
                 free(in); free(out);
                 return res;
+            }
+        // ── embedded assets, roadmap 11.9 ──
+        case 67: // asset(name) -> string ("" when absent)
+            {
+                char* want = value_to_string(a[0]);
+                Value res = val_str("", 0);
+                for (int i = 0; i < g_nassets; i++) {
+                    if (strcmp(g_assets[i].name, want) == 0) {
+                        res = val_str(g_assets[i].data, g_assets[i].len);
+                        break;
+                    }
+                }
+                free(want);
+                return res;
+            }
+        case 68: // asset_names() -> string[] (sorted, as in the Go VM)
+            {
+                RcArray* out = rc_array_new();
+                for (int i = 0; i < g_nassets; i++) {
+                    rc_array_push(out, val_str(g_assets[i].name,
+                                               (int64_t)strlen(g_assets[i].name)));
+                }
+                return val_array(out);
             }
     }
     fatal("unknown native builtin");

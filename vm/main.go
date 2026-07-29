@@ -37,6 +37,9 @@ var stdin = bufio.NewReader(os.Stdin)
 // One listener and one in-flight connection: requests are served strictly one
 // at a time, which is what makes this safe without locking the VM. Must mirror
 // pyro_runtime.c exactly, including the request map's keys.
+// 11.9 — assets embedded in the .pyro, name -> contents.
+var assets = map[string]string{}
+
 var httpListener net.Listener
 var httpConn net.Conn
 
@@ -535,6 +538,23 @@ func load(data []byte) *Program {
 	if flags&0x04 != 0 {
 		sandboxed = true
 	}
+	// 11.9 — embedded assets, if present. Read AFTER the debug section, in
+	// the same order the generator writes them.
+	defer func() {
+		if flags&0x08 == 0 {
+			return
+		}
+		n := int(rd32())
+		for i := 0; i < n; i++ {
+			nl := int(rd32())
+			name := string(data[pos : pos+nl])
+			pos += nl
+			dl := int(rd32())
+			assets[name] = string(data[pos : pos+dl])
+			pos += dl
+		}
+	}()
+
 	// debug section (pc -> line), if present
 	if flags&0x02 != 0 {
 		ndbg := int(rd32())
@@ -1613,6 +1633,20 @@ func native(id int, a []Value) Value {
 			}
 			return vStr(b.String())
 		}
+	// ── embedded assets, roadmap 11.9 ──
+	case 67: // asset(name) -> string ("" when absent)
+		return vStr(assets[a[0].String()])
+	case 68: // asset_names() -> string[] (sorted, so every engine agrees)
+		names := make([]string, 0, len(assets))
+		for k := range assets {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		out := make([]Value, len(names))
+		for i, n := range names {
+			out[i] = vStr(n)
+		}
+		return vArr(out)
 
 	}
 	fatal(fmt.Sprintf("unknown native builtin: id=%d", id))

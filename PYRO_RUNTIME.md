@@ -148,8 +148,10 @@ the result. The id table is **mirrored** between the generator (`NATIVES` in
 | | | | | 64 | `write_file_atomic` |
 | | | | | 65 | `url_decode` |
 | | | | | 66 | `url_encode` |
+| | | | | 67 | `asset` |
+| | | | | 68 | `asset_names` |
 
-Ids 30 and below are listed in the left three columns above; 31–66 continue here.
+Ids 30 and below are listed in the left three columns above; 31–68 continue here.
 An id is **permanent** once shipped: renumbering silently breaks every `.pyro`
 already on disk, so new builtins only ever append.
 
@@ -249,6 +251,13 @@ already on disk, so new builtins only ever append.
   **malformed escape passes through unchanged** rather than aborting — a
   server must not die on a bad request. `url_encode` leaves the unreserved
   set (`A-Za-z0-9-_.~`) alone and uppercases its hex digits.
+- **`asset(name) -> string` / `asset_names() -> string[]` (11.9)** read files
+  **embedded in the program**. `--assets DIR` puts every file under `DIR` into
+  the `.pyro`, keyed by its path relative to that root with forward slashes;
+  `pyro build --assets DIR` bakes them into a native binary, so shipping is one
+  file. A missing name gives `""` rather than an error, and `asset_names()` is
+  **sorted**, so every engine returns the same order. Assets are bytes, not
+  text: a NUL inside one is preserved.
 - `to_int`/`to_number` of a non-numeric string **abort** (fail-fast).
 - **`replace(s, old, new)`** replaces all occurrences of `old` with `new`. When `old` is an empty string (`""`), `new` is inserted at every position boundary (e.g. `replace("abc", "", "-")` yields `"-a-b-c-"`, and `replace("", "", "-")` yields `"-"`).
 

@@ -206,6 +206,24 @@ Program* load_program(const uint8_t* data, size_t size) {
         }
     }
     
+
+    // 11.9 — embedded assets, LAST section. Guarded by a flag bit rather
+    // than a version bump, so a .pyro without assets loads exactly as
+    // before and an engine that predates the flag never reads this far.
+    if (flags & 0x08) {
+        uint32_t n = read_u32(data, &pos);
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t nl = read_u32(data, &pos);
+            char* name = (char*)malloc(nl + 1);
+            memcpy(name, data + pos, nl); name[nl] = 0;
+            pos += nl;
+            uint32_t dl = read_u32(data, &pos);
+            char* blob = (char*)malloc(dl + 1);
+            memcpy(blob, data + pos, dl); blob[dl] = 0;
+            pos += dl;
+            pyro_asset_add(name, blob, (int64_t)dl);
+        }
+    }
     return p;
 }
 

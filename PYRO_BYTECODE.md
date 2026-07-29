@@ -12,6 +12,7 @@ own frames of local variables).
 ```
 magic     4    "PYRO"
 version   1    0x03   (v2 still accepted by both VMs)
+flags     1    bit0 encoded, bit1 debug, bit2 sandbox, bit3 assets
 flags     1    bit0 = code section encoded (rolling XOR)
                bit1 = debug section present (pc → line)
                bit2 = sandbox (VM refuses network/machine natives)
@@ -137,6 +138,30 @@ out of bounds.
 
 Locals shadow module state: the compiler resolves a name to a frame slot
 whenever one exists, and only otherwise to a module slot.
+
+### Embedded assets (flags bit3)
+
+An optional **asset section**, written after the debug section when
+`flags & 0x08`:
+
+```text
+u32 count
+count x { u32 namelen, name bytes, u32 datalen, data bytes }
+```
+
+Names are the file's path **relative to the asset root**, with forward
+slashes, and the entries are **sorted by name** — the container has to be
+reproducible or the [bootstrap fixed point](../ROADMAP.md) stops holding.
+
+It needed **no version bump**, for the same reason the globals array grows on
+demand: the section is last and behind a flag, so a reader that does not know
+bit3 never reaches those bytes. Every `.pyro` written before it, and every
+engine, keeps working unchanged.
+
+Assets are read with `asset(name)` and `asset_names()`. The AOT bakes them
+into the generated C as byte arrays — not string literals, since an asset may
+contain a NUL — so a natively compiled program carries its files inside the
+executable.
 
 ## Format versions
 

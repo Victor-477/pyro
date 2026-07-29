@@ -76,6 +76,11 @@
 #define opGETGLOBAL  0x76   // u16 slot -> push globals[slot]
 #define opSETGLOBAL  0x77   // u16 slot -> globals[slot] = pop()
 
+// Roadmap 11.9 — embedded assets. The C VM fills this from the .pyro's asset
+// section; an AOT binary fills it from data baked into the generated C. Both
+// take ownership of the pointers.
+void pyro_asset_add(char* name, char* data, int64_t len);
+
 // ── Constant Tags ───────────────────────────────────────────
 #define TAG_INT      1
 #define TAG_FLT      2
