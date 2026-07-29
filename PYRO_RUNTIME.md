@@ -261,6 +261,40 @@ already on disk, so new builtins only ever append.
 - `to_int`/`to_number` of a non-numeric string **abort** (fail-fast).
 - **`replace(s, old, new)`** replaces all occurrences of `old` with `new`. When `old` is an empty string (`""`), `new` is inserted at every position boundary (e.g. `replace("abc", "", "-")` yields `"-a-b-c-"`, and `replace("", "", "-")` yields `"-"`).
 
+### Loading untrusted bytecode (11.13)
+
+The loader and the dispatch loop parse a file that may be **malformed or
+hostile**, in C. They are the most exposed surface in the project, so the
+contract is: **a bad `.pyro` fails with a message; it never reads out of
+bounds.**
+
+What is checked:
+
+- **Every read is bounded** against the file size, and every length is
+  validated against the bytes that actually remain *before* it drives an
+  allocation — counts, string lengths, code length, debug entries, asset
+  names and payloads.
+- **Cross-field invariants**: the entry function index, each function's name
+  index, and each function's entry offset must be inside their tables.
+- **`pc` stays inside the code section**, and an instruction's operands must
+  fit before the end.
+- **Jump and catch targets** are computed in 64-bit and range-checked —
+  `pc + rel` in `int` is undefined on overflow, and a hostile file can supply
+  `rel = 0x7FFFFFFF`.
+- **The four stacks are bounded** (values, frames, handlers, locals), so a
+  program that pushes without popping aborts instead of running off the array.
+- **`NEWARR`/`NEWMAP` counts** are checked against the current stack depth: a
+  larger count made the base index negative and read *below* the stack.
+
+**Infinite loops are out of scope.** A malformed jump can make a program loop
+forever — but so can a valid one; a server's accept loop is exactly that. The
+VM cannot tell them apart, so bounding execution is a quota concern, not a
+memory-safety one.
+
+`burnout/tests/test_fuzz.py` is the regression: truncations, absurd lengths
+and bit flips over two seed programs, on both VMs. A crash there is a release
+blocker.
+
 ### Sandbox policy
 The runtime exposes `pyro_sandboxed` (turned on by the host via the `.pyro` `bit2`
 flag or `PYRO_SANDBOX=1`). When active, the **network/machine** natives (`http_get`,

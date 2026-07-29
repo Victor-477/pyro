@@ -122,6 +122,39 @@ bool raise_exception(Value v) {
 }
 
 // ── Bytecode Loader ──────────────────────────────────────────
+// ── bounds-checked reading (roadmap 11.13) ─────────────────
+// The loader consumes a file that may be malformed or hostile. Every read
+// goes through these, so a truncated or lying length fails with a message
+// instead of walking off the buffer.
+static size_t g_pyro_size = 0;
+
+static void need_bytes(int pos, size_t want, const char* what) {
+    if (pos < 0 || (size_t)pos > g_pyro_size || want > g_pyro_size - (size_t)pos) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "malformed .pyro: %s needs %llu byte(s) at offset %d, "
+                 "but the file is only %llu bytes",
+                 what, (unsigned long long)want, pos,
+                 (unsigned long long)g_pyro_size);
+        fatal(msg);
+    }
+}
+
+static uint8_t rd_u8(const uint8_t* data, int* pos, const char* what) {
+    need_bytes(*pos, 1, what);
+    return data[(*pos)++];
+}
+
+static uint16_t rd_u16(const uint8_t* data, int* pos, const char* what) {
+    need_bytes(*pos, 2, what);
+    return read_u16(data, pos);
+}
+
+static uint32_t rd_u32(const uint8_t* data, int* pos, const char* what) {
+    need_bytes(*pos, 4, what);
+    return read_u32(data, pos);
+}
+
 Program* load_program(const uint8_t* data, size_t size) {
     if (size < 6 || memcmp(data, "PYRO", 4) != 0) {
         fatal("invalid .pyro file (magic)");
@@ -132,22 +165,30 @@ Program* load_program(const uint8_t* data, size_t size) {
         fatal("unsupported .pyro version (expected v2 or v3)");
     }
     uint8_t flags = data[5];
+    g_pyro_size = size;
     Program* p = malloc(sizeof(Program));
+    if (!p) fatal("out of memory loading .pyro");
     int pos = 6;
     
     p->sandboxed = (flags & 0x04) != 0;
     
-    uint16_t nconsts = read_u16(data, &pos);
+    uint16_t nconsts = rd_u16(data, &pos, "constant count");
     p->nconsts = nconsts;
-    p->consts = malloc(sizeof(Value) * nconsts);
+    // Each constant costs at least 1 byte (its tag), so a count larger than
+    // the bytes remaining is a lie — caught before allocating for it.
+    need_bytes(pos, nconsts, "constant table");
+    p->consts = malloc(sizeof(Value) * (nconsts ? nconsts : 1));
+    if (!p->consts) fatal("out of memory loading .pyro constants");
     for (int i = 0; i < nconsts; i++) {
-        uint8_t tag = data[pos++];
+        uint8_t tag = rd_u8(data, &pos, "constant tag");
         switch (tag) {
             case TAG_INT:
+                need_bytes(pos, 8, "int constant");
                 p->consts[i] = val_int((int64_t)read_u64(data, &pos));
                 break;
             case TAG_FLT:
                 {
+                    need_bytes(pos, 8, "float constant");
                     uint64_t u = read_u64(data, &pos);
                     double f;
                     memcpy(&f, &u, 8);
@@ -156,39 +197,48 @@ Program* load_program(const uint8_t* data, size_t size) {
                 break;
             case TAG_STR:
                 {
-                    uint32_t len = (ver >= 3) ? read_u32(data, &pos)
-                                              : (uint32_t)read_u16(data, &pos);
+                    // The length is attacker-controlled; check it against the
+                    // bytes that remain BEFORE val_str copies from data + pos.
+                    uint32_t len = (ver >= 3) ? rd_u32(data, &pos, "string length")
+                                              : (uint32_t)rd_u16(data, &pos, "string length");
+                    need_bytes(pos, len, "string constant");
                     p->consts[i] = val_str((const char*)(data + pos), (int64_t)len);
                     pos += (int)len;
                 }
                 break;
             case TAG_BOOL:
-                p->consts[i] = val_bool(data[pos++] != 0);
+                p->consts[i] = val_bool(rd_u8(data, &pos, "bool constant") != 0);
                 break;
             default:
                 fatal("unknown constant tag");
         }
     }
     
-    uint16_t nfuncs = read_u16(data, &pos);
+    uint16_t nfuncs = rd_u16(data, &pos, "function count");
+    // 9 bytes per entry: nameidx(2) + entry(4) + nparams(1) + nlocals(2)
+    need_bytes(pos, (size_t)nfuncs * 9, "function table");
     p->nfuncs = nfuncs;
     p->funcs = malloc(sizeof(FuncInfo) * nfuncs);
     for (int i = 0; i < nfuncs; i++) {
-        uint16_t nameidx = read_u16(data, &pos);
-        uint32_t entry = read_u32(data, &pos);
+        uint16_t nameidx = rd_u16(data, &pos, "function name index");
+        if (nameidx >= nconsts) fatal("malformed .pyro: function name index out of range");
+        uint32_t entry = rd_u32(data, &pos, "function entry");
         uint8_t nparams = data[pos++];
-        uint16_t nlocals = read_u16(data, &pos);
+        uint16_t nlocals = rd_u16(data, &pos, "function locals");
         
         char* fname = value_to_string(p->consts[nameidx]);
         p->funcs[i] = (FuncInfo){ .name = fname, .entry = entry, .nparams = nparams, .nlocals = nlocals };
     }
     
-    p->entryFn = read_u16(data, &pos);
-    uint32_t codelen = read_u32(data, &pos);
+    p->entryFn = rd_u16(data, &pos, "entry function");
+    if (p->entryFn >= nfuncs) fatal("malformed .pyro: entry function index out of range");
+    uint32_t codelen = rd_u32(data, &pos, "code length");
+    need_bytes(pos, codelen, "code section");
     p->codelen = codelen;
-    p->code = malloc(codelen);
+    p->code = malloc(codelen ? codelen : 1);
+    if (!p->code) fatal("out of memory loading .pyro code");
     memcpy(p->code, data + pos, codelen);
-    pos += codelen;
+    pos += (int)codelen;
     
     if (flags & 0x01) {
         xor_decode(p->code, codelen);
@@ -197,12 +247,14 @@ Program* load_program(const uint8_t* data, size_t size) {
     p->dbg = NULL;
     p->ndebug = 0;
     if (flags & 0x02) {
-        uint32_t ndbg = read_u32(data, &pos);
+        uint32_t ndbg = rd_u32(data, &pos, "debug entry count");
+        need_bytes(pos, (size_t)ndbg * 8, "debug section");   // 2 x u32 each
         p->ndebug = ndbg;
-        p->dbg = malloc(sizeof(DebugEntry) * ndbg);
+        p->dbg = malloc(sizeof(DebugEntry) * (ndbg ? ndbg : 1));
+        if (!p->dbg) fatal("out of memory loading .pyro debug section");
         for (uint32_t i = 0; i < ndbg; i++) {
-            p->dbg[i].pc = read_u32(data, &pos);
-            p->dbg[i].line = read_u32(data, &pos);
+            p->dbg[i].pc = rd_u32(data, &pos, "debug pc");
+            p->dbg[i].line = rd_u32(data, &pos, "debug line");
         }
     }
     
@@ -211,20 +263,71 @@ Program* load_program(const uint8_t* data, size_t size) {
     // than a version bump, so a .pyro without assets loads exactly as
     // before and an engine that predates the flag never reads this far.
     if (flags & 0x08) {
-        uint32_t n = read_u32(data, &pos);
+        uint32_t n = rd_u32(data, &pos, "asset count");
+        // 8 bytes minimum per asset (two lengths), so an inflated count is
+        // rejected before it drives a single allocation.
+        need_bytes(pos, (size_t)n * 8, "asset table");
         for (uint32_t i = 0; i < n; i++) {
-            uint32_t nl = read_u32(data, &pos);
-            char* name = (char*)malloc(nl + 1);
+            uint32_t nl = rd_u32(data, &pos, "asset name length");
+            need_bytes(pos, nl, "asset name");
+            char* name = (char*)malloc((size_t)nl + 1);
+            if (!name) fatal("out of memory loading .pyro assets");
             memcpy(name, data + pos, nl); name[nl] = 0;
-            pos += nl;
-            uint32_t dl = read_u32(data, &pos);
-            char* blob = (char*)malloc(dl + 1);
+            pos += (int)nl;
+            uint32_t dl = rd_u32(data, &pos, "asset data length");
+            need_bytes(pos, dl, "asset data");
+            char* blob = (char*)malloc((size_t)dl + 1);
+            if (!blob) { free(name); fatal("out of memory loading .pyro assets"); }
             memcpy(blob, data + pos, dl); blob[dl] = 0;
-            pos += dl;
+            pos += (int)dl;
             pyro_asset_add(name, blob, (int64_t)dl);
         }
     }
+    // Cross-field invariants. A function whose entry points outside the code
+    // section would send the dispatch loop off the end on its first call —
+    // the length checks above cannot catch that on their own.
+    for (int i = 0; i < p->nfuncs; i++) {
+        if (p->funcs[i].entry > p->codelen) {
+            fatal("malformed .pyro: function entry point past the end of the code");
+        }
+    }
+
     return p;
+}
+
+// Operand width per opcode, mirroring _OPERAND in burnout/codegen_pyro.py.
+// Used only to reject a truncated final instruction (11.13).
+static uint32_t pyro_operand_width(uint8_t op) {
+    switch (op) {
+        case opCONST: case opLOAD: case opSTORE: case opNEWARR: case opNEWMAP:
+        case opPUSHFN: case opGETGLOBAL: case opSETGLOBAL:
+            return 2;
+        case opJMP: case opJMPF: case opJMPT:
+            return 4;
+        case opCALL:
+            return 3;
+        case opNATIVE:
+            return 2;
+        case opTRYPUSH:
+            return 6;
+        case opCLOSURE:
+            return 3;
+        case opCALLVALUE:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+// A relative jump, validated. `pc + rel` in int is undefined on overflow and
+// a hostile .pyro can supply rel = 0x7FFFFFFF, so the sum is computed in
+// int64 and the destination checked against the code section (11.13).
+static int pyro_jump_to(int pc, int32_t rel, uint32_t codelen) {
+    int64_t dest = (int64_t)pc + (int64_t)rel;
+    if (dest < 0 || dest > (int64_t)codelen) {
+        fatal("malformed .pyro: jump target outside the code section");
+    }
+    return (int)dest;
 }
 
 // ── Virtual Machine Execution Loop ───────────────────────────
@@ -253,13 +356,57 @@ void run_program(Program* p) {
     int     nglobals  = 0;
 
     while (1) {
+        // 11.13 — the code section is untrusted input too. A malformed .pyro
+        // can hold a jump past the end or an instruction whose operand runs
+        // off the buffer; without this the loop reads whatever follows in
+        // memory. Checked once per instruction: one comparison.
+        if (pc < 0 || (uint32_t)pc >= p->codelen) {
+            fatal("malformed .pyro: execution ran past the end of the code");
+        }
+        // 11.13 — the four stacks are fixed arrays. A malformed .pyro can push
+        // without ever popping (a call that never returns, a try that never
+        // pops), so they are bounded here, once, rather than at each of the
+        // dozens of push sites. The margins cover the widest single
+        // instruction: NEWMAP touches 2*n slots, a call pushes one frame.
+        if (sp < 0 || sp > (int)(sizeof(stack) / sizeof(stack[0])) - 4) {
+            fatal("malformed .pyro: value stack overflow");
+        }
+        if (fp < 0 || fp > (int)(sizeof(frames) / sizeof(frames[0])) - 2) {
+            fatal("malformed .pyro: call stack overflow (runaway recursion?)");
+        }
+        if (hp < 0 || hp > (int)(sizeof(handlers) / sizeof(handlers[0])) - 2) {
+            fatal("malformed .pyro: exception handler stack overflow");
+        }
         uint8_t op = code[pc++];
+        // Every instruction below reads at most 6 operand bytes (TRYPUSH).
+        // Verifying the widest case once is simpler than threading a length
+        // through each read, and still rejects a truncated final instruction.
+        if ((uint32_t)pc + 6 > p->codelen) {
+            switch (op) {
+                // operand-less opcodes are always safe at the tail
+                case opHALT: case opRET: case opPOP: case opTRUE: case opFALSE:
+                case opNULL: case opPRINT: case opPRINTLN: case opASSERT:
+                case opNOT: case opNEG: case opBNOT: case opLEN: case opINDEX:
+                case opSETIDX: case opAPPEND: case opHAS: case opKEYS:
+                case opTRYPOP: case opTHROW: case opCOALESCE: case opUNWRAP:
+                case opADD: case opSUB: case opMUL: case opDIV: case opMOD:
+                case opBAND: case opBOR: case opBXOR: case opSHL: case opSHR:
+                case opEQ: case opNE: case opLT: case opGT: case opLE: case opGE:
+                    break;
+                default:
+                    if ((uint32_t)pc + pyro_operand_width(op) > p->codelen) {
+                        fatal("malformed .pyro: instruction operand runs past "
+                              "the end of the code");
+                    }
+            }
+        }
         switch (op) {
             case opHALT:
                 return;
             case opCONST:
                 {
                     uint16_t idx = read_u16(code, &pc);
+                    if (idx >= p->nconsts) fatal("malformed .pyro: constant index out of range");
                     Value v = p->consts[idx];
                     retain_value(v);
                     stack[sp++] = v;
@@ -370,7 +517,7 @@ void run_program(Program* p) {
             case opJMP:
                 {
                     int32_t rel = read_i32(code, &pc);
-                    pc += rel;
+                    pc = pyro_jump_to(pc, rel, p->codelen);
                 }
                 break;
             case opJMPF:
@@ -379,7 +526,7 @@ void run_program(Program* p) {
                     Value a = stack[--sp];
                     bool t = value_truthy(a);
                     release_value(a);
-                    if (!t) pc += rel;
+                    if (!t) pc = pyro_jump_to(pc, rel, p->codelen);
                 }
                 break;
             case opJMPT:
@@ -388,13 +535,14 @@ void run_program(Program* p) {
                     Value a = stack[--sp];
                     bool t = value_truthy(a);
                     release_value(a);
-                    if (t) pc += rel;
+                    if (t) pc = pyro_jump_to(pc, rel, p->codelen);
                 }
                 break;
             case opCALL:
                 {
                     uint16_t fi = read_u16(code, &pc);
                     uint8_t argc = code[pc++];
+                    if (fi >= p->nfuncs) fatal("malformed .pyro: function index out of range");
                     FuncInfo fn = p->funcs[fi];
                     int next_base = frames[fp - 1].locals_base + frames[fp - 1].nlocals;
                     for (int i = 0; i < fn.nlocals; i++) {
@@ -439,6 +587,7 @@ void run_program(Program* p) {
                         fatal("call of a non-function value");
                     }
                     int fi = (int)fnval.fnidx;
+                    if (fi >= p->nfuncs) fatal("malformed .pyro: function index out of range");
                     FuncInfo fn = p->funcs[fi];
                     int next_base = frames[fp - 1].locals_base + frames[fp - 1].nlocals;
                     for (int i = 0; i < fn.nlocals; i++) {
@@ -507,6 +656,9 @@ void run_program(Program* p) {
             case opNEWARR:
                 {
                     uint16_t n = read_u16(code, &pc);
+                    // 11.13 — a count larger than the stack depth makes `base`
+                    // negative and indexes BELOW the stack array.
+                    if ((int)n > sp) fatal("malformed .pyro: array literal larger than the stack");
                     RcArray* arr = rc_array_new();
                     int base = sp - n;
                     for (int i = 0; i < n; i++) {
@@ -520,6 +672,9 @@ void run_program(Program* p) {
             case opNEWMAP:
                 {
                     uint16_t n = read_u16(code, &pc);
+                    // 11.13 — same trap as opNEWARR, doubled: each pair is two
+                    // stack slots, so 2*n must fit in the current depth.
+                    if (2 * (int)n > sp) fatal("malformed .pyro: map literal larger than the stack");
                     RcMap* mp = rc_map_new();
                     int base = sp - 2 * n;
                     for (int i = 0; i < n; i++) {
@@ -620,7 +775,9 @@ void run_program(Program* p) {
                 {
                     int32_t rel = read_i32(code, &pc);
                     uint16_t slot = read_u16(code, &pc);
-                    handlers[hp++] = (Handler){ .catchPC = pc + rel, .sp = sp, .fp = fp, .slot = slot };
+                    // the catch target is attacker-controlled like any jump
+                    int catch_pc = pyro_jump_to(pc, rel, p->codelen);
+                    handlers[hp++] = (Handler){ .catchPC = catch_pc, .sp = sp, .fp = fp, .slot = slot };
                 }
                 break;
             case opTRYPOP:
@@ -655,12 +812,19 @@ void run_program(Program* p) {
                 {
                     Value a = stack[sp - 1];
                     if (a.kind == VAL_NULL) {
+                        // Pop BEFORE raising. raise_exception unwinds the stack
+                        // to the handler's recorded sp, so decrementing
+                        // afterwards took it one slot too far — with a handler
+                        // at depth 0 that left sp NEGATIVE, and the next
+                        // instruction read stack[-1]. The Go VM pops first;
+                        // this now matches. (Found by the 11.13 stack guard,
+                        // which fired on a valid program.)
+                        sp--;
                         const char* um = "[Cryo Security] unwrap of null value";
                         Value err_msg = val_str(um, (int64_t)strlen(um));
                         if (!raise_exception(err_msg)) {
                             fatal(um);
                         }
-                        sp--;
                     }
                 }
                 break;
