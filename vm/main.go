@@ -43,15 +43,16 @@ var httpConn net.Conn
 // httpParseRequest reads one HTTP/1.1 request and splits it into the four
 // fields the request map exposes. Deliberately minimal and written to behave
 // identically to the C implementation.
-func httpParseRequest(c net.Conn) (method, path, query, body string, ok bool) {
+func httpParseRequest(c net.Conn) (method, path, query, body string, hdrs map[string]string, ok bool) {
+	hdrs = map[string]string{}
 	r := bufio.NewReader(c)
 	line, err := r.ReadString('\n')
 	if err != nil {
-		return "", "", "", "", false
+		return "", "", "", "", hdrs, false
 	}
 	parts := strings.Fields(strings.TrimSpace(line))
 	if len(parts) < 2 {
-		return "", "", "", "", false
+		return "", "", "", "", hdrs, false
 	}
 	method, target := parts[0], parts[1]
 	if i := strings.IndexByte(target, '?'); i >= 0 {
@@ -63,25 +64,43 @@ func httpParseRequest(c net.Conn) (method, path, query, body string, ok bool) {
 	for {
 		h, err := r.ReadString('\n')
 		if err != nil {
-			return "", "", "", "", false
+			return "", "", "", "", hdrs, false
 		}
 		h = strings.TrimSpace(h)
 		if h == "" {
 			break
 		}
-		if k, v, found := strings.Cut(h, ":"); found &&
-			strings.EqualFold(strings.TrimSpace(k), "content-length") {
-			length, _ = strconv.Atoi(strings.TrimSpace(v))
+		if k, v, found := strings.Cut(h, ":"); found {
+			name := strings.ToLower(strings.TrimSpace(k))
+			val := strings.TrimSpace(v)
+			hdrs[name] = val
+			if name == "content-length" {
+				length, _ = strconv.Atoi(val)
+			}
 		}
 	}
 	if length > 0 {
 		buf := make([]byte, length)
 		if _, err := io.ReadFull(r, buf); err != nil {
-			return "", "", "", "", false
+			return "", "", "", "", hdrs, false
 		}
 		body = string(buf)
 	}
-	return method, path, query, body, true
+	return method, path, query, body, hdrs, true
+}
+
+// unhex: one hex digit -> its value. Shared by url_decode so the two
+// engines cannot drift on what counts as a valid escape.
+func unhex(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
 }
 
 func httpStatusText(code int64) string {
@@ -1406,7 +1425,7 @@ func native(id int, a []Value) Value {
 		if err != nil {
 			return empty()
 		}
-		method, path, query, body, ok := httpParseRequest(c)
+		method, path, query, body, hdrs, ok := httpParseRequest(c)
 		if !ok {
 			c.Close()
 			return empty()
@@ -1417,6 +1436,12 @@ func native(id int, a []Value) Value {
 		m["path"] = vStr(path)
 		m["query"] = vStr(query)
 		m["body"] = vStr(body)
+		// Headers share the flat map under a `header:` prefix, lowercased.
+		// Flat because the Cryo side is `map<string,string>`; a nested map
+		// would not survive `as map<string,string>`.
+		for hk, hv := range hdrs {
+			m["header:"+hk] = vStr(hv)
+		}
 		return vMap(m)
 	case 54: // http_respond(status, content_type, body) -> bool
 		if httpConn == nil {
@@ -1545,6 +1570,48 @@ func native(id int, a []Value) Value {
 				return vBool(false)
 			}
 			return vBool(true)
+		}
+	case 65: // url_decode(s) -> string  (percent-decoding, '+' is a space)
+		{
+			in := a[0].String()
+			var b strings.Builder
+			for i := 0; i < len(in); i++ {
+				switch {
+				case in[i] == '+':
+					b.WriteByte(' ')
+				case in[i] == '%' && i+2 < len(in):
+					hi, ok1 := unhex(in[i+1])
+					lo, ok2 := unhex(in[i+2])
+					if ok1 && ok2 {
+						b.WriteByte(hi<<4 | lo)
+						i += 2
+					} else {
+						b.WriteByte(in[i]) // malformed: pass through
+					}
+				default:
+					b.WriteByte(in[i])
+				}
+			}
+			return vStr(b.String())
+		}
+	case 66: // url_encode(s) -> string
+		{
+			const hexd = "0123456789ABCDEF"
+			in := a[0].String()
+			var b strings.Builder
+			for i := 0; i < len(in); i++ {
+				ch := in[i]
+				if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+					(ch >= '0' && ch <= '9') || ch == '-' || ch == '_' ||
+					ch == '.' || ch == '~' {
+					b.WriteByte(ch)
+				} else {
+					b.WriteByte('%')
+					b.WriteByte(hexd[ch>>4])
+					b.WriteByte(hexd[ch&0x0F])
+				}
+			}
+			return vStr(b.String())
 		}
 
 	}

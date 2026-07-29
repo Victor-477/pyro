@@ -1039,6 +1039,15 @@ static int pyro_mkdir_all(const char* path) {
 static pyro_sock g_http_srv  = PYRO_BADSOCK;
 static pyro_sock g_http_conn = PYRO_BADSOCK;
 
+// One hex digit -> its value, or -1. Mirrors unhex() in main.go so the two
+// engines agree on what counts as a valid escape.
+static int pyro_unhex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
 static const char* http_status_text(int64_t code) {
     switch (code) {
         case 200: return "OK";
@@ -1056,13 +1065,17 @@ static const char* http_status_text(int64_t code) {
 
 // Reads one HTTP/1.1 request. Returns 0 on a malformed or closed connection.
 // Kept deliberately minimal and behaviour-identical to httpParseRequest in Go.
+// Headers are handed back as a single "name: value\n" blob, which the caller
+// splits into the request map. A blob keeps this signature from growing a
+// parallel array pair, and the map keys end up identical to the Go VM's.
 static int http_read_request(pyro_sock c, char* method, size_t msz,
                              char* path, size_t psz, char* query, size_t qsz,
-                             char** body_out) {
+                             char** body_out, char** hdrs_out) {
     static char buf[65536];
     int total = 0;
     int header_end = -1;
     *body_out = NULL;
+    if (hdrs_out) *hdrs_out = NULL;
 
     // read until the end of the headers
     while (total < (int)sizeof(buf) - 1) {
@@ -1098,23 +1111,55 @@ static int http_read_request(pyro_sock c, char* method, size_t msz,
         memcpy(query, q + 1, qlen); query[qlen] = '\0';
     }
 
-    // Content-Length (case-insensitive), then the body
+    // Walk the header block once: collect every header AND find
+    // Content-Length. Names are lowercased so lookups match the Go VM.
     long clen = 0;
-    for (const char* h = buf; h && h < buf + header_end; ) {
+    size_t hcap = 1024, hlen = 0;
+    char* hblob = (char*)malloc(hcap);
+    if (hblob) hblob[0] = '\0';
+    const char* first_eol = strstr(buf, "\r\n");
+    for (const char* h = first_eol ? first_eol + 2 : NULL;
+         h && h < buf + header_end; ) {
         const char* eol = strstr(h, "\r\n");
-        if (!eol || eol >= buf + header_end) break;
-        if ((size_t)(eol - h) > 15) {
-            char name[16];
-            memcpy(name, h, 14); name[14] = '\0';
-            for (int i = 0; name[i]; i++) name[i] = (char)tolower((unsigned char)name[i]);
-            if (strcmp(name, "content-length") == 0) {
-                const char* v = h + 14;
-                while (*v == ':' || *v == ' ') v++;
+        if (!eol || eol > buf + header_end) break;
+        size_t linelen = (size_t)(eol - h);
+        if (linelen == 0) break;                     // end of headers
+        const char* colon = (const char*)memchr(h, ':', linelen);
+        if (colon) {
+            size_t nlen = (size_t)(colon - h);
+            const char* v = colon + 1;
+            while (v < eol && (*v == ' ' || *v == '\t')) v++;
+            size_t vlen = (size_t)(eol - v);
+
+            char lname[128];
+            size_t keep = nlen < sizeof(lname) - 1 ? nlen : sizeof(lname) - 1;
+            for (size_t i = 0; i < keep; i++)
+                lname[i] = (char)tolower((unsigned char)h[i]);
+            lname[keep] = '\0';
+
+            if (strcmp(lname, "content-length") == 0)
                 clen = strtol(v, NULL, 10);
+
+            if (hblob) {
+                size_t need = hlen + keep + vlen + 3;
+                if (need > hcap) {
+                    while (need > hcap) hcap *= 2;
+                    char* grown = (char*)realloc(hblob, hcap);
+                    if (grown) { hblob = grown; }
+                    else { free(hblob); hblob = NULL; }
+                }
+                if (hblob) {
+                    memcpy(hblob + hlen, lname, keep); hlen += keep;
+                    hblob[hlen++] = ':';
+                    memcpy(hblob + hlen, v, vlen); hlen += vlen;
+                    hblob[hlen++] = '\n';
+                    hblob[hlen] = '\0';
+                }
             }
         }
         h = eol + 2;
     }
+    if (hdrs_out) *hdrs_out = hblob; else free(hblob);
     if (clen > 0) {
         char* body = (char*)malloc((size_t)clen + 1);
         if (!body) return 0;
@@ -1855,13 +1900,15 @@ Value native(int id, Value* a, int argc) {
                 char* body = NULL;
                 method[0] = '\0'; path[0] = '\0'; query[0] = '\0';
                 pyro_sock c = accept(g_http_srv, NULL, NULL);
+                char* hdrs = NULL;
                 if (c != PYRO_BADSOCK &&
                     !http_read_request(c, method, sizeof(method), path, sizeof(path),
-                                       query, sizeof(query), &body)) {
+                                       query, sizeof(query), &body, &hdrs)) {
                     pyro_closesock(c);
                     c = PYRO_BADSOCK;
                     method[0] = '\0'; path[0] = '\0'; query[0] = '\0';
                     if (body) { free(body); body = NULL; }
+                    if (hdrs) { free(hdrs); hdrs = NULL; }
                 }
                 g_http_conn = c;
                 RcMap* m = rc_map_new();
@@ -1871,6 +1918,25 @@ Value native(int id, Value* a, int argc) {
                 rc_map_set(m, val_str("body",   4), val_str(body ? body : "",
                                                             body ? (int64_t)strlen(body) : 0));
                 if (body) free(body);
+                // Headers share the flat map under a `header:` prefix — same
+                // keys the Go VM produces.
+                if (hdrs) {
+                    char* line = hdrs;
+                    while (line && *line) {
+                        char* nl = strchr(line, '\n');
+                        if (nl) *nl = '\0';
+                        char* colon = strchr(line, ':');
+                        if (colon) {
+                            *colon = '\0';
+                            char key[160];
+                            snprintf(key, sizeof(key), "header:%s", line);
+                            rc_map_set(m, val_str(key, (int64_t)strlen(key)),
+                                       val_str(colon + 1, (int64_t)strlen(colon + 1)));
+                        }
+                        line = nl ? nl + 1 : NULL;
+                    }
+                    free(hdrs);
+                }
                 return val_map(m);
             }
         case 54: // http_respond(status, content_type, body) -> bool
@@ -2074,6 +2140,52 @@ Value native(int id, Value* a, int argc) {
                 }
                 free(path); free(data);
                 return val_bool(ok);
+            }
+        case 65: // url_decode(s) -> string ('+' is a space; bad escapes pass through)
+            {
+                char* in = value_to_string(a[0]);
+                size_t n = strlen(in);
+                char* out = (char*)malloc(n + 1);
+                size_t j = 0;
+                for (size_t i = 0; i < n; i++) {
+                    if (in[i] == '+') {
+                        out[j++] = ' ';
+                    } else if (in[i] == '%' && i + 2 < n) {
+                        int hi = pyro_unhex(in[i + 1]), lo = pyro_unhex(in[i + 2]);
+                        if (hi >= 0 && lo >= 0) { out[j++] = (char)(hi * 16 + lo); i += 2; }
+                        else                    { out[j++] = in[i]; }
+                    } else {
+                        out[j++] = in[i];
+                    }
+                }
+                out[j] = '\0';
+                Value res = val_str(out, (int64_t)j);
+                free(in); free(out);
+                return res;
+            }
+        case 66: // url_encode(s) -> string
+            {
+                static const char* HEXD = "0123456789ABCDEF";
+                char* in = value_to_string(a[0]);
+                size_t n = strlen(in);
+                char* out = (char*)malloc(n * 3 + 1);
+                size_t j = 0;
+                for (size_t i = 0; i < n; i++) {
+                    unsigned char ch = (unsigned char)in[i];
+                    if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                        (ch >= '0' && ch <= '9') ||
+                        ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+                        out[j++] = (char)ch;
+                    } else {
+                        out[j++] = '%';
+                        out[j++] = HEXD[ch >> 4];
+                        out[j++] = HEXD[ch & 0x0F];
+                    }
+                }
+                out[j] = '\0';
+                Value res = val_str(out, (int64_t)j);
+                free(in); free(out);
+                return res;
             }
     }
     fatal("unknown native builtin");

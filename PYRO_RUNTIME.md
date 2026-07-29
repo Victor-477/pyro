@@ -146,8 +146,10 @@ the result. The id table is **mirrored** between the generator (`NATIVES` in
 | | | | | 62 | `env` |
 | | | | | 63 | `exec` |
 | | | | | 64 | `write_file_atomic` |
+| | | | | 65 | `url_decode` |
+| | | | | 66 | `url_encode` |
 
-Ids 30 and below are listed in the left three columns above; 31–64 continue here.
+Ids 30 and below are listed in the left three columns above; 31–66 continue here.
 An id is **permanent** once shipped: renumbering silently breaks every `.pyro`
 already on disk, so new builtins only ever append.
 
@@ -199,6 +201,12 @@ already on disk, so new builtins only ever append.
   globals, so that is a different refactor per engine. Owning the loop needs
   no re-entrancy anywhere and makes the sequencing explicit.
 
+  The request map's keys are `method`, `path`, `query`, `body`, plus every
+  request **header** under `header:<lowercased-name>` (`header:authorization`,
+  `header:content-type`, ...). Headers share the one flat map rather than
+  nesting, because the Cryo side is `map<string,string>` and a nested map
+  would not survive `as map<string,string>`.
+
   Requests are served **strictly one at a time**: one listener and one
   in-flight connection, which is what makes this safe with no locking.
   `http_accept` **always returns a map**, never `null` — a failed or malformed
@@ -236,6 +244,11 @@ already on disk, so new builtins only ever append.
   On failure it returns false, removes the temp file and **leaves the target
   untouched**. Windows needs `MoveFileEx` rather than `rename`, which fails
   there when the target already exists. Sandbox-gated.
+- **`url_decode(s)` / `url_encode(s)` (11.10)** are percent-coding for query
+  strings and form bodies. `url_decode` also turns `+` into a space, and a
+  **malformed escape passes through unchanged** rather than aborting — a
+  server must not die on a bad request. `url_encode` leaves the unreserved
+  set (`A-Za-z0-9-_.~`) alone and uppercases its hex digits.
 - `to_int`/`to_number` of a non-numeric string **abort** (fail-fast).
 - **`replace(s, old, new)`** replaces all occurrences of `old` with `new`. When `old` is an empty string (`""`), `new` is inserted at every position boundary (e.g. `replace("abc", "", "-")` yields `"-a-b-c-"`, and `replace("", "", "-")` yields `"-"`).
 
