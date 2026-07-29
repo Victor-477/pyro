@@ -83,6 +83,11 @@ const (
 	opTHROW    = 0x73 // pop value -> unwinds to the nearest handler
 	opCOALESCE = 0x74 // pop b, a -> a if a != null, else b (??)
 	opUNWRAP   = 0x75 // pop a -> a if a != null, else aborts (x!)
+	// Roadmap 11.1 — module state. Top-level `var` declarations live in a
+	// globals array instead of being locals of main, which is what lets a
+	// function read and assign them. Operand is a u16 slot index.
+	opGETGLOBAL = 0x76
+	opSETGLOBAL = 0x77
 )
 
 const noSlot = 0xFFFF
@@ -527,6 +532,11 @@ func run(p *Program) {
 	frames := []frame{{retpc: -1, locals: make([]Value, main.nlocals), fn: p.entryFn}}
 	pc := int(main.entry)
 
+	// Roadmap 11.1 — module state, shared by every frame. Grown on demand by
+	// opSETGLOBAL so the .pyro container needs no globals count and v3 files
+	// keep loading unchanged.
+	var globals []Value
+
 	// debug state accessible by fatal() (stack trace)
 	dbgLines = p.dbg
 	dbgFuncs = p.funcs
@@ -583,6 +593,23 @@ func run(p *Program) {
 			push(frames[len(frames)-1].locals[rd16()])
 		case opSTORE:
 			frames[len(frames)-1].locals[rd16()] = pop()
+		case opGETGLOBAL:
+			i := int(rd16())
+			if i >= len(globals) {
+				// Reading before the initialiser ran. The compiler emits the
+				// initialiser first, so this is defensive rather than reachable.
+				push(Value{k: kNull})
+			} else {
+				push(globals[i])
+			}
+		case opSETGLOBAL:
+			i := int(rd16())
+			// Grown on demand: the container carries no globals count, so v3
+			// files keep loading unchanged.
+			for len(globals) <= i {
+				globals = append(globals, Value{k: kNull})
+			}
+			globals[i] = pop()
 		case opADD, opSUB, opMUL, opDIV, opMOD,
 			opBAND, opBOR, opBXOR, opSHL, opSHR,
 			opEQ, opNE, opLT, opGT, opLE, opGE:

@@ -71,6 +71,10 @@
 #define opTHROW      0x73
 #define opCOALESCE   0x74
 #define opUNWRAP     0x75
+// Roadmap 11.1 — module state: a top-level `var` lives in a globals
+// array instead of a local of main, so functions can read/assign it.
+#define opGETGLOBAL  0x76   // u16 slot -> push globals[slot]
+#define opSETGLOBAL  0x77   // u16 slot -> globals[slot] = pop()
 
 // ── Constant Tags ───────────────────────────────────────────
 #define TAG_INT      1

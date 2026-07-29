@@ -228,6 +228,12 @@ void run_program(Program* p) {
     
     const uint8_t* code = p->code;
     
+    // Roadmap 11.1 — module state, shared by every frame. Grown on demand
+    // by opSETGLOBAL, so the .pyro container carries no globals count and
+    // v3 files keep loading unchanged. Must mirror main.go exactly.
+    Value*  globals   = NULL;
+    int     nglobals  = 0;
+
     while (1) {
         uint8_t op = code[pc++];
         switch (op) {
@@ -267,6 +273,31 @@ void run_program(Program* p) {
                     int loc_idx = frames[fp - 1].locals_base + slot;
                     release_value(locals_stack[loc_idx]);
                     locals_stack[loc_idx] = stack[--sp];
+                }
+                break;
+            case opGETGLOBAL:
+                {
+                    uint16_t slot = read_u16(code, &pc);
+                    // Reading before the initialiser ran: the compiler emits the
+                    // initialiser first, so this is defensive, not reachable.
+                    Value v = (slot < nglobals) ? globals[slot] : val_null();
+                    retain_value(v);
+                    stack[sp++] = v;
+                }
+                break;
+            case opSETGLOBAL:
+                {
+                    uint16_t slot = read_u16(code, &pc);
+                    if (slot >= nglobals) {
+                        int want = slot + 1;
+                        Value* grown = (Value*)realloc(globals, (size_t)want * sizeof(Value));
+                        if (!grown) fatal("out of memory growing globals");
+                        for (int i = nglobals; i < want; i++) grown[i] = val_null();
+                        globals  = grown;
+                        nglobals = want;
+                    }
+                    release_value(globals[slot]);
+                    globals[slot] = stack[--sp];   // ownership moves off the stack
                 }
                 break;
             case opADD:

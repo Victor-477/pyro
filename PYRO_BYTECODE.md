@@ -77,6 +77,8 @@ Each instruction = 1 opcode byte + fixed-size operands.
 | `THROW` | 73 | — | `pop` value; unwinds stack/frames to the nearest handler |
 | `COALESCE` | 74 | — | `pop b, a` → `a` if `a != null`, else `b` (operator `??`) |
 | `UNWRAP` | 75 | — | `pop a` → `a` if `a != null`, else aborts (unwrap `x!`) |
+| `GETGLOBAL` | 76 | u16 slot | `push globals[slot]` — module state (11.1) |
+| `SETGLOBAL` | 77 | u16 slot | `pop v` → `globals[slot] = v` — module state (11.1) |
 
 ### Native builtins (`NATIVE`)
 
@@ -118,6 +120,23 @@ compile time.
 > pops **both** the value and the array.
 
 Jumps are **relative** to the end of the instruction itself (`rel = target − (pc_after_operand)`).
+
+### Module state (`GETGLOBAL` / `SETGLOBAL`)
+
+A top-level `var` in Cryo is **module state**: one slot in a globals array
+shared by every frame, which is what lets a function read and assign it. The
+compiler numbers the slots from 0 in declaration order and always emits the
+initialising `SETGLOBAL` before any `GETGLOBAL` of that slot.
+
+The container carries **no globals count**. Engines grow the array on demand
+when `SETGLOBAL` addresses a slot beyond its end, which is why these opcodes
+did not need a format bump — a v3 file that never uses them loads and runs
+exactly as before. A `GETGLOBAL` of an unwritten slot yields `null`; it is
+unreachable from generated code and exists so a hand-made file cannot read
+out of bounds.
+
+Locals shadow module state: the compiler resolves a name to a frame slot
+whenever one exists, and only otherwise to a module slot.
 
 ## Format versions
 
