@@ -995,6 +995,7 @@ static void http_send(pyro_sock c, int status, const char* reason,
 //
 // Clauses: fs.read= fs.write= net= exec= env=  (comma-separated, * = all)
 // Mirrors capPolicy in main.go, message text included.
+#include <stddef.h>   // offsetof, for the policy gates
 typedef struct { char** items; int n; } CapList;
 
 // getcwd lives in <direct.h> on Windows and <unistd.h> elsewhere; wrapping it
@@ -1007,8 +1008,18 @@ static bool pyro_getcwd(char* buf, size_t n) { return _getcwd(buf, (int)n) != NU
 static bool pyro_getcwd(char* buf, size_t n) { return getcwd(buf, n) != NULL; }
 #endif
 
-static bool    g_policy_active = false;
-static CapList g_cap_fsread, g_cap_fswrite, g_cap_net, g_cap_exec, g_cap_env;
+// Two sets can be in force: what the OPERATOR set (PYRO_POLICY) and what the
+// ARTIFACT declared (11.12). A capability must be allowed by both — an
+// operator may narrow what a program asked for, never widen it.
+typedef struct {
+    bool    active;
+    CapList fsread, fswrite, net, exec, env;
+} CapPolicy;
+
+static CapPolicy g_env_policy;        // PYRO_POLICY
+static CapPolicy g_artifact_policy;   // embedded in the .pyro
+
+#define g_policy_active (g_env_policy.active || g_artifact_policy.active)
 
 static void cap_add(CapList* l, const char* item) {
     char** grown = (char**)realloc(l->items, (size_t)(l->n + 1) * sizeof(char*));
@@ -1142,9 +1153,9 @@ static char* cap_next(char** cur, char sep) {
     return start;
 }
 
-void pyro_policy_init(const char* spec) {
+static void policy_parse(CapPolicy* dst, const char* spec) {
     if (!spec || !*spec) return;
-    g_policy_active = true;
+    dst->active = true;
     pyro_sandboxed = true;
     char* buf = pyro_strdup(spec);
     char* cur = buf;
@@ -1157,11 +1168,11 @@ void pyro_policy_init(const char* spec) {
         *eq = '\0';
         char* key = cap_trim(clause);
         CapList* target = NULL;
-        if      (strcmp(key, "fs.read")  == 0) target = &g_cap_fsread;
-        else if (strcmp(key, "fs.write") == 0) target = &g_cap_fswrite;
-        else if (strcmp(key, "net")      == 0) target = &g_cap_net;
-        else if (strcmp(key, "exec")     == 0) target = &g_cap_exec;
-        else if (strcmp(key, "env")      == 0) target = &g_cap_env;
+        if      (strcmp(key, "fs.read")  == 0) target = &dst->fsread;
+        else if (strcmp(key, "fs.write") == 0) target = &dst->fswrite;
+        else if (strcmp(key, "net")      == 0) target = &dst->net;
+        else if (strcmp(key, "exec")     == 0) target = &dst->exec;
+        else if (strcmp(key, "env")      == 0) target = &dst->env;
         else {
             char msg[256];
             snprintf(msg, sizeof(msg),
@@ -1179,11 +1190,37 @@ void pyro_policy_init(const char* spec) {
     free(buf);
 }
 
+void pyro_policy_init(const char* spec)     { policy_parse(&g_env_policy, spec); }
+void pyro_policy_artifact(const char* spec) { policy_parse(&g_artifact_policy, spec); }
+
+// Every ACTIVE policy must allow — the operator's and the artifact's.
+// Mirrors bothAllow() in main.go. The offset picks which CapList to consult,
+// so one helper serves all five capabilities.
+static bool cap_both_paths(size_t off, const char* path) {
+    const CapPolicy* pols[2] = { &g_env_policy, &g_artifact_policy };
+    for (int i = 0; i < 2; i++) {
+        if (!pols[i]->active) continue;
+        const CapList* l = (const CapList*)((const char*)pols[i] + off);
+        if (!cap_path_allowed(l, path)) return false;
+    }
+    return g_policy_active;
+}
+
+static bool cap_both_listed(size_t off, const char* want) {
+    const CapPolicy* pols[2] = { &g_env_policy, &g_artifact_policy };
+    for (int i = 0; i < 2; i++) {
+        if (!pols[i]->active) continue;
+        const CapList* l = (const CapList*)((const char*)pols[i] + off);
+        if (!cap_listed(l, want)) return false;
+    }
+    return g_policy_active;
+}
+
 void cap_fs(bool read, const char* path, const char* what) {
     if (!pyro_sandboxed && !g_policy_active) return;
-    const CapList* roots = read ? &g_cap_fsread : &g_cap_fswrite;
+    size_t off = read ? offsetof(CapPolicy, fsread) : offsetof(CapPolicy, fswrite);
     const char* name = read ? "fs.read" : "fs.write";
-    if (!g_policy_active || !cap_path_allowed(roots, path)) cap_denied(what, name, path);
+    if (!cap_both_paths(off, path)) cap_denied(what, name, path);
 }
 
 // The host out of a URL, for the net allowlist. Unparseable means refused:
@@ -1201,7 +1238,7 @@ void cap_net(const char* target, const char* what) {
     char host[512];
     cap_host_of(target, host, sizeof(host));
     if (!host[0]) snprintf(host, sizeof(host), "%s", target);
-    if (!g_policy_active || !cap_listed(&g_cap_net, host)) cap_denied(what, "net", host);
+    if (!cap_both_listed(offsetof(CapPolicy, net), host)) cap_denied(what, "net", host);
 }
 
 void cap_exec(const char* cmd, const char* what) {
@@ -1212,12 +1249,12 @@ void cap_exec(const char* cmd, const char* what) {
     bin[i] = '\0';
     const char* base = bin;
     for (const char* p = bin; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;
-    if (!g_policy_active || !cap_listed(&g_cap_exec, base)) cap_denied(what, "exec", base);
+    if (!cap_both_listed(offsetof(CapPolicy, exec), base)) cap_denied(what, "exec", base);
 }
 
 void cap_env(const char* name, const char* what) {
     if (!pyro_sandboxed && !g_policy_active) return;
-    if (!g_policy_active || !cap_listed(&g_cap_env, name)) cap_denied(what, "env", name);
+    if (!cap_both_listed(offsetof(CapPolicy, env), name)) cap_denied(what, "env", name);
 }
 
 // ── embedded assets (roadmap 11.9) ─────────────────────────

@@ -50,10 +50,22 @@ type capPolicy struct {
 	env      []string
 }
 
-var policy capPolicy
+var policy capPolicy          // from PYRO_POLICY (the operator)
+var artifact capPolicy        // from the .pyro itself (the author, 11.12)
 
-func parsePolicy(spec string) {
-	policy = capPolicy{active: true}
+// Both must allow. The artifact says what the program asked for; the operator
+// may narrow it but never widen it.
+func bothAllow(pick func(capPolicy) []string, ok func([]string) bool) bool {
+	for _, pol := range []capPolicy{policy, artifact} {
+		if pol.active && !ok(pick(pol)) {
+			return false
+		}
+	}
+	return policy.active || artifact.active
+}
+
+func parsePolicyInto(dst *capPolicy, spec string) {
+	*dst = capPolicy{active: true}
 	for _, clause := range strings.Split(spec, ";") {
 		clause = strings.TrimSpace(clause)
 		if clause == "" {
@@ -71,17 +83,17 @@ func parsePolicy(spec string) {
 		}
 		switch strings.TrimSpace(key) {
 		case "fs.read":
-			policy.fsRead = append(policy.fsRead, items...)
+			dst.fsRead = append(dst.fsRead, items...)
 		case "fs.write":
-			policy.fsWrite = append(policy.fsWrite, items...)
+			dst.fsWrite = append(dst.fsWrite, items...)
 		case "net":
-			policy.net = append(policy.net, items...)
+			dst.net = append(dst.net, items...)
 		case "exec":
-			policy.exec = append(policy.exec, items...)
+			dst.exec = append(dst.exec, items...)
 		case "env":
-			policy.env = append(policy.env, items...)
+			dst.env = append(dst.env, items...)
 		default:
-			fatal("PYRO_POLICY: unknown capability '" + key +
+			fatal("policy: unknown capability '" + key +
 				"' (known: fs.read, fs.write, net, exec, env)")
 		}
 	}
@@ -91,7 +103,7 @@ func parsePolicy(spec string) {
 // WHICH capability would have allowed it. A flat "blocked by sandbox policy"
 // tells the operator nothing about what to grant.
 func denied(what, capability, subject string) {
-	if !policy.active {
+	if !policy.active && !artifact.active {
 		fatal("[Cryo Security] Sandbox: " + what + " blocked by sandbox policy")
 	}
 	fatal("[Cryo Security] Sandbox: " + what + " denied for " + subject +
@@ -145,49 +157,54 @@ func hostOf(rawurl string) string {
 
 // The five gates. Each aborts with a message naming the capability.
 func capFS(read bool, path, what string) {
-	if !sandboxed && !policy.active {
+	if !sandboxed && !policy.active && !artifact.active {
 		return
 	}
-	roots, name := policy.fsWrite, "fs.write"
+	name := "fs.write"
+	pick := func(p capPolicy) []string { return p.fsWrite }
 	if read {
-		roots, name = policy.fsRead, "fs.read"
+		name = "fs.read"
+		pick = func(p capPolicy) []string { return p.fsRead }
 	}
-	if !policy.active || !pathAllowed(roots, path) {
+	if !bothAllow(pick, func(roots []string) bool { return pathAllowed(roots, path) }) {
 		denied(what, name+"="+path, path)
 	}
 }
 
 func capNet(target, what string) {
-	if !sandboxed && !policy.active {
+	if !sandboxed && !policy.active && !artifact.active {
 		return
 	}
 	host := hostOf(target)
 	if host == "" {
 		host = target
 	}
-	if !policy.active || !listed(policy.net, host) {
+	if !bothAllow(func(p capPolicy) []string { return p.net },
+		func(l []string) bool { return listed(l, host) }) {
 		denied(what, "net="+host, host)
 	}
 }
 
 func capExec(cmd, what string) {
-	if !sandboxed && !policy.active {
+	if !sandboxed && !policy.active && !artifact.active {
 		return
 	}
 	bin := cmd
 	if f := strings.Fields(cmd); len(f) > 0 {
 		bin = filepath.Base(f[0])
 	}
-	if !policy.active || !listed(policy.exec, bin) {
+	if !bothAllow(func(p capPolicy) []string { return p.exec },
+		func(l []string) bool { return listed(l, bin) }) {
 		denied(what, "exec="+bin, bin)
 	}
 }
 
 func capEnv(name, what string) {
-	if !sandboxed && !policy.active {
+	if !sandboxed && !policy.active && !artifact.active {
 		return
 	}
-	if !policy.active || !listed(policy.env, name) {
+	if !bothAllow(func(p capPolicy) []string { return p.env },
+		func(l []string) bool { return listed(l, name) }) {
 		denied(what, "env="+name, name)
 	}
 }
@@ -712,6 +729,19 @@ func load(data []byte) *Program {
 			assets[name] = string(data[pos : pos+dl])
 			pos += dl
 		}
+	}()
+
+	// 11.12 — permissions the ARTIFACT declares, enforced alongside any
+	// operator policy. Read last, after the assets.
+	defer func() {
+		if flags&0x10 == 0 {
+			return
+		}
+		n := int(rd32())
+		spec := string(data[pos : pos+n])
+		pos += n
+		sandboxed = true
+		parsePolicyInto(&artifact, spec)
 	}()
 
 	// debug section (pc -> line), if present
@@ -1937,7 +1967,7 @@ func main() {
 	if spec := os.Getenv("PYRO_POLICY"); spec != "" {
 		// A policy implies the sandbox: deny by default, grant what is listed.
 		sandboxed = true
-		parsePolicy(spec)
+		parsePolicyInto(&policy, spec)
 	}
 	if os.Getenv("PYRO_SANDBOX") == "1" {
 		sandboxed = true

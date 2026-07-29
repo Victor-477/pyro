@@ -283,6 +283,18 @@ Program* load_program(const uint8_t* data, size_t size) {
             pyro_asset_add(name, blob, (int64_t)dl);
         }
     }
+    // 11.12 — permissions declared by the program, after the assets.
+    if (flags & 0x10) {
+        uint32_t n = rd_u32(data, &pos, "permissions length");
+        need_bytes(pos, n, "permissions section");
+        char* spec = (char*)malloc((size_t)n + 1);
+        if (!spec) fatal("out of memory loading .pyro permissions");
+        memcpy(spec, data + pos, n); spec[n] = 0;
+        pos += (int)n;
+        pyro_policy_artifact(spec);
+        free(spec);
+    }
+
     // Cross-field invariants. A function whose entry points outside the code
     // section would send the dispatch loop off the end on its first call —
     // the length checks above cannot catch that on their own.

@@ -333,6 +333,33 @@ Two properties worth stating:
 An unknown capability is an **error**, not a silent no-op: a typo in a policy
 must not quietly grant less than intended.
 
+### Permissions declared by the program (11.12)
+
+A program can state what it needs, and the compiler holds it to that:
+
+```cryo
+permissions {
+    read  = "./data", "./config";
+    write = "./data";
+    net   = "api.example.com";
+}
+```
+
+**Checked twice.** The compiler refuses a call to a gated builtin whose
+permission was not declared — `write_file() needs the 'write' permission,
+which this program does not declare` — so the mistake is caught before the
+program runs. The same list is then embedded in the `.pyro` (flags bit4) and
+enforced by the runtime, so it survives into the shipped artifact.
+
+**A capability must be allowed by every active policy.** If both a declaration
+and `PYRO_POLICY` are present, an operator can **narrow** what the program
+asked for but never **widen** it: `PYRO_POLICY=fs.read=*` does not unlock a
+path the program never declared. Without that rule the declaration would be
+decoration.
+
+The block is **opt-in** — a program without one behaves exactly as before —
+and an unknown permission name is a syntax error rather than a silent no-op.
+
 > **Not covered:** execution time and memory. A malformed or hostile program
 > can still loop forever, and so can a valid one (see the note on the loader
 > above), so quotas are a separate mechanism.

@@ -12,7 +12,7 @@ own frames of local variables).
 ```
 magic     4    "PYRO"
 version   1    0x03   (v2 still accepted by both VMs)
-flags     1    bit0 encoded, bit1 debug, bit2 sandbox, bit3 assets
+flags     1    bit0 encoded, bit1 debug, bit2 sandbox, bit3 assets, bit4 permissions
 flags     1    bit0 = code section encoded (rolling XOR)
                bit1 = debug section present (pc → line)
                bit2 = sandbox (VM refuses network/machine natives)
@@ -162,6 +162,16 @@ Assets are read with `asset(name)` and `asset_names()`. The AOT bakes them
 into the generated C as byte arrays — not string literals, since an asset may
 contain a NUL — so a natively compiled program carries its files inside the
 executable.
+
+### Declared permissions (flags bit4)
+
+After the assets, when `flags & 0x10`: `u32 length` then the policy string,
+in the same syntax `PYRO_POLICY` uses (`fs.read=./data;net=host`). One format
+to learn, one parser to trust.
+
+Written from a `permissions { ... }` block in the source, sorted for a
+reproducible container. Enforced by the runtime **together with** any
+operator policy — see `PYRO_RUNTIME.md`.
 
 ## Format versions
 
