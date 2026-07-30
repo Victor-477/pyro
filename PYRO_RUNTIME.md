@@ -88,6 +88,47 @@ Invariants:
 - `value_to_string` defines the canonical textual form of each type (used by
   `print`, concatenation and `json_encode` of keys).
 
+### 3.1 `value_to_string` — canonical textual form
+
+This form is **normative for every backend**, not just the two runtimes. It is the
+single rendering behind `print(x)`, `to_string(x)`, `"${x}"` (which the front-end
+desugars to `to_string(x)`) and string concatenation, so all four agree.
+
+| Type | Form | Example |
+|---|---|---|
+| `int` | decimal, no separators | `-42` |
+| `float` | shortest round-tripping form; `+Inf`, `-Inf`, `NaN` for the non-finite values | `1.5`, `2` (for `2.0`) |
+| `bool` | `true` / `false` | `true` |
+| `string` | the bytes themselves — **never quoted, never escaped** | `hi` |
+| `null` | `null` | `null` |
+| `array` | `[` elements `]`, separated by `, ` (comma **and** space); empty is `[]` | `[0, 1, 2]` |
+| `map` | `{` pairs `}` where each pair is `key: value`, separated by `, `; empty is `{}` | `{a: 1, b: 2}` |
+| `function` | `<fn#N>` for function-table index N | `<fn#3>` |
+
+Rules that the container forms depend on:
+
+- **Recursive.** Elements, keys and values are rendered by `value_to_string`
+  itself, so nesting composes: `[{k: 1}]`, `{a: [3], b: [1, 2]}`.
+- **Elements are not quoted.** A string inside a container renders exactly as it
+  would alone, so `["x", "y"]` prints as `[x, y]`. This is deliberately *not*
+  JSON — `json_encode` is the quoting-and-escaping form, and is a separate
+  builtin for that reason.
+- **Map pairs are ordered by the key's own textual form**, matching `keys(m)`
+  (§4). The order is therefore lexicographic on the rendered key, not numeric:
+  `{10: ten, 9: nine}`. Hash order must never be observable, or the same program
+  prints differently on two runs of the same engine.
+- **Structs render as maps**, since a struct *is* a map of string keys in the
+  value model (§1); the keys are the field's original Cryo names.
+
+> Backends that host their own value model must convert rather than lean on the
+> host language's own notation. Every native form differs from this one:
+> Go's `fmt.Sprint` gives `[0 1 2]`, JS `String()` gives `0,1,2` for an array and
+> `[object Object]` for a map, and `console.log` gives `[ 0, 1, 2 ]`. Each of
+> those was a live parity bug. `codegen_go.py` and `codegen_node.py` both emit a
+> `cryoStr` helper implementing this table; `test_cli.py` asserts the three
+> primary backends produce byte-identical output for a program that prints
+> containers, so a fourth rendering cannot appear unnoticed.
+
 ---
 
 ## 4. Containers
