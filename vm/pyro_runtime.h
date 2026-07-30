@@ -71,6 +71,26 @@
 #define opTHROW      0x73
 #define opCOALESCE   0x74
 #define opUNWRAP     0x75
+// Roadmap 11.1 — module state: a top-level `var` lives in a globals
+// array instead of a local of main, so functions can read/assign it.
+#define opGETGLOBAL  0x76   // u16 slot -> push globals[slot]
+#define opSETGLOBAL  0x77   // u16 slot -> globals[slot] = pop()
+
+// Roadmap 11.9 — embedded assets. The C VM fills this from the .pyro's asset
+// section; an AOT binary fills it from data baked into the generated C. Both
+// take ownership of the pointers.
+void pyro_asset_add(char* name, char* data, int64_t len);
+
+// Roadmap 11.11 — capability policy. pyro_policy_init parses PYRO_POLICY;
+// the cap_* gates replace the all-or-nothing sandbox check in each native.
+void pyro_policy_init(const char* spec);
+// 11.12 — permissions declared by the artifact itself. Enforced together with
+// PYRO_POLICY: a capability must be allowed by both.
+void pyro_policy_artifact(const char* spec);
+void cap_fs(bool read, const char* path, const char* what);
+void cap_net(const char* target, const char* what);
+void cap_exec(const char* cmd, const char* what);
+void cap_env(const char* name, const char* what);
 
 // ── Constant Tags ───────────────────────────────────────────
 #define TAG_INT      1

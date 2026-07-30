@@ -12,6 +12,7 @@ own frames of local variables).
 ```
 magic     4    "PYRO"
 version   1    0x03   (v2 still accepted by both VMs)
+flags     1    bit0 encoded, bit1 debug, bit2 sandbox, bit3 assets, bit4 permissions
 flags     1    bit0 = code section encoded (rolling XOR)
                bit1 = debug section present (pc → line)
                bit2 = sandbox (VM refuses network/machine natives)
@@ -77,6 +78,8 @@ Each instruction = 1 opcode byte + fixed-size operands.
 | `THROW` | 73 | — | `pop` value; unwinds stack/frames to the nearest handler |
 | `COALESCE` | 74 | — | `pop b, a` → `a` if `a != null`, else `b` (operator `??`) |
 | `UNWRAP` | 75 | — | `pop a` → `a` if `a != null`, else aborts (unwrap `x!`) |
+| `GETGLOBAL` | 76 | u16 slot | `push globals[slot]` — module state (11.1) |
+| `SETGLOBAL` | 77 | u16 slot | `pop v` → `globals[slot] = v` — module state (11.1) |
 
 ### Native builtins (`NATIVE`)
 
@@ -118,6 +121,57 @@ compile time.
 > pops **both** the value and the array.
 
 Jumps are **relative** to the end of the instruction itself (`rel = target − (pc_after_operand)`).
+
+### Module state (`GETGLOBAL` / `SETGLOBAL`)
+
+A top-level `var` in Cryo is **module state**: one slot in a globals array
+shared by every frame, which is what lets a function read and assign it. The
+compiler numbers the slots from 0 in declaration order and always emits the
+initialising `SETGLOBAL` before any `GETGLOBAL` of that slot.
+
+The container carries **no globals count**. Engines grow the array on demand
+when `SETGLOBAL` addresses a slot beyond its end, which is why these opcodes
+did not need a format bump — a v3 file that never uses them loads and runs
+exactly as before. A `GETGLOBAL` of an unwritten slot yields `null`; it is
+unreachable from generated code and exists so a hand-made file cannot read
+out of bounds.
+
+Locals shadow module state: the compiler resolves a name to a frame slot
+whenever one exists, and only otherwise to a module slot.
+
+### Embedded assets (flags bit3)
+
+An optional **asset section**, written after the debug section when
+`flags & 0x08`:
+
+```text
+u32 count
+count x { u32 namelen, name bytes, u32 datalen, data bytes }
+```
+
+Names are the file's path **relative to the asset root**, with forward
+slashes, and the entries are **sorted by name** — the container has to be
+reproducible or the [bootstrap fixed point](../ROADMAP.md) stops holding.
+
+It needed **no version bump**, for the same reason the globals array grows on
+demand: the section is last and behind a flag, so a reader that does not know
+bit3 never reaches those bytes. Every `.pyro` written before it, and every
+engine, keeps working unchanged.
+
+Assets are read with `asset(name)` and `asset_names()`. The AOT bakes them
+into the generated C as byte arrays — not string literals, since an asset may
+contain a NUL — so a natively compiled program carries its files inside the
+executable.
+
+### Declared permissions (flags bit4)
+
+After the assets, when `flags & 0x10`: `u32 length` then the policy string,
+in the same syntax `PYRO_POLICY` uses (`fs.read=./data;net=host`). One format
+to learn, one parser to trust.
+
+Written from a `permissions { ... }` block in the source, sorted for a
+reproducible container. Enforced by the runtime **together with** any
+operator policy — see `PYRO_RUNTIME.md`.
 
 ## Format versions
 

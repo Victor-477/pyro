@@ -16,8 +16,14 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
+	"net/url"
+	"path/filepath"
+	"os/exec"
+	"runtime"
 	"os"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,6 +34,278 @@ import (
 var httpClient = &http.Client{Timeout: 15 * time.Second}
 
 var stdin = bufio.NewReader(os.Stdin)
+
+// ── capability policy (roadmap 11.11) ──────────────────────
+//
+// `sandboxed` alone means "refuse everything gated". A POLICY refines that:
+// deny by default, then grant named capabilities. The point is that a program
+// which needs to read ./data and reach one host can be given exactly that,
+// instead of the all-or-nothing choice that pushes people to run unsandboxed.
+type capPolicy struct {
+	active   bool
+	fsRead   []string
+	fsWrite  []string
+	net      []string
+	exec     []string
+	env      []string
+}
+
+var policy capPolicy          // from PYRO_POLICY (the operator)
+var artifact capPolicy        // from the .pyro itself (the author, 11.12)
+
+// Both must allow. The artifact says what the program asked for; the operator
+// may narrow it but never widen it.
+func bothAllow(pick func(capPolicy) []string, ok func([]string) bool) bool {
+	for _, pol := range []capPolicy{policy, artifact} {
+		if pol.active && !ok(pick(pol)) {
+			return false
+		}
+	}
+	return policy.active || artifact.active
+}
+
+func parsePolicyInto(dst *capPolicy, spec string) {
+	*dst = capPolicy{active: true}
+	for _, clause := range strings.Split(spec, ";") {
+		clause = strings.TrimSpace(clause)
+		if clause == "" {
+			continue
+		}
+		key, val, ok := strings.Cut(clause, "=")
+		if !ok {
+			fatal("PYRO_POLICY: expected key=value in clause: " + clause)
+		}
+		items := []string{}
+		for _, it := range strings.Split(val, ",") {
+			if it = strings.TrimSpace(it); it != "" {
+				items = append(items, it)
+			}
+		}
+		switch strings.TrimSpace(key) {
+		case "fs.read":
+			dst.fsRead = append(dst.fsRead, items...)
+		case "fs.write":
+			dst.fsWrite = append(dst.fsWrite, items...)
+		case "net":
+			dst.net = append(dst.net, items...)
+		case "exec":
+			dst.exec = append(dst.exec, items...)
+		case "env":
+			dst.env = append(dst.env, items...)
+		default:
+			fatal("policy: unknown capability '" + key +
+				"' (known: fs.read, fs.write, net, exec, env)")
+		}
+	}
+}
+
+// denied reports the refusal the same way everywhere: what was attempted, and
+// WHICH capability would have allowed it. A flat "blocked by sandbox policy"
+// tells the operator nothing about what to grant.
+func denied(what, capability, subject string) {
+	if !policy.active && !artifact.active {
+		fatal("[Cryo Security] Sandbox: " + what + " blocked by sandbox policy")
+	}
+	fatal("[Cryo Security] Sandbox: " + what + " denied for " + subject +
+		" — grant it with " + capability + " in PYRO_POLICY")
+}
+
+// pathAllowed: the cleaned absolute path must sit inside one of the granted
+// roots. Cleaning first is what stops "./data/../../etc/passwd" walking out of
+// a granted directory.
+func pathAllowed(roots []string, target string) bool {
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		return false
+	}
+	abs = filepath.Clean(abs)
+	for _, r := range roots {
+		if r == "*" {
+			return true
+		}
+		ra, err := filepath.Abs(r)
+		if err != nil {
+			continue
+		}
+		ra = filepath.Clean(ra)
+		if abs == ra || strings.HasPrefix(abs, ra+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+func listed(items []string, want string) bool {
+	for _, it := range items {
+		if it == "*" || strings.EqualFold(it, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// hostOf pulls the host out of a URL for the net allowlist. A URL we cannot
+// parse is refused rather than allowed — failing open here would defeat the
+// allowlist entirely.
+func hostOf(rawurl string) string {
+	u, err := url.Parse(rawurl)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Hostname()
+}
+
+// The five gates. Each aborts with a message naming the capability.
+func capFS(read bool, path, what string) {
+	if !sandboxed && !policy.active && !artifact.active {
+		return
+	}
+	name := "fs.write"
+	pick := func(p capPolicy) []string { return p.fsWrite }
+	if read {
+		name = "fs.read"
+		pick = func(p capPolicy) []string { return p.fsRead }
+	}
+	if !bothAllow(pick, func(roots []string) bool { return pathAllowed(roots, path) }) {
+		denied(what, name+"="+path, path)
+	}
+}
+
+func capNet(target, what string) {
+	if !sandboxed && !policy.active && !artifact.active {
+		return
+	}
+	host := hostOf(target)
+	if host == "" {
+		host = target
+	}
+	if !bothAllow(func(p capPolicy) []string { return p.net },
+		func(l []string) bool { return listed(l, host) }) {
+		denied(what, "net="+host, host)
+	}
+}
+
+func capExec(cmd, what string) {
+	if !sandboxed && !policy.active && !artifact.active {
+		return
+	}
+	bin := cmd
+	if f := strings.Fields(cmd); len(f) > 0 {
+		bin = filepath.Base(f[0])
+	}
+	if !bothAllow(func(p capPolicy) []string { return p.exec },
+		func(l []string) bool { return listed(l, bin) }) {
+		denied(what, "exec="+bin, bin)
+	}
+}
+
+func capEnv(name, what string) {
+	if !sandboxed && !policy.active && !artifact.active {
+		return
+	}
+	if !bothAllow(func(p capPolicy) []string { return p.env },
+		func(l []string) bool { return listed(l, name) }) {
+		denied(what, "env="+name, name)
+	}
+}
+
+// ── HTTP server (roadmap 11.6) ─────────────────────────────
+// One listener and one in-flight connection: requests are served strictly one
+// at a time, which is what makes this safe without locking the VM. Must mirror
+// pyro_runtime.c exactly, including the request map's keys.
+// 11.9 — assets embedded in the .pyro, name -> contents.
+var assets = map[string]string{}
+
+var httpListener net.Listener
+var httpConn net.Conn
+
+// httpParseRequest reads one HTTP/1.1 request and splits it into the four
+// fields the request map exposes. Deliberately minimal and written to behave
+// identically to the C implementation.
+func httpParseRequest(c net.Conn) (method, path, query, body string, hdrs map[string]string, ok bool) {
+	hdrs = map[string]string{}
+	r := bufio.NewReader(c)
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return "", "", "", "", hdrs, false
+	}
+	parts := strings.Fields(strings.TrimSpace(line))
+	if len(parts) < 2 {
+		return "", "", "", "", hdrs, false
+	}
+	method, target := parts[0], parts[1]
+	if i := strings.IndexByte(target, '?'); i >= 0 {
+		path, query = target[:i], target[i+1:]
+	} else {
+		path = target
+	}
+	length := 0
+	for {
+		h, err := r.ReadString('\n')
+		if err != nil {
+			return "", "", "", "", hdrs, false
+		}
+		h = strings.TrimSpace(h)
+		if h == "" {
+			break
+		}
+		if k, v, found := strings.Cut(h, ":"); found {
+			name := strings.ToLower(strings.TrimSpace(k))
+			val := strings.TrimSpace(v)
+			hdrs[name] = val
+			if name == "content-length" {
+				length, _ = strconv.Atoi(val)
+			}
+		}
+	}
+	if length > 0 {
+		buf := make([]byte, length)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return "", "", "", "", hdrs, false
+		}
+		body = string(buf)
+	}
+	return method, path, query, body, hdrs, true
+}
+
+// unhex: one hex digit -> its value. Shared by url_decode so the two
+// engines cannot drift on what counts as a valid escape.
+func unhex(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
+}
+
+func httpStatusText(code int64) string {
+	switch code {
+	case 200:
+		return "OK"
+	case 201:
+		return "Created"
+	case 204:
+		return "No Content"
+	case 400:
+		return "Bad Request"
+	case 401:
+		return "Unauthorized"
+	case 403:
+		return "Forbidden"
+	case 404:
+		return "Not Found"
+	case 405:
+		return "Method Not Allowed"
+	case 500:
+		return "Internal Server Error"
+	default:
+		return "Status"
+	}
+}
 
 // ── Opcodes (mirrors burnout/codegen_pyro.py) ──────────────
 const (
@@ -83,6 +361,11 @@ const (
 	opTHROW    = 0x73 // pop value -> unwinds to the nearest handler
 	opCOALESCE = 0x74 // pop b, a -> a if a != null, else b (??)
 	opUNWRAP   = 0x75 // pop a -> a if a != null, else aborts (x!)
+	// Roadmap 11.1 — module state. Top-level `var` declarations live in a
+	// globals array instead of being locals of main, which is what lets a
+	// function read and assign them. Operand is a u16 slot index.
+	opGETGLOBAL = 0x76
+	opSETGLOBAL = 0x77
 )
 
 const noSlot = 0xFFFF
@@ -431,6 +714,36 @@ func load(data []byte) *Program {
 	if flags&0x04 != 0 {
 		sandboxed = true
 	}
+	// 11.9 — embedded assets, if present. Read AFTER the debug section, in
+	// the same order the generator writes them.
+	defer func() {
+		if flags&0x08 == 0 {
+			return
+		}
+		n := int(rd32())
+		for i := 0; i < n; i++ {
+			nl := int(rd32())
+			name := string(data[pos : pos+nl])
+			pos += nl
+			dl := int(rd32())
+			assets[name] = string(data[pos : pos+dl])
+			pos += dl
+		}
+	}()
+
+	// 11.12 — permissions the ARTIFACT declares, enforced alongside any
+	// operator policy. Read last, after the assets.
+	defer func() {
+		if flags&0x10 == 0 {
+			return
+		}
+		n := int(rd32())
+		spec := string(data[pos : pos+n])
+		pos += n
+		sandboxed = true
+		parsePolicyInto(&artifact, spec)
+	}()
+
 	// debug section (pc -> line), if present
 	if flags&0x02 != 0 {
 		ndbg := int(rd32())
@@ -527,6 +840,11 @@ func run(p *Program) {
 	frames := []frame{{retpc: -1, locals: make([]Value, main.nlocals), fn: p.entryFn}}
 	pc := int(main.entry)
 
+	// Roadmap 11.1 — module state, shared by every frame. Grown on demand by
+	// opSETGLOBAL so the .pyro container needs no globals count and v3 files
+	// keep loading unchanged.
+	var globals []Value
+
 	// debug state accessible by fatal() (stack trace)
 	dbgLines = p.dbg
 	dbgFuncs = p.funcs
@@ -583,6 +901,23 @@ func run(p *Program) {
 			push(frames[len(frames)-1].locals[rd16()])
 		case opSTORE:
 			frames[len(frames)-1].locals[rd16()] = pop()
+		case opGETGLOBAL:
+			i := int(rd16())
+			if i >= len(globals) {
+				// Reading before the initialiser ran. The compiler emits the
+				// initialiser first, so this is defensive rather than reachable.
+				push(Value{k: kNull})
+			} else {
+				push(globals[i])
+			}
+		case opSETGLOBAL:
+			i := int(rd16())
+			// Grown on demand: the container carries no globals count, so v3
+			// files keep loading unchanged.
+			for len(globals) <= i {
+				globals = append(globals, Value{k: kNull})
+			}
+			globals[i] = pop()
 		case opADD, opSUB, opMUL, opDIV, opMOD,
 			opBAND, opBOR, opBXOR, opSHL, opSHR,
 			opEQ, opNE, opLT, opGT, opLE, opGE:
@@ -1015,12 +1350,12 @@ func native(id int, a []Value) Value {
 		return goToValue(raw)
 	case 24: // http_get(url) -> body (string); "" in case of error
 		if sandboxed {
-			fatal("[Cryo Security] Sandbox: http_get() blocked by sandbox policy")
+			capNet(a[0].String(), "http_get()")
 		}
 		return vStr(httpGet(a[0].String()))
 	case 25: // http_post(url, body) -> response body (string)
 		if sandboxed {
-			fatal("[Cryo Security] Sandbox: http_post() blocked by sandbox policy")
+			capNet(a[0].String(), "http_post()")
 		}
 		return vStr(httpPost(a[0].String(), a[1].String()))
 	case 26: // sleep(ms) -> pause; returns null
@@ -1033,9 +1368,7 @@ func native(id int, a []Value) Value {
 		}
 		return vNull()
 	case 27: // write_bytes(path, int[]) -> bool: writes bytes to a file
-		if sandboxed {
-			fatal("[Cryo Security] Sandbox: write_bytes() blocked by sandbox policy")
-		}
+		capFS(false, a[0].String(), "write_bytes()")
 		if a[1].k != kArray {
 			return vBool(false)
 		}
@@ -1046,9 +1379,7 @@ func native(id int, a []Value) Value {
 		}
 		return vBool(os.WriteFile(a[0].String(), buf, 0644) == nil)
 	case 28: // read_file(path) -> string ("" on error)
-		if sandboxed {
-			fatal("[Cryo Security] Sandbox: read_file() blocked by sandbox policy")
-		}
+		capFS(true, a[0].String(), "read_file()")
 		data, err := os.ReadFile(a[0].String())
 		if err != nil {
 			return vStr("")
@@ -1259,6 +1590,239 @@ func native(id int, a []Value) Value {
 	case 51: // seed(n) -> void/null
 		prngState = uint64(nativeInt(a[0]))
 		return vNull()
+	// ── HTTP server, roadmap 11.6 ──
+	case 52: // http_listen(port) -> bool
+		if sandboxed {
+			fatal("[Cryo Security] Sandbox: http_listen() blocked by sandbox policy")
+		}
+		if httpListener != nil {
+			httpListener.Close()
+		}
+		ln, err := net.Listen("tcp", ":"+strconv.FormatInt(nativeInt(a[0]), 10))
+		if err != nil {
+			return vBool(false)
+		}
+		httpListener = ln
+		return vBool(true)
+	case 53: // http_accept() -> map{method,path,query,body}, or null
+		if httpListener == nil {
+			fatal("http_accept() called before http_listen()")
+		}
+		if httpConn != nil {
+			// The program skipped http_respond for the previous request; close
+			// it rather than leaking the connection.
+			httpConn.Close()
+			httpConn = nil
+		}
+		// Always returns a MAP, never null: `req == null` cannot be written
+		// reliably today (valueEq compares containers by their zero int, so a
+		// map tests equal to null), and an empty method is a cleaner signal
+		// anyway. A failed or malformed accept yields method "".
+		empty := func() Value {
+			m := map[any]Value{}
+			m["method"] = vStr("")
+			m["path"] = vStr("")
+			m["query"] = vStr("")
+			m["body"] = vStr("")
+			return vMap(m)
+		}
+		c, err := httpListener.Accept()
+		if err != nil {
+			return empty()
+		}
+		method, path, query, body, hdrs, ok := httpParseRequest(c)
+		if !ok {
+			c.Close()
+			return empty()
+		}
+		httpConn = c
+		m := map[any]Value{}
+		m["method"] = vStr(method)
+		m["path"] = vStr(path)
+		m["query"] = vStr(query)
+		m["body"] = vStr(body)
+		// Headers share the flat map under a `header:` prefix, lowercased.
+		// Flat because the Cryo side is `map<string,string>`; a nested map
+		// would not survive `as map<string,string>`.
+		for hk, hv := range hdrs {
+			m["header:"+hk] = vStr(hv)
+		}
+		return vMap(m)
+	case 54: // http_respond(status, content_type, body) -> bool
+		if httpConn == nil {
+			return vBool(false)
+		}
+		status := nativeInt(a[0])
+		ctype := a[1].String()
+		payload := a[2].String()
+		resp := "HTTP/1.1 " + strconv.FormatInt(status, 10) + " " + httpStatusText(status) + "\r\n" +
+			"Content-Type: " + ctype + "\r\n" +
+			"Content-Length: " + strconv.Itoa(len(payload)) + "\r\n" +
+			"Connection: close\r\n\r\n" + payload
+		_, werr := httpConn.Write([]byte(resp))
+		httpConn.Close()
+		httpConn = nil
+		return vBool(werr == nil)
+
+	// ── filesystem & process, roadmap 11.7 ──
+	// Pure queries (exists/is_dir/size/list) are ungated: they reveal only what
+	// a path lookup reveals. Everything that MUTATES the machine or reads its
+	// environment is sandbox-gated, matching read_file/write_bytes.
+	case 55: // file_exists(path) -> bool
+		_, err := os.Stat(a[0].String())
+		return vBool(err == nil)
+	case 56: // is_dir(path) -> bool
+		st, err := os.Stat(a[0].String())
+		return vBool(err == nil && st.IsDir())
+	case 57: // list_dir(path) -> string[] (names only, sorted; empty on error)
+		ents, err := os.ReadDir(a[0].String())
+		if err != nil {
+			return vArr([]Value{})
+		}
+		names := make([]string, 0, len(ents))
+		for _, e := range ents {
+			names = append(names, e.Name())
+		}
+		sort.Strings(names) // deterministic: the C runtime sorts too
+		out := make([]Value, len(names))
+		for i, n := range names {
+			out[i] = vStr(n)
+		}
+		return vArr(out)
+	case 58: // make_dir(path) -> bool (creates parents; true if it already exists)
+		capFS(false, a[0].String(), "make_dir()")
+		return vBool(os.MkdirAll(a[0].String(), 0o755) == nil)
+	case 59: // delete_file(path) -> bool
+		capFS(false, a[0].String(), "delete_file()")
+		// FILES ONLY, and deliberately not recursive. Go's os.Remove would
+		// also drop an empty directory, but MSVCRT's remove() will not and
+		// POSIX's will — so left alone this one call would mean three
+		// different things. Directory removal is simply not offered yet.
+		if st, err := os.Stat(a[0].String()); err == nil && st.IsDir() {
+			return vBool(false)
+		}
+		return vBool(os.Remove(a[0].String()) == nil)
+	case 60: // file_size(path) -> int (-1 when it cannot be read)
+		st, err := os.Stat(a[0].String())
+		if err != nil {
+			return vInt(-1)
+		}
+		return vInt(st.Size())
+	case 61: // write_file(path, content) -> bool
+		capFS(false, a[0].String(), "write_file()")
+		return vBool(os.WriteFile(a[0].String(), []byte(a[1].String()), 0o644) == nil)
+	case 62: // env(name) -> string ("" when unset)
+		capEnv(a[0].String(), "env()")
+		return vStr(os.Getenv(a[0].String()))
+	case 63: // exec(cmd) -> string (stdout; "" on failure)
+		capExec(a[0].String(), "exec()")
+		var cmd *exec.Cmd
+		if runtime.GOOS == "windows" {
+			cmd = exec.Command("cmd", "/C", a[0].String())
+		} else {
+			cmd = exec.Command("sh", "-c", a[0].String())
+		}
+		outBytes, err := cmd.Output()
+		if err != nil && len(outBytes) == 0 {
+			return vStr("")
+		}
+		return vStr(string(outBytes))
+
+	// ── persistence, roadmap 11.8 ──
+	case 64: // write_file_atomic(path, content) -> bool
+		if sandboxed {
+			capFS(false, a[0].String(), "write_file_atomic()")
+		}
+		// Write a sibling temp file, flush it to disk, then rename over the
+		// target. A reader then sees either the old file or the new one, never
+		// the truncated middle that a plain write leaves behind on a crash.
+		// The temp file is a SIBLING so the rename stays on one filesystem —
+		// across devices it would be a copy, which is not atomic.
+		{
+			path := a[0].String()
+			tmp := path + ".tmp"
+			f, err := os.Create(tmp)
+			if err != nil {
+				return vBool(false)
+			}
+			if _, err = f.WriteString(a[1].String()); err != nil {
+				f.Close()
+				os.Remove(tmp)
+				return vBool(false)
+			}
+			if err = f.Sync(); err != nil {
+				f.Close()
+				os.Remove(tmp)
+				return vBool(false)
+			}
+			if err = f.Close(); err != nil {
+				os.Remove(tmp)
+				return vBool(false)
+			}
+			// os.Rename replaces an existing target on Windows too.
+			if err = os.Rename(tmp, path); err != nil {
+				os.Remove(tmp)
+				return vBool(false)
+			}
+			return vBool(true)
+		}
+	case 65: // url_decode(s) -> string  (percent-decoding, '+' is a space)
+		{
+			in := a[0].String()
+			var b strings.Builder
+			for i := 0; i < len(in); i++ {
+				switch {
+				case in[i] == '+':
+					b.WriteByte(' ')
+				case in[i] == '%' && i+2 < len(in):
+					hi, ok1 := unhex(in[i+1])
+					lo, ok2 := unhex(in[i+2])
+					if ok1 && ok2 {
+						b.WriteByte(hi<<4 | lo)
+						i += 2
+					} else {
+						b.WriteByte(in[i]) // malformed: pass through
+					}
+				default:
+					b.WriteByte(in[i])
+				}
+			}
+			return vStr(b.String())
+		}
+	case 66: // url_encode(s) -> string
+		{
+			const hexd = "0123456789ABCDEF"
+			in := a[0].String()
+			var b strings.Builder
+			for i := 0; i < len(in); i++ {
+				ch := in[i]
+				if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+					(ch >= '0' && ch <= '9') || ch == '-' || ch == '_' ||
+					ch == '.' || ch == '~' {
+					b.WriteByte(ch)
+				} else {
+					b.WriteByte('%')
+					b.WriteByte(hexd[ch>>4])
+					b.WriteByte(hexd[ch&0x0F])
+				}
+			}
+			return vStr(b.String())
+		}
+	// ── embedded assets, roadmap 11.9 ──
+	case 67: // asset(name) -> string ("" when absent)
+		return vStr(assets[a[0].String()])
+	case 68: // asset_names() -> string[] (sorted, so every engine agrees)
+		names := make([]string, 0, len(assets))
+		for k := range assets {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		out := make([]Value, len(names))
+		for i, n := range names {
+			out[i] = vStr(n)
+		}
+		return vArr(out)
+
 	}
 	fatal(fmt.Sprintf("unknown native builtin: id=%d", id))
 	return vNull()
@@ -1357,7 +1921,20 @@ func binOp(op byte, a, b Value) Value {
 	return vNull()
 }
 
+func sameMap(m1, m2 map[any]Value) bool {
+	if m1 == nil && m2 == nil {
+		return true
+	}
+	if m1 == nil || m2 == nil {
+		return false
+	}
+	return reflect.ValueOf(m1).Pointer() == reflect.ValueOf(m2).Pointer()
+}
+
 func valueEq(a, b Value) bool {
+	if a.k == kNull || b.k == kNull {
+		return a.k == kNull && b.k == kNull
+	}
 	if a.k == kStr || b.k == kStr {
 		return a.String() == b.String()
 	}
@@ -1367,7 +1944,16 @@ func valueEq(a, b Value) bool {
 	if a.k == kBool || b.k == kBool {
 		return a.truthy() == b.truthy()
 	}
-	return a.i == b.i
+	if a.k == kArray || b.k == kArray {
+		return a.k == b.k && a.arr == b.arr
+	}
+	if a.k == kMap || b.k == kMap {
+		return a.k == b.k && sameMap(a.m, b.m)
+	}
+	if a.k == kFunc || b.k == kFunc {
+		return a.k == b.k && a.i == b.i && a.arr == b.arr
+	}
+	return a.k == b.k && a.i == b.i
 }
 
 func main() {
@@ -1377,6 +1963,11 @@ func main() {
 	data, err := os.ReadFile(os.Args[1])
 	if err != nil {
 		fatal("could not read: " + err.Error())
+	}
+	if spec := os.Getenv("PYRO_POLICY"); spec != "" {
+		// A policy implies the sandbox: deny by default, grant what is listed.
+		sandboxed = true
+		parsePolicyInto(&policy, spec)
 	}
 	if os.Getenv("PYRO_SANDBOX") == "1" {
 		sandboxed = true

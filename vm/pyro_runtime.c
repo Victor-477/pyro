@@ -471,6 +471,9 @@ char* value_to_string(Value v) {
 }
 
 bool value_eq(Value a, Value b) {
+    if (a.kind == VAL_NULL || b.kind == VAL_NULL) {
+        return a.kind == VAL_NULL && b.kind == VAL_NULL;
+    }
     if (a.kind == VAL_STR || b.kind == VAL_STR) {
         char* sa = value_to_string(a);
         char* sb = value_to_string(b);
@@ -485,12 +488,13 @@ bool value_eq(Value a, Value b) {
     }
     if (a.kind == VAL_BOOL || b.kind == VAL_BOOL) {
         bool ba = (a.kind == VAL_BOOL) ? a.as.b : (a.kind == VAL_INT ? a.as.i != 0 : false);
-        bool bb = (b.kind == VAL_BOOL) ? b.as.b : (b.kind == VAL_INT ? b.as.i != 0 : false);
+        bool bb = (b.kind == VAL_BOOL) ? b.as.b : (a.kind == VAL_INT ? b.as.i != 0 : false);
         return ba == bb;
     }
-    if (a.kind == VAL_NULL && b.kind == VAL_NULL) return true;
     if (a.kind != b.kind) return false;
     if (a.kind == VAL_INT) return a.as.i == b.as.i;
+    if (a.kind == VAL_ARRAY) return a.as.arr == b.as.arr;
+    if (a.kind == VAL_MAP) return a.as.map == b.as.map;
     if (a.kind == VAL_FUNC) return a.fnidx == b.fnidx && a.as.arr == b.as.arr;
     return false;
 }
@@ -983,6 +987,491 @@ static void http_send(pyro_sock c, int status, const char* reason,
     if (body && blen > 0) send(c, body, (int)blen, 0);
 }
 
+// ── capability policy (roadmap 11.11) ──────────────────────
+//
+//   (nothing set)   everything allowed
+//   PYRO_SANDBOX=1  everything gated is refused
+//   PYRO_POLICY=... deny by default, grant exactly what is listed
+//
+// Clauses: fs.read= fs.write= net= exec= env=  (comma-separated, * = all)
+// Mirrors capPolicy in main.go, message text included.
+#include <stddef.h>   // offsetof, for the policy gates
+typedef struct { char** items; int n; } CapList;
+
+// getcwd lives in <direct.h> on Windows and <unistd.h> elsewhere; wrapping it
+// keeps the platform test in one place.
+#ifdef _WIN32
+#include <direct.h>
+static bool pyro_getcwd(char* buf, size_t n) { return _getcwd(buf, (int)n) != NULL; }
+#else
+#include <unistd.h>
+static bool pyro_getcwd(char* buf, size_t n) { return getcwd(buf, n) != NULL; }
+#endif
+
+// Two sets can be in force: what the OPERATOR set (PYRO_POLICY) and what the
+// ARTIFACT declared (11.12). A capability must be allowed by both — an
+// operator may narrow what a program asked for, never widen it.
+typedef struct {
+    bool    active;
+    CapList fsread, fswrite, net, exec, env;
+} CapPolicy;
+
+static CapPolicy g_env_policy;        // PYRO_POLICY
+static CapPolicy g_artifact_policy;   // embedded in the .pyro
+
+#define g_policy_active (g_env_policy.active || g_artifact_policy.active)
+
+static void cap_add(CapList* l, const char* item) {
+    char** grown = (char**)realloc(l->items, (size_t)(l->n + 1) * sizeof(char*));
+    if (!grown) return;
+    l->items = grown;
+    l->items[l->n++] = pyro_strdup(item);
+}
+
+static char* cap_trim(char* s) {
+    while (*s == ' ' || *s == '\t') s++;
+    char* e = s + strlen(s);
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t')) *--e = '\0';
+    return s;
+}
+
+// Own case-insensitive compare: _stricmp/strcasecmp are hidden by
+// -std=c11 on MinGW, and an implicit declaration would truncate the result.
+static bool cap_ieq(const char* a, const char* b) {
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return false;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+static bool cap_listed(const CapList* l, const char* want) {
+    for (int i = 0; i < l->n; i++) {
+        if (strcmp(l->items[i], "*") == 0) return true;
+        if (cap_ieq(l->items[i], want)) return true;
+    }
+    return false;
+}
+
+// Absolute + normalised, so "./data/../secret" cannot slip out of a granted
+// root. Separators are folded to '/' so the comparison is uniform.
+// Absolute + normalised, written by hand: _fullpath and strtok_r are both
+// hidden by -std=c11 on MinGW. Separators fold to '/', "." is dropped and
+// ".." pops a segment — that last part is what stops "./data/../secret"
+// slipping out of a granted root.
+static void cap_abs(const char* path, char* out, size_t osz) {
+    char joined[4096];
+    bool absolute = (path[0] == '/' || path[0] == '\\') ||
+                    (path[0] && path[1] == ':');
+    if (absolute) {
+        snprintf(joined, sizeof(joined), "%s", path);
+    } else {
+        char cwd[2048];
+        if (!pyro_getcwd(cwd, sizeof(cwd))) cwd[0] = '\0';
+        snprintf(joined, sizeof(joined), "%s/%s", cwd, path);
+    }
+    for (char* p = joined; *p; p++) if (*p == '\\') *p = '/';
+
+    // keep a leading "C:" or "" prefix, then rebuild from the segments
+    char prefix[8] = "";
+    char* body = joined;
+    if (joined[0] && joined[1] == ':') {
+        prefix[0] = joined[0]; prefix[1] = ':'; prefix[2] = '\0';
+        body = joined + 2;
+    }
+
+    char* seg[256];
+    int nseg = 0;
+    char* p = body;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        char* st = p;
+        while (*p && *p != '/') p++;
+        char saved = *p;
+        *p = '\0';
+        if (strcmp(st, ".") == 0) {
+            /* skip */
+        } else if (strcmp(st, "..") == 0) {
+            if (nseg > 0) nseg--;
+        } else if (nseg < 256) {
+            seg[nseg++] = st;
+        }
+        // Do NOT restore the separator: seg[] points into this buffer and
+        // each entry must stay NUL-terminated. Restoring it made every
+        // segment read to the end of the string.
+        if (saved) p++;
+    }
+
+    size_t used = (size_t)snprintf(out, osz, "%s", prefix);
+    for (int i = 0; i < nseg && used + 1 < osz; i++) {
+        used += (size_t)snprintf(out + used, osz - used, "/%s", seg[i]);
+    }
+    if (used == 0 || (used == strlen(prefix) && osz > used + 1)) {
+        snprintf(out + used, osz - used, "/");
+    }
+}
+
+static bool cap_path_allowed(const CapList* roots, const char* target) {
+    char abs[4096];
+    cap_abs(target, abs, sizeof(abs));
+    for (int i = 0; i < roots->n; i++) {
+        if (strcmp(roots->items[i], "*") == 0) return true;
+        char root[4096];
+        cap_abs(roots->items[i], root, sizeof(root));
+        size_t rl = strlen(root);
+        if (rl && root[rl - 1] == '/') root[--rl] = '\0';
+        if (strncmp(abs, root, rl) == 0 && (abs[rl] == '\0' || abs[rl] == '/')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void cap_denied(const char* what, const char* capability, const char* subject) {
+    char msg[1024];
+    if (!g_policy_active) {
+        snprintf(msg, sizeof(msg),
+                 "[Cryo Security] Sandbox: %s blocked by sandbox policy", what);
+    } else {
+        snprintf(msg, sizeof(msg),
+                 "[Cryo Security] Sandbox: %s denied for %s — grant it with %s=%s "
+                 "in PYRO_POLICY", what, subject, capability, subject);
+    }
+    fatal(msg);
+}
+
+// Splits on `sep`, in place, returning the next token and advancing `*cur`.
+// strtok_r is hidden by -std=c11 on MinGW and strtok is not reentrant, so the
+// parser carries its own.
+static char* cap_next(char** cur, char sep) {
+    if (!*cur || !**cur) return NULL;
+    char* start = *cur;
+    char* p = start;
+    while (*p && *p != sep) p++;
+    if (*p == sep) { *p = '\0'; *cur = p + 1; } else { *cur = p; }
+    return start;
+}
+
+static void policy_parse(CapPolicy* dst, const char* spec) {
+    if (!spec || !*spec) return;
+    dst->active = true;
+    pyro_sandboxed = true;
+    char* buf = pyro_strdup(spec);
+    char* cur = buf;
+    char* clause_raw;
+    while ((clause_raw = cap_next(&cur, ';')) != NULL) {
+        char* clause = cap_trim(clause_raw);
+        if (!*clause) continue;
+        char* eq = strchr(clause, '=');
+        if (!eq) fatal("PYRO_POLICY: expected key=value in clause");
+        *eq = '\0';
+        char* key = cap_trim(clause);
+        CapList* target = NULL;
+        if      (strcmp(key, "fs.read")  == 0) target = &dst->fsread;
+        else if (strcmp(key, "fs.write") == 0) target = &dst->fswrite;
+        else if (strcmp(key, "net")      == 0) target = &dst->net;
+        else if (strcmp(key, "exec")     == 0) target = &dst->exec;
+        else if (strcmp(key, "env")      == 0) target = &dst->env;
+        else {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "PYRO_POLICY: unknown capability '%s' "
+                     "(known: fs.read, fs.write, net, exec, env)", key);
+            fatal(msg);
+        }
+        char* items = eq + 1;
+        char* it;
+        while ((it = cap_next(&items, ',')) != NULL) {
+            char* v = cap_trim(it);
+            if (*v) cap_add(target, v);
+        }
+    }
+    free(buf);
+}
+
+void pyro_policy_init(const char* spec)     { policy_parse(&g_env_policy, spec); }
+void pyro_policy_artifact(const char* spec) { policy_parse(&g_artifact_policy, spec); }
+
+// Every ACTIVE policy must allow — the operator's and the artifact's.
+// Mirrors bothAllow() in main.go. The offset picks which CapList to consult,
+// so one helper serves all five capabilities.
+static bool cap_both_paths(size_t off, const char* path) {
+    const CapPolicy* pols[2] = { &g_env_policy, &g_artifact_policy };
+    for (int i = 0; i < 2; i++) {
+        if (!pols[i]->active) continue;
+        const CapList* l = (const CapList*)((const char*)pols[i] + off);
+        if (!cap_path_allowed(l, path)) return false;
+    }
+    return g_policy_active;
+}
+
+static bool cap_both_listed(size_t off, const char* want) {
+    const CapPolicy* pols[2] = { &g_env_policy, &g_artifact_policy };
+    for (int i = 0; i < 2; i++) {
+        if (!pols[i]->active) continue;
+        const CapList* l = (const CapList*)((const char*)pols[i] + off);
+        if (!cap_listed(l, want)) return false;
+    }
+    return g_policy_active;
+}
+
+void cap_fs(bool read, const char* path, const char* what) {
+    if (!pyro_sandboxed && !g_policy_active) return;
+    size_t off = read ? offsetof(CapPolicy, fsread) : offsetof(CapPolicy, fswrite);
+    const char* name = read ? "fs.read" : "fs.write";
+    if (!cap_both_paths(off, path)) cap_denied(what, name, path);
+}
+
+// The host out of a URL, for the net allowlist. Unparseable means refused:
+// failing open here would defeat the allowlist.
+static void cap_host_of(const char* rawurl, char* out, size_t osz) {
+    const char* p = strstr(rawurl, "://");
+    p = p ? p + 3 : rawurl;
+    size_t i = 0;
+    while (p[i] && p[i] != '/' && p[i] != ':' && i < osz - 1) { out[i] = p[i]; i++; }
+    out[i] = '\0';
+}
+
+void cap_net(const char* target, const char* what) {
+    if (!pyro_sandboxed && !g_policy_active) return;
+    char host[512];
+    cap_host_of(target, host, sizeof(host));
+    if (!host[0]) snprintf(host, sizeof(host), "%s", target);
+    if (!cap_both_listed(offsetof(CapPolicy, net), host)) cap_denied(what, "net", host);
+}
+
+void cap_exec(const char* cmd, const char* what) {
+    if (!pyro_sandboxed && !g_policy_active) return;
+    char bin[512];
+    size_t i = 0;
+    while (cmd[i] && cmd[i] != ' ' && i < sizeof(bin) - 1) { bin[i] = cmd[i]; i++; }
+    bin[i] = '\0';
+    const char* base = bin;
+    for (const char* p = bin; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;
+    if (!cap_both_listed(offsetof(CapPolicy, exec), base)) cap_denied(what, "exec", base);
+}
+
+void cap_env(const char* name, const char* what) {
+    if (!pyro_sandboxed && !g_policy_active) return;
+    if (!cap_both_listed(offsetof(CapPolicy, env), name)) cap_denied(what, "env", name);
+}
+
+// ── embedded assets (roadmap 11.9) ─────────────────────────
+// Filled by the loader (C VM) or by the generated program (AOT), so both
+// engines answer asset() from the same table. Names are kept sorted so
+// asset_names() matches the Go VM's ordering.
+typedef struct { char* name; char* data; int64_t len; } PyroAsset;
+static PyroAsset* g_assets = NULL;
+static int g_nassets = 0;
+
+static int pyro_asset_cmp(const void* a, const void* b) {
+    return strcmp(((const PyroAsset*)a)->name, ((const PyroAsset*)b)->name);
+}
+
+// Takes ownership of `name` and `data`.
+void pyro_asset_add(char* name, char* data, int64_t len) {
+    PyroAsset* grown = (PyroAsset*)realloc(g_assets,
+                                           (size_t)(g_nassets + 1) * sizeof(PyroAsset));
+    if (!grown) return;
+    g_assets = grown;
+    g_assets[g_nassets].name = name;
+    g_assets[g_nassets].data = data;
+    g_assets[g_nassets].len = len;
+    g_nassets++;
+    qsort(g_assets, (size_t)g_nassets, sizeof(PyroAsset), pyro_asset_cmp);
+}
+
+// ── filesystem helpers (roadmap 11.7) ──────────────────────
+#include <dirent.h>
+#include <sys/stat.h>
+
+// list_dir sorts its names so the Go VM and this runtime return the same
+// order. Go uses sort.Strings; strcmp gives the same byte ordering.
+static int pyro_name_cmp(const void* a, const void* b) {
+    return strcmp(*(const char* const*)a, *(const char* const*)b);
+}
+
+static int pyro_is_dir(const char* path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    return (st.st_mode & S_IFMT) == S_IFDIR;
+}
+
+// Creates every missing component, like Go's os.MkdirAll. Returns 1 on
+// success or if the directory already exists.
+static int pyro_mkdir_all(const char* path) {
+    char buf[1024];
+    size_t n = strlen(path);
+    if (n >= sizeof(buf)) return 0;
+    memcpy(buf, path, n + 1);
+    for (size_t i = 1; i < n; i++) {
+        if (buf[i] == '/' || buf[i] == '\\') {
+            char save = buf[i];
+            buf[i] = '\0';
+            if (buf[0] && !pyro_is_dir(buf)) {
+#ifdef _WIN32
+                _mkdir(buf);
+#else
+                mkdir(buf, 0755);
+#endif
+            }
+            buf[i] = save;
+        }
+    }
+    if (pyro_is_dir(buf)) return 1;
+#ifdef _WIN32
+    return _mkdir(buf) == 0 || pyro_is_dir(buf);
+#else
+    return mkdir(buf, 0755) == 0 || pyro_is_dir(buf);
+#endif
+}
+
+// ── HTTP server (roadmap 11.6) ─────────────────────────────
+// One listener, one in-flight connection: requests are served strictly one at
+// a time, which is what makes this safe without any locking. Mirrors the Go
+// VM's implementation in main.go, field for field.
+static pyro_sock g_http_srv  = PYRO_BADSOCK;
+static pyro_sock g_http_conn = PYRO_BADSOCK;
+
+// One hex digit -> its value, or -1. Mirrors unhex() in main.go so the two
+// engines agree on what counts as a valid escape.
+static int pyro_unhex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static const char* http_status_text(int64_t code) {
+    switch (code) {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 204: return "No Content";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 500: return "Internal Server Error";
+        default:  return "Status";
+    }
+}
+
+// Reads one HTTP/1.1 request. Returns 0 on a malformed or closed connection.
+// Kept deliberately minimal and behaviour-identical to httpParseRequest in Go.
+// Headers are handed back as a single "name: value\n" blob, which the caller
+// splits into the request map. A blob keeps this signature from growing a
+// parallel array pair, and the map keys end up identical to the Go VM's.
+static int http_read_request(pyro_sock c, char* method, size_t msz,
+                             char* path, size_t psz, char* query, size_t qsz,
+                             char** body_out, char** hdrs_out) {
+    static char buf[65536];
+    int total = 0;
+    int header_end = -1;
+    *body_out = NULL;
+    if (hdrs_out) *hdrs_out = NULL;
+
+    // read until the end of the headers
+    while (total < (int)sizeof(buf) - 1) {
+        int got = recv(c, buf + total, (int)sizeof(buf) - 1 - total, 0);
+        if (got <= 0) return 0;
+        total += got;
+        buf[total] = '\0';
+        char* p = strstr(buf, "\r\n\r\n");
+        if (p) { header_end = (int)(p - buf) + 4; break; }
+    }
+    if (header_end < 0) return 0;
+
+    // request line: METHOD TARGET HTTP/1.1
+    const char* sp1 = strchr(buf, ' ');
+    if (!sp1) return 0;
+    size_t mlen = (size_t)(sp1 - buf);
+    if (mlen >= msz) mlen = msz - 1;
+    memcpy(method, buf, mlen); method[mlen] = '\0';
+
+    const char* target = sp1 + 1;
+    const char* sp2 = strchr(target, ' ');
+    if (!sp2) return 0;
+    size_t tlen = (size_t)(sp2 - target);
+
+    const char* q = (const char*)memchr(target, '?', tlen);
+    size_t plen = q ? (size_t)(q - target) : tlen;
+    if (plen >= psz) plen = psz - 1;
+    memcpy(path, target, plen); path[plen] = '\0';
+    query[0] = '\0';
+    if (q) {
+        size_t qlen = tlen - plen - 1;
+        if (qlen >= qsz) qlen = qsz - 1;
+        memcpy(query, q + 1, qlen); query[qlen] = '\0';
+    }
+
+    // Walk the header block once: collect every header AND find
+    // Content-Length. Names are lowercased so lookups match the Go VM.
+    long clen = 0;
+    size_t hcap = 1024, hlen = 0;
+    char* hblob = (char*)malloc(hcap);
+    if (hblob) hblob[0] = '\0';
+    const char* first_eol = strstr(buf, "\r\n");
+    for (const char* h = first_eol ? first_eol + 2 : NULL;
+         h && h < buf + header_end; ) {
+        const char* eol = strstr(h, "\r\n");
+        if (!eol || eol > buf + header_end) break;
+        size_t linelen = (size_t)(eol - h);
+        if (linelen == 0) break;                     // end of headers
+        const char* colon = (const char*)memchr(h, ':', linelen);
+        if (colon) {
+            size_t nlen = (size_t)(colon - h);
+            const char* v = colon + 1;
+            while (v < eol && (*v == ' ' || *v == '\t')) v++;
+            size_t vlen = (size_t)(eol - v);
+
+            char lname[128];
+            size_t keep = nlen < sizeof(lname) - 1 ? nlen : sizeof(lname) - 1;
+            for (size_t i = 0; i < keep; i++)
+                lname[i] = (char)tolower((unsigned char)h[i]);
+            lname[keep] = '\0';
+
+            if (strcmp(lname, "content-length") == 0)
+                clen = strtol(v, NULL, 10);
+
+            if (hblob) {
+                size_t need = hlen + keep + vlen + 3;
+                if (need > hcap) {
+                    while (need > hcap) hcap *= 2;
+                    char* grown = (char*)realloc(hblob, hcap);
+                    if (grown) { hblob = grown; }
+                    else { free(hblob); hblob = NULL; }
+                }
+                if (hblob) {
+                    memcpy(hblob + hlen, lname, keep); hlen += keep;
+                    hblob[hlen++] = ':';
+                    memcpy(hblob + hlen, v, vlen); hlen += vlen;
+                    hblob[hlen++] = '\n';
+                    hblob[hlen] = '\0';
+                }
+            }
+        }
+        h = eol + 2;
+    }
+    if (hdrs_out) *hdrs_out = hblob; else free(hblob);
+    if (clen > 0) {
+        char* body = (char*)malloc((size_t)clen + 1);
+        if (!body) return 0;
+        int have = total - header_end;
+        if (have > clen) have = (int)clen;
+        if (have > 0) memcpy(body, buf + header_end, (size_t)have);
+        while (have < clen) {
+            int got = recv(c, body + have, (int)(clen - have), 0);
+            if (got <= 0) break;
+            have += got;
+        }
+        body[have] = '\0';
+        *body_out = body;
+    }
+    return 1;
+}
+
 void http_serve_dir(const char* dir, int port) {
 #ifdef _WIN32
     WSADATA wsa;
@@ -1268,6 +1757,22 @@ Value native(int id, Value* a, int argc) {
                 size_t old_len = strlen(old);
                 size_t new_len = strlen(new_str);
                 
+                if (old_len == 0) {
+                    size_t slen = strlen(s);
+                    size_t res_cap = (slen + 1) * new_len + slen + 1;
+                    char* res = malloc(res_cap);
+                    size_t pos = 0;
+                    for (size_t i = 0; i < slen; i++) {
+                        memcpy(res + pos, new_str, new_len); pos += new_len;
+                        res[pos++] = s[i];
+                    }
+                    memcpy(res + pos, new_str, new_len); pos += new_len;
+                    res[pos] = '\0';
+                    Value rval = val_str(res, pos);
+                    free(s); free(old); free(new_str); free(res);
+                    return rval;
+                }
+
                 size_t capacity = strlen(s) + 1;
                 char* res = malloc(capacity);
                 res[0] = '\0';
@@ -1275,11 +1780,6 @@ Value native(int id, Value* a, int argc) {
                 
                 char* curr = s;
                 char* next;
-                if (old_len == 0) {
-                    Value rval = val_str(s, strlen(s));
-                    free(s); free(old); free(new_str); free(res);
-                    return rval;
-                }
                 while ((next = strstr(curr, old)) != NULL) {
                     size_t diff = next - curr;
                     if (rlen + diff + new_len + 1 >= capacity) {
@@ -1366,10 +1866,8 @@ Value native(int id, Value* a, int argc) {
                 return v;
             }
         case 24: // http_get
-            if (pyro_sandboxed) {
-                fatal("[Cryo Security] Sandbox: http_get() blocked by sandbox policy");
-            }
             {
+                { char* u = value_to_string(a[0]); cap_net(u, "http_get()"); free(u); }
                 char* url = value_to_string(a[0]);
                 char* res = http_get_curl(url);
                 Value rval = val_str(res, strlen(res));
@@ -1377,10 +1875,8 @@ Value native(int id, Value* a, int argc) {
                 return rval;
             }
         case 25: // http_post
-            if (pyro_sandboxed) {
-                fatal("[Cryo Security] Sandbox: http_post() blocked by sandbox policy");
-            }
             {
+                { char* u = value_to_string(a[0]); cap_net(u, "http_post()"); free(u); }
                 char* url = value_to_string(a[0]);
                 char* body = value_to_string(a[1]);
                 char* res = http_post_curl(url, body);
@@ -1396,9 +1892,8 @@ Value native(int id, Value* a, int argc) {
             }
         case 27: // write_bytes(path, int[]) -> bool: writes bytes to a file
             {
-                if (pyro_sandboxed) {
-                    fatal("[Cryo Security] Sandbox: write_bytes() blocked by sandbox policy");
-                }
+                { char* wp = value_to_string(a[0]);
+                  cap_fs(false, wp, "write_bytes()"); free(wp); }
                 if (a[1].kind != VAL_ARRAY) return val_bool(false);
                 char* path = value_to_string(a[0]);
                 FILE* fp = fopen(path, "wb");
@@ -1415,9 +1910,8 @@ Value native(int id, Value* a, int argc) {
             }
         case 28: // read_file(path) -> string ("" on error)
             {
-                if (pyro_sandboxed) {
-                    fatal("[Cryo Security] Sandbox: read_file() blocked by sandbox policy");
-                }
+                { char* rp = value_to_string(a[0]);
+                  cap_fs(true, rp, "read_file()"); free(rp); }
                 char* path = value_to_string(a[0]);
                 FILE* fp = fopen(path, "rb");
                 free(path);
@@ -1447,9 +1941,11 @@ Value native(int id, Value* a, int argc) {
             }
         case 30: // http_serve(port, dir) -> serve a static directory (blocking)
             {
-                if (pyro_sandboxed) {
-                    fatal("[Cryo Security] Sandbox: http_serve() blocked by sandbox policy");
-                }
+                // Binding a port is a net capability; the directory served
+                  // is also a read capability, so both are required.
+                  { char* sd = value_to_string(a[1]);
+                    cap_net("listen", "http_serve()");
+                    cap_fs(true, sd, "http_serve()"); free(sd); }
                 char* dir = value_to_string(a[1]);
                 int64_t port = (a[0].kind == VAL_FLOAT) ? (int64_t)a[0].as.f : a[0].as.i;
                 printf("[pyro] serving %s on http://localhost:%lld\n", dir, (long long)port);
@@ -1650,6 +2146,353 @@ Value native(int id, Value* a, int argc) {
                 int64_t n = (a[0].kind == VAL_INT) ? a[0].as.i : (int64_t)value_as_float(a[0]);
                 g_c_prng_state = (uint64_t)n;
                 return val_null();
+            }
+        // ── HTTP server, roadmap 11.6 ──
+        case 52: // http_listen(port) -> bool
+            {
+                cap_net("listen", "http_listen()");
+#ifdef _WIN32
+                WSADATA wsa;
+                if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return val_bool(false);
+#endif
+                if (g_http_srv != PYRO_BADSOCK) pyro_closesock(g_http_srv);
+                int64_t port = (a[0].kind == VAL_INT) ? a[0].as.i : (int64_t)value_as_float(a[0]);
+                pyro_sock srv = socket(AF_INET, SOCK_STREAM, 0);
+                if (srv == PYRO_BADSOCK) return val_bool(false);
+                int yes = 1;
+                setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+                struct sockaddr_in addr;
+                memset(&addr, 0, sizeof(addr));
+                addr.sin_family = AF_INET;
+                addr.sin_addr.s_addr = htonl(INADDR_ANY);
+                addr.sin_port = htons((unsigned short)port);
+                if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+                    pyro_closesock(srv); return val_bool(false);
+                }
+                if (listen(srv, 16) != 0) { pyro_closesock(srv); return val_bool(false); }
+                g_http_srv = srv;
+                return val_bool(true);
+            }
+        case 53: // http_accept() -> map{method,path,query,body} or null
+            {
+                if (g_http_srv == PYRO_BADSOCK)
+                    fatal("http_accept() called before http_listen()");
+                if (g_http_conn != PYRO_BADSOCK) {
+                    // previous request never answered: close rather than leak
+                    pyro_closesock(g_http_conn);
+                    g_http_conn = PYRO_BADSOCK;
+                }
+                // Always returns a MAP, never null — mirrors main.go. `req == null`
+                // cannot be written reliably today (equality compares containers
+                // by their zero int), so a failed or malformed accept is signalled
+                // by an empty method instead.
+                char method[16], path[2048], query[2048];
+                char* body = NULL;
+                method[0] = '\0'; path[0] = '\0'; query[0] = '\0';
+                pyro_sock c = accept(g_http_srv, NULL, NULL);
+                char* hdrs = NULL;
+                if (c != PYRO_BADSOCK &&
+                    !http_read_request(c, method, sizeof(method), path, sizeof(path),
+                                       query, sizeof(query), &body, &hdrs)) {
+                    pyro_closesock(c);
+                    c = PYRO_BADSOCK;
+                    method[0] = '\0'; path[0] = '\0'; query[0] = '\0';
+                    if (body) { free(body); body = NULL; }
+                    if (hdrs) { free(hdrs); hdrs = NULL; }
+                }
+                g_http_conn = c;
+                RcMap* m = rc_map_new();
+                rc_map_set(m, val_str("method", 6), val_str(method, (int64_t)strlen(method)));
+                rc_map_set(m, val_str("path",   4), val_str(path,   (int64_t)strlen(path)));
+                rc_map_set(m, val_str("query",  5), val_str(query,  (int64_t)strlen(query)));
+                rc_map_set(m, val_str("body",   4), val_str(body ? body : "",
+                                                            body ? (int64_t)strlen(body) : 0));
+                if (body) free(body);
+                // Headers share the flat map under a `header:` prefix — same
+                // keys the Go VM produces.
+                if (hdrs) {
+                    char* line = hdrs;
+                    while (line && *line) {
+                        char* nl = strchr(line, '\n');
+                        if (nl) *nl = '\0';
+                        char* colon = strchr(line, ':');
+                        if (colon) {
+                            *colon = '\0';
+                            char key[160];
+                            snprintf(key, sizeof(key), "header:%s", line);
+                            rc_map_set(m, val_str(key, (int64_t)strlen(key)),
+                                       val_str(colon + 1, (int64_t)strlen(colon + 1)));
+                        }
+                        line = nl ? nl + 1 : NULL;
+                    }
+                    free(hdrs);
+                }
+                return val_map(m);
+            }
+        case 54: // http_respond(status, content_type, body) -> bool
+            {
+                if (g_http_conn == PYRO_BADSOCK) return val_bool(false);
+                int64_t status = (a[0].kind == VAL_INT) ? a[0].as.i : (int64_t)value_as_float(a[0]);
+                char* ctype = value_to_string(a[1]);
+                char* payload = value_to_string(a[2]);
+                size_t plen = strlen(payload);
+                size_t need = plen + strlen(ctype) + 256;
+                char* resp = (char*)malloc(need);
+                int ok = 0;
+                if (resp) {
+                    int n = snprintf(resp, need,
+                        "HTTP/1.1 %lld %s\r\nContent-Type: %s\r\nContent-Length: %lld\r\n"
+                        "Connection: close\r\n\r\n%s",
+                        (long long)status, http_status_text(status), ctype,
+                        (long long)plen, payload);
+                    ok = (send(g_http_conn, resp, n, 0) == n);
+                    free(resp);
+                }
+                free(ctype); free(payload);
+                pyro_closesock(g_http_conn);
+                g_http_conn = PYRO_BADSOCK;
+                return val_bool(ok);
+            }
+        // ── filesystem & process, roadmap 11.7 ──
+        // Pure queries are ungated; anything that mutates the machine or reads
+        // its environment is sandbox-gated, matching read_file/write_bytes.
+        case 55: // file_exists(path) -> bool
+            {
+                char* p = value_to_string(a[0]);
+                struct stat st;
+                bool ok = (stat(p, &st) == 0);
+                free(p);
+                return val_bool(ok);
+            }
+        case 56: // is_dir(path) -> bool
+            {
+                char* p = value_to_string(a[0]);
+                bool ok = pyro_is_dir(p) != 0;
+                free(p);
+                return val_bool(ok);
+            }
+        case 57: // list_dir(path) -> string[] (names only, sorted; empty on error)
+            {
+                char* p = value_to_string(a[0]);
+                RcArray* out = rc_array_new();
+                DIR* d = opendir(p);
+                free(p);
+                if (!d) return val_array(out);
+                char** names = NULL;
+                int n = 0, cap = 0;
+                struct dirent* e;
+                while ((e = readdir(d)) != NULL) {
+                    if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+                    if (n == cap) {
+                        cap = cap ? cap * 2 : 16;
+                        char** grown = (char**)realloc(names, (size_t)cap * sizeof(char*));
+                        if (!grown) break;
+                        names = grown;
+                    }
+                    names[n++] = pyro_strdup(e->d_name);
+                }
+                closedir(d);
+                if (names) {
+                    qsort(names, (size_t)n, sizeof(char*), pyro_name_cmp);
+                    for (int i = 0; i < n; i++) {
+                        rc_array_push(out, val_str(names[i], (int64_t)strlen(names[i])));
+                        free(names[i]);
+                    }
+                    free(names);
+                }
+                return val_array(out);
+            }
+        case 58: // make_dir(path) -> bool (creates parents)
+            {
+                char* p = value_to_string(a[0]);
+                cap_fs(false, p, "make_dir()");
+                bool ok = pyro_mkdir_all(p) != 0;
+                free(p);
+                return val_bool(ok);
+            }
+        case 59: // delete_file(path) -> bool  (deliberately NOT recursive)
+            {
+                // FILES ONLY — see the note in main.go case 59. POSIX remove()
+                // would delete an empty directory; MSVCRT's would not.
+                char* p = value_to_string(a[0]);
+                cap_fs(false, p, "delete_file()");
+                bool ok = false;
+                if (!pyro_is_dir(p)) ok = (remove(p) == 0);
+                free(p);
+                return val_bool(ok);
+            }
+        case 60: // file_size(path) -> int (-1 when it cannot be read)
+            {
+                char* p = value_to_string(a[0]);
+                struct stat st;
+                int64_t sz = (stat(p, &st) == 0) ? (int64_t)st.st_size : -1;
+                free(p);
+                return val_int(sz);
+            }
+        case 61: // write_file(path, content) -> bool
+            {
+                char* p = value_to_string(a[0]);
+                cap_fs(false, p, "write_file()");
+                char* c = value_to_string(a[1]);
+                FILE* f = fopen(p, "wb");
+                bool ok = false;
+                if (f) {
+                    size_t len = strlen(c);
+                    ok = (fwrite(c, 1, len, f) == len);
+                    fclose(f);
+                }
+                free(p); free(c);
+                return val_bool(ok);
+            }
+        case 62: // env(name) -> string ("" when unset)
+            {
+                char* n = value_to_string(a[0]);
+                cap_env(n, "env()");
+                const char* v = getenv(n);
+                free(n);
+                return val_str(v ? v : "", v ? (int64_t)strlen(v) : 0);
+            }
+        case 63: // exec(cmd) -> string (stdout; "" on failure)
+            {
+                char* cmd = value_to_string(a[0]);
+                cap_exec(cmd, "exec()");
+#ifdef _WIN32
+                FILE* pipe = _popen(cmd, "r");
+#else
+                FILE* pipe = popen(cmd, "r");
+#endif
+                free(cmd);
+                if (!pipe) return val_str("", 0);
+                char* buf = NULL;
+                size_t len = 0, cap = 0;
+                char chunk[4096];
+                size_t got;
+                while ((got = fread(chunk, 1, sizeof(chunk), pipe)) > 0) {
+                    if (len + got + 1 > cap) {
+                        size_t want = (len + got + 1) * 2;
+                        char* grown = (char*)realloc(buf, want);
+                        if (!grown) break;
+                        buf = grown; cap = want;
+                    }
+                    memcpy(buf + len, chunk, got);
+                    len += got;
+                }
+#ifdef _WIN32
+                _pclose(pipe);
+#else
+                pclose(pipe);
+#endif
+                if (!buf) return val_str("", 0);
+                buf[len] = '\0';
+                Value res = val_str(buf, (int64_t)len);
+                free(buf);
+                return res;
+            }
+        // ── persistence, roadmap 11.8 ──
+        case 64: // write_file_atomic(path, content) -> bool
+            {
+                // Sibling temp file + flush + rename. See the note in main.go:
+                // a reader sees the old file or the new one, never the
+                // truncated middle a plain write leaves after a crash.
+                char* path = value_to_string(a[0]);
+                cap_fs(false, path, "write_file_atomic()");
+                char* data = value_to_string(a[1]);
+                size_t plen = strlen(path);
+                char* tmp = (char*)malloc(plen + 5);
+                bool ok = false;
+                if (tmp) {
+                    memcpy(tmp, path, plen);
+                    memcpy(tmp + plen, ".tmp", 5);
+                    FILE* f = fopen(tmp, "wb");
+                    if (f) {
+                        size_t dlen = strlen(data);
+                        ok = (fwrite(data, 1, dlen, f) == dlen);
+                        if (ok) ok = (fflush(f) == 0);
+                        fclose(f);
+                        if (ok) {
+#ifdef _WIN32
+                            // rename() fails on Windows when the target exists;
+                            // MoveFileEx replaces it in one step.
+                            ok = MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+                            ok = (rename(tmp, path) == 0);
+#endif
+                        }
+                        if (!ok) remove(tmp);
+                    }
+                    free(tmp);
+                }
+                free(path); free(data);
+                return val_bool(ok);
+            }
+        case 65: // url_decode(s) -> string ('+' is a space; bad escapes pass through)
+            {
+                char* in = value_to_string(a[0]);
+                size_t n = strlen(in);
+                char* out = (char*)malloc(n + 1);
+                size_t j = 0;
+                for (size_t i = 0; i < n; i++) {
+                    if (in[i] == '+') {
+                        out[j++] = ' ';
+                    } else if (in[i] == '%' && i + 2 < n) {
+                        int hi = pyro_unhex(in[i + 1]), lo = pyro_unhex(in[i + 2]);
+                        if (hi >= 0 && lo >= 0) { out[j++] = (char)(hi * 16 + lo); i += 2; }
+                        else                    { out[j++] = in[i]; }
+                    } else {
+                        out[j++] = in[i];
+                    }
+                }
+                out[j] = '\0';
+                Value res = val_str(out, (int64_t)j);
+                free(in); free(out);
+                return res;
+            }
+        case 66: // url_encode(s) -> string
+            {
+                static const char* HEXD = "0123456789ABCDEF";
+                char* in = value_to_string(a[0]);
+                size_t n = strlen(in);
+                char* out = (char*)malloc(n * 3 + 1);
+                size_t j = 0;
+                for (size_t i = 0; i < n; i++) {
+                    unsigned char ch = (unsigned char)in[i];
+                    if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                        (ch >= '0' && ch <= '9') ||
+                        ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+                        out[j++] = (char)ch;
+                    } else {
+                        out[j++] = '%';
+                        out[j++] = HEXD[ch >> 4];
+                        out[j++] = HEXD[ch & 0x0F];
+                    }
+                }
+                out[j] = '\0';
+                Value res = val_str(out, (int64_t)j);
+                free(in); free(out);
+                return res;
+            }
+        // ── embedded assets, roadmap 11.9 ──
+        case 67: // asset(name) -> string ("" when absent)
+            {
+                char* want = value_to_string(a[0]);
+                Value res = val_str("", 0);
+                for (int i = 0; i < g_nassets; i++) {
+                    if (strcmp(g_assets[i].name, want) == 0) {
+                        res = val_str(g_assets[i].data, g_assets[i].len);
+                        break;
+                    }
+                }
+                free(want);
+                return res;
+            }
+        case 68: // asset_names() -> string[] (sorted, as in the Go VM)
+            {
+                RcArray* out = rc_array_new();
+                for (int i = 0; i < g_nassets; i++) {
+                    rc_array_push(out, val_str(g_assets[i].name,
+                                               (int64_t)strlen(g_assets[i].name)));
+                }
+                return val_array(out);
             }
     }
     fatal("unknown native builtin");
