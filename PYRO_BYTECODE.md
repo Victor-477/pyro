@@ -12,7 +12,8 @@ own frames of local variables).
 ```
 magic     4    "PYRO"
 version   1    0x03   (v2 still accepted by both VMs)
-flags     1    bit0 encoded, bit1 debug, bit2 sandbox, bit3 assets, bit4 permissions
+flags     1    bit0 encoded, bit1 debug, bit2 sandbox, bit3 assets,
+               bit4 permissions, bit5 signature
 flags     1    bit0 = code section encoded (rolling XOR)
                bit1 = debug section present (pc → line)
                bit2 = sandbox (VM refuses network/machine natives)
@@ -29,6 +30,8 @@ codelen   u32
 code      codelen bytes   (decoded on load if flags bit0)
 ndebug    u32            (only if flags bit1)
 debug     ndebug × [ pc u32, line u32 ]   pc → source-line table
+...
+signature 32 bytes      (only if flags bit5)  HMAC-SHA256 of every byte before it
 ```
 
 > **v2** (since Phase 5): jumps (`JMP`/`JMPF`/`JMPT` and the `TRYPUSH` `rel`) went
@@ -219,3 +222,50 @@ compact; for real secrecy, encrypt the artifact separately.
 
 - Generator: [`burnout/codegen_pyro.py`](../burnout/codegen_pyro.py) (opcodes and serialization).
 - VM: [`pyro/vm/main.go`](vm/main.go) (load, decode and execute).
+
+
+## Integrity — the signature section (11.14)
+
+A signed container sets **flag bit 5** and ends with a **32-byte HMAC-SHA256**
+over *every byte before it*: magic, flags, constants, functions, code, the
+debug section, the embedded assets and the declared permissions.
+
+It is written **last**, and that placement is the point. 11.12 puts the
+program's declared permissions inside the container and the VM enforces them,
+which makes that section the first thing worth editing on a `.pyro` you did not
+build — widening `net` costs one byte and produces no error. Anything outside
+the signed range would be exactly the part an attacker edits, so the signature
+covers all of it, including the flags byte that says a signature is present.
+
+```bash
+# build
+cryoc app.cryo --backend pyro -o app.pyro --sign env:PYRO_KEY
+
+# run, verifying
+PYRO_KEY=... pyrovm app.pyro
+```
+
+**Verification is opt-in on the verifier's side.** Without a key the VM runs a
+signed `.pyro` without checking it, because most people running one have no
+key and refusing would make signing unusable. With a key it refuses three
+things: a signature that does not match, a body that has changed, and an
+**unsigned file**. That last refusal is what makes the rest worth anything —
+if unsigned files were accepted under a key, an attacker would not need to
+forge a signature, only delete 32 bytes and clear a flag bit.
+
+**It is a shared secret, not a public-key signature.** Anyone who can verify
+can also sign. This answers *"did this file arrive as it was built, by someone
+holding our key"* — the distribution and tampering question — and it does not
+let you publish a key so that strangers can verify your builds. HMAC-SHA256 is
+in both standard libraries involved (Python's `hmac`, Go's `crypto/hmac`);
+Ed25519 is in Go's and not in Python's, and the project ships no crypto
+dependency. Asymmetric signing would be a separate change, and the section
+layout leaves room for it.
+
+**The C VM does not verify.** It ignores the trailing section and runs the
+program, which is the same behaviour as the Go VM with no key configured.
+Verify with the Go VM.
+
+Signing does not affect reproducibility: the signature is a pure function of
+the body and the key, so the same source and key give a byte-identical file,
+and two different keys give the same body with a different trailing 32 bytes.

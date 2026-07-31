@@ -655,6 +655,10 @@ func load(data []byte) *Program {
 		fatal("unsupported .pyro version (expected v2 or v3)")
 	}
 	flags := data[5]
+	// 11.14 — integrity. Checked BEFORE anything is parsed: everything below
+	// reads offsets and lengths out of this buffer, and a tampered container is
+	// exactly the input that makes those lie.
+	data = verifySignature(data, flags)
 	p := &Program{}
 	pos := 6
 	rd16 := func() int { v := int(binary.LittleEndian.Uint16(data[pos:])); pos += 2; return v }
@@ -1982,6 +1986,10 @@ const usage = `usage: pyrovm [options] program.pyro [args...]
   --profile            sample the running program and report time per function
   --profile-hz=N       sampling rate, default 1000
   --profile-out=FILE   write the profile there instead of stderr
+  --key=KEY            verify the .pyro signature: refuses a file that does not
+                       match the key, and refuses an UNSIGNED one. Also read
+                       from PYRO_KEY, or PYRO_KEY_FILE for a path — prefer
+                       those, as argv is visible to every process on the box.
 `
 
 func main() {
@@ -1989,6 +1997,7 @@ func main() {
 	// program (the args() native), so a script's own --debug is left alone.
 	args := os.Args[1:]
 	source := ""
+	keySpec := ""
 	debugging := false
 	for len(args) > 0 && strings.HasPrefix(args[0], "--") {
 		a := args[0]
@@ -2012,6 +2021,8 @@ func main() {
 			profHz = n
 		case "--profile-out":
 			profOut = val
+		case "--key":
+			keySpec = val
 		case "--help", "-h":
 			fmt.Print(usage)
 			return
@@ -2022,6 +2033,9 @@ func main() {
 	if len(args) < 1 {
 		fatal(usage)
 	}
+	// Before the file is read: a configured key decides whether we are willing
+	// to run it at all (11.14).
+	loadSigningKey(keySpec)
 	data, err := os.ReadFile(args[0])
 	if err != nil {
 		fatal("could not read: " + err.Error())
