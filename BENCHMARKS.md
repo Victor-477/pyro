@@ -76,3 +76,69 @@ again:
 
 The benchmark harness stays. It is what turned "threading is faster" from a
 belief into a measurement, and the measurement was the opposite.
+
+---
+
+## 11.25 — what the debugger hook costs when it is off
+
+The debugger (`--debug`) needs the interpreter to be able to stop before any
+instruction, which means a check inside the dispatch loop:
+
+```go
+for {
+    if dbgOn {                      // false in every normal run
+        if !dbg.before(pc, frames) { return }
+    }
+    op := code[pc]
+    ...
+```
+
+11.22 established that this loop is sensitive enough that a change intended to
+speed it up made it 3.3% slower, so "one predictable branch, it's free" is a
+claim that needed a number rather than an argument.
+
+### Isolating the branch
+
+The first comparison — the VM at `HEAD` against the VM with the debugger — said
+the new one was **12% faster**, reproducibly. That is not a thing a added
+branch does, and the explanation was not the branch: building the same modified
+file with the hook compiled out (`if false && dbgOn`) measured *just as fast*.
+The ~12% comes from code layout shifting under the other edits in `main.go`
+(the option parsing, the `defer`), not from anything done on purpose. It is
+noted here so nobody reads it as an optimisation and tries to keep it.
+
+So the number below is from two binaries built from **one file in one
+directory**, differing only in whether that branch is compiled in:
+
+| Program | hook out | hook in | change |
+|---|---:|---:|---:|
+| `arith` | 252 ms | 257 ms | +2.0% |
+| `calls` | 43 ms | 44 ms | +2.3% |
+| `fib` | 29 ms | 28 ms | −2.1% |
+| `array` | 72 ms | 68 ms | −4.4% |
+| `branch` | 159 ms | 172 ms | +8.1% |
+| `strings` | 31 ms | 30 ms | −4.7% |
+| **total** | **585 ms** | **599 ms** | **+2.3%** |
+
+Run again with the two binaries in the opposite slots, the total came out at
+**−0.4%** — the sign flipped. So the honest reading is **no cost measurable
+above the noise**, not "+2.3%".
+
+### The noise floor, measured rather than assumed
+
+Two checks were needed before any of the above meant anything:
+
+- **Order bias.** Timing A then B every repetition gives B a warmed file cache;
+  that alone was worth ~15%, enough to manufacture a speedup from nothing. The
+  harness alternates which binary runs first.
+- **A/A control.** The same binary against itself, alternating, still reports
+  **−3.1%** in favour of the second slot. That is the floor: any result inside
+  ±3% on this machine is not a result. It is why +2.3% is reported as "no
+  measurable cost" instead of a regression.
+
+`continue` with no breakpoints set clears `dbgOn`, so even a debugged program
+runs at full speed once it is past the part being looked at.
+
+The sampling profiler (`--profile`) adds nothing to this loop at all: the
+sampler is a separate goroutine reading one atomic word, and the interpreter
+writes that word only on call and return.

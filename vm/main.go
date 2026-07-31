@@ -874,6 +874,9 @@ func run(p *Program) {
 			stack = stack[:h.sp]
 		}
 		frames = frames[:h.fp]
+		// An exception can unwind several frames at once; without this the
+		// profile would keep charging time to a function that already returned.
+		profSet(frames[len(frames)-1].fn)
 		if h.slot != noSlot {
 			frames[len(frames)-1].locals[h.slot] = v
 		}
@@ -881,7 +884,20 @@ func run(p *Program) {
 		return true
 	}
 
+	profBegin(len(p.funcs))
+	profSet(p.entryFn)
+	defer profEnd(p.funcs)
+
 	for {
+		// 11.25 — the debugger's only per-instruction cost. dbgOn is false in
+		// every normal run, and `continue` with no breakpoints set turns it
+		// back off, so a debugged program runs at full speed once it is past
+		// the part you were looking at.
+		if dbgOn {
+			if !dbg.before(pc, frames) {
+				return
+			}
+		}
 		op := code[pc]
 		pc++
 		switch op {
@@ -958,6 +974,7 @@ func run(p *Program) {
 			copy(locals, stack[base:])
 			stack = stack[:base]
 			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi})
+			profSet(fi)
 			pc = int(fn.entry)
 		case opPUSHFN:
 			push(vFunc(int64(rd16())))
@@ -990,6 +1007,7 @@ func run(p *Program) {
 			copy(locals[ncap:], stack[base:])
 			stack = stack[:base-1] // drop the args and the fn value beneath them
 			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi})
+			profSet(fi)
 			pc = int(fn.entry)
 		case opRET:
 			ret := pop()
@@ -998,6 +1016,7 @@ func run(p *Program) {
 			if fr.retpc < 0 {
 				return
 			}
+			profSet(frames[len(frames)-1].fn)
 			pc = fr.retpc
 			push(ret)
 		case opPRINT:
@@ -1956,11 +1975,54 @@ func valueEq(a, b Value) bool {
 	return a.k == b.k && a.i == b.i
 }
 
+const usage = `usage: pyrovm [options] program.pyro [args...]
+
+  --debug              stop before the first statement and read commands
+  --source=FILE        the .cryo source, so the debugger can show lines
+  --profile            sample the running program and report time per function
+  --profile-hz=N       sampling rate, default 1000
+  --profile-out=FILE   write the profile there instead of stderr
+`
+
 func main() {
-	if len(os.Args) < 2 {
-		fatal("usage: pyrovm program.pyro")
+	// Options come before the program; everything after it belongs to the
+	// program (the args() native), so a script's own --debug is left alone.
+	args := os.Args[1:]
+	source := ""
+	debugging := false
+	for len(args) > 0 && strings.HasPrefix(args[0], "--") {
+		a := args[0]
+		args = args[1:]
+		val := ""
+		if i := strings.IndexByte(a, '='); i >= 0 {
+			a, val = a[:i], a[i+1:]
+		}
+		switch a {
+		case "--debug":
+			debugging = true
+		case "--source":
+			source = val
+		case "--profile":
+			profOn = true
+		case "--profile-hz":
+			n, err := strconv.Atoi(val)
+			if err != nil || n <= 0 {
+				fatal("--profile-hz needs a positive number, got " + val)
+			}
+			profHz = n
+		case "--profile-out":
+			profOut = val
+		case "--help", "-h":
+			fmt.Print(usage)
+			return
+		default:
+			fatal("unknown option " + a + "\n" + usage)
+		}
 	}
-	data, err := os.ReadFile(os.Args[1])
+	if len(args) < 1 {
+		fatal(usage)
+	}
+	data, err := os.ReadFile(args[0])
 	if err != nil {
 		fatal("could not read: " + err.Error())
 	}
@@ -1972,6 +2034,16 @@ func main() {
 	if os.Getenv("PYRO_SANDBOX") == "1" {
 		sandboxed = true
 	}
-	progArgs = os.Args[2:]   // exposed to the program via the args() native
-	run(load(data))
+	progArgs = args[1:] // exposed to the program via the args() native
+	prog := load(data)
+	if debugging {
+		if len(prog.dbg) == 0 {
+			// Without the debug section there are no lines to stop at, and a
+			// prompt that can only step opcodes is not what was asked for.
+			fatal("this .pyro has no debug section — recompile without stripping it")
+		}
+		dbg = newDebugger(prog, source)
+		dbgOn = true
+	}
+	run(prog)
 }
