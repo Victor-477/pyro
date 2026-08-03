@@ -142,3 +142,88 @@ runs at full speed once it is past the part being looked at.
 The sampling profiler (`--profile`) adds nothing to this loop at all: the
 sampler is a separate goroutine reading one atomic word, and the interpreter
 writes that word only on call and return.
+
+---
+
+## 11.22, second attempt — the guards, not the dispatch
+
+The first attempt made *dispatch* cheaper (computed goto) and measured 3.3%
+slower. The note it left behind was that the per-instruction **guards** cost
+more than the dispatch they protect, so that is where this attempt went.
+
+### First: how much is even available?
+
+Before optimising anything, all three per-instruction guards were removed —
+unsafe, purely diagnostic — to put a ceiling on the exercise:
+
+| | min | median |
+|---|---:|---:|
+| every guard removed vs `HEAD` | −7.5% | −7.3% |
+
+So the guards cost about 7%, and no amount of reorganising them can beat that.
+Worth knowing before starting rather than after.
+
+### What shipped
+
+`fp` and `hp` were checked on **every instruction**, but the frame stack only
+moves on `CALL`/`CALLVALUE`/`RET` and the handler stack only on
+`TRYPUSH`/`TRYPOP`. Four comparisons and two loads were being paid on every
+`ADD` and `LOAD` to re-verify something that had not changed. They are now
+checked at those opcodes. The `pc` and `sp` checks each became one unsigned
+comparison instead of two — a negative int cast to unsigned wraps to something
+huge, so the upper-bound test rejects it on its own.
+
+| Program | `HEAD` | guards moved | change |
+|---|---:|---:|---:|
+| `arith` | 289 ms | 269 ms | −6.8% |
+| `calls` | 55 ms | 52 ms | −5.4% |
+| `fib` | 24 ms | 25 ms | +4.1% |
+| `array` | 45 ms | 44 ms | −2.6% |
+| `branch` | 195 ms | 189 ms | −3.0% |
+| `strings` | 66 ms | 64 ms | −2.6% |
+| **total** | **674 ms** | **643 ms** | **−4.5%** |
+
+On a single 12M-iteration arithmetic loop, where fixed costs are negligible:
+**−3.6% min, −4.2% median**, and **+3.5% / +4.6% with the binaries swapped** —
+the sign follows the change, which is what separates a result from noise.
+
+`fib` going the other way is the noise floor talking: it is a 24 ms program and
+the A/A control swings ±8% on the short ones.
+
+### Rejected on measurement: removing the `pc` guard entirely
+
+It looked like the best idea in the file. Every write to `pc` is *already*
+validated — a function entry against `codelen` at load, a jump through
+`pyro_jump_to`, a return to a pc that was valid when saved — so `pc` can only
+leave the code section by advancing off the end, which 8 bytes of sentinel
+padding absorbs. Implemented, fuzzed clean, parity clean… and **+1.7% min,
++2.3% median. Slower.** It was reverted.
+
+Measured alone, back to back, against a 0.1% floor:
+
+| variant | min | median |
+|---|---:|---:|
+| A/A control | −0.02% | +0.11% |
+| `pc` padding only | +1.72% | +2.30% |
+| `fp`/`hp` moved only | **−2.70%** | **−3.88%** |
+| both together | −1.97% | −2.82% |
+
+Both together is *worse* than the guard move alone — the padding gives back
+part of the win. Two changes that each look right can fight.
+
+### The methodology cost more than the change
+
+An early A/A control between two copies of one binary reported **−7.5%**, and
+the same binary against its own path reported **−0.7%**. The difference is
+entirely first-touch cost — page cache, and on Windows an on-access scan —
+which lands on whichever file is timed first and which `min()` cannot remove,
+because it is paid once before the first sample rather than spread across them.
+The harness now warms both binaries on each program before timing.
+
+Under that broken floor, the guard move measured "no change" and the padding
+measured "a win". Both readings were wrong, and both were reversed once the
+floor was fixed. **The first thing to measure is the measurement.**
+
+Correctness is unchanged and was checked before speed: `test_fuzz.py` 888
+malformed inputs across both VMs with no crash, `test_c_vm.py` 57 parity cases
+including abort messages, `test_aot.py` 22.

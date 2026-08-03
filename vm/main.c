@@ -371,24 +371,28 @@ void run_program(Program* p) {
         // 11.13 — the code section is untrusted input too. A malformed .pyro
         // can hold a jump past the end or an instruction whose operand runs
         // off the buffer; without this the loop reads whatever follows in
-        // memory. Checked once per instruction: one comparison.
-        if (pc < 0 || (uint32_t)pc >= p->codelen) {
+        // memory.
+        //
+        // 11.22 — ONE unsigned comparison, not two. Converting a negative int
+        // to uint32_t is well defined and wraps to something huge, so the
+        // `>= codelen` test rejects a negative pc on its own; same for sp.
+        if ((uint32_t)pc >= p->codelen) {
             fatal("malformed .pyro: execution ran past the end of the code");
         }
-        // 11.13 — the four stacks are fixed arrays. A malformed .pyro can push
-        // without ever popping (a call that never returns, a try that never
-        // pops), so they are bounded here, once, rather than at each of the
-        // dozens of push sites. The margins cover the widest single
-        // instruction: NEWMAP touches 2*n slots, a call pushes one frame.
-        if (sp < 0 || sp > (int)(sizeof(stack) / sizeof(stack[0])) - 4) {
+        // The value stack moves on almost every instruction, so it is checked
+        // on every instruction. The margin covers the widest single one:
+        // NEWMAP touches 2*n slots.
+        if ((unsigned)sp > (unsigned)(int)(sizeof(stack) / sizeof(stack[0])) - 4u) {
             fatal("malformed .pyro: value stack overflow");
         }
-        if (fp < 0 || fp > (int)(sizeof(frames) / sizeof(frames[0])) - 2) {
-            fatal("malformed .pyro: call stack overflow (runaway recursion?)");
-        }
-        if (hp < 0 || hp > (int)(sizeof(handlers) / sizeof(handlers[0])) - 2) {
-            fatal("malformed .pyro: exception handler stack overflow");
-        }
+        // fp and hp used to be checked here too, and that was the waste: the
+        // frame stack only moves on CALL/CALLVALUE/RET and the handler stack
+        // only on TRYPUSH/TRYPOP, so four comparisons and two loads were being
+        // paid on every ADD and LOAD to re-verify something that had not
+        // changed. They are now checked at those opcodes instead: the same
+        // guarantee, ~3% faster on a guard-bound loop (BENCHMARKS.md), and the
+        // same malformed files rejected — test_fuzz.py is the arbiter, with
+        // 888 malformed inputs across both VMs.
         uint8_t op = code[pc++];
         // Every instruction below reads at most 6 operand bytes (TRYPUSH).
         // Verifying the widest case once is simpler than threading a length
@@ -565,6 +569,12 @@ void run_program(Program* p) {
                         locals_stack[next_base + i] = stack[base + i];
                     }
                     sp = base;
+                    // 11.22 — bounded HERE, not on every instruction: the
+                    // frame stack only moves on a call and a return.
+                    if ((unsigned)fp >
+                        (unsigned)(int)(sizeof(frames) / sizeof(frames[0])) - 2u) {
+                        fatal("malformed .pyro: call stack overflow (runaway recursion?)");
+                    }
                     frames[fp++] = (Frame){ .retpc = pc, .locals_base = next_base, .nlocals = fn.nlocals, .fn = fi };
                     pc = fn.entry;
                 }
@@ -617,6 +627,12 @@ void run_program(Program* p) {
                     }
                     release_value(fnval);   // the stack slot's reference is gone
                     sp = base - 1;          // drop the args and the fn value beneath
+                    // 11.22 — bounded HERE, not on every instruction: the
+                    // frame stack only moves on a call and a return.
+                    if ((unsigned)fp >
+                        (unsigned)(int)(sizeof(frames) / sizeof(frames[0])) - 2u) {
+                        fatal("malformed .pyro: call stack overflow (runaway recursion?)");
+                    }
                     frames[fp++] = (Frame){ .retpc = pc, .locals_base = next_base, .nlocals = fn.nlocals, .fn = fi };
                     pc = fn.entry;
                 }
@@ -624,6 +640,13 @@ void run_program(Program* p) {
             case opRET:
                 {
                     Value ret = stack[--sp];
+                    // The pop needs a LOWER bound, and needs it BEFORE the
+                    // read. The old per-instruction check could not give
+                    // that: `frames[--fp]` with fp == 0 read frames[-1] and
+                    // only failed on the next iteration, after the fact.
+                    if (fp <= 0) {
+                        fatal("malformed .pyro: return with no frame to return to");
+                    }
                     Frame fr = frames[--fp];
                     for (int i = 0; i < fr.nlocals; i++) {
                         release_value(locals_stack[fr.locals_base + i]);
@@ -789,6 +812,12 @@ void run_program(Program* p) {
                     uint16_t slot = read_u16(code, &pc);
                     // the catch target is attacker-controlled like any jump
                     int catch_pc = pyro_jump_to(pc, rel, p->codelen);
+                    // 11.22 — likewise: the handler stack only moves here
+                    // and at TRYPOP.
+                    if ((unsigned)hp >
+                        (unsigned)(int)(sizeof(handlers) / sizeof(handlers[0])) - 2u) {
+                        fatal("malformed .pyro: exception handler stack overflow");
+                    }
                     handlers[hp++] = (Handler){ .catchPC = catch_pc, .sp = sp, .fp = fp, .slot = slot };
                 }
                 break;
