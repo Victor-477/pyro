@@ -366,6 +366,11 @@ const (
 	// function read and assign them. Operand is a u16 slot index.
 	opGETGLOBAL = 0x76
 	opSETGLOBAL = 0x77
+	// Roadmap 12.5 — concurrency. opSPAWN pops a function value (a closure over
+	// the spawned expression) and starts a task; opAWAIT pops a future and
+	// yields until that task has produced its value.
+	opSPAWN = 0x78
+	opAWAIT = 0x79
 )
 
 const noSlot = 0xFFFF
@@ -380,6 +385,7 @@ const (
 	kArray // *[]Value (reference: push/setidx mutate the shared array)
 	kMap   // map[any]Value (structs also use this type)
 	kFunc  // first-class function value (i = function index)
+	kFuture // 12.5 — a spawned task's result (i = task id)
 )
 
 type Value struct {
@@ -400,6 +406,7 @@ func vNull() Value            { return Value{k: kNull} }
 func vArr(a []Value) Value    { return Value{k: kArray, arr: &a} }
 func vMap(m map[any]Value) Value { return Value{k: kMap, m: m} }
 func vFunc(idx int64) Value    { return Value{k: kFunc, i: idx} }
+func vFuture(id int64) Value  { return Value{k: kFuture, i: id} }
 
 // vClosure: a function value carrying captured values (captured BY VALUE).
 // They are copied into the leading locals of the callee by opCALLVALUE.
@@ -532,6 +539,8 @@ func (v Value) String() string {
 		return "{" + join(parts, ", ") + "}"
 	case kFunc:
 		return "<fn#" + strconv.FormatInt(v.i, 10) + ">"
+	case kFuture:
+		return "<future#" + strconv.FormatInt(v.i, 10) + ">"
 	default:
 		return "null"
 	}
@@ -584,6 +593,51 @@ type frame struct {
 	retpc  int
 	locals []Value
 	fn     int // function index (for stack trace)
+}
+
+// exception handler (try/catch). Per-task: an unwind must not cross into
+// another task's stack, so 12.5 moved this out of run()'s locals.
+type handler struct {
+	catchPC int
+	sp      int // operand stack depth upon entering try
+	fp      int // frame stack depth
+	slot    int // catch variable slot (noSlot = none)
+}
+
+// ── 12.5: tasks ─────────────────────────────────────────────
+//
+// A task is one independent execution context: its own operand stack, call
+// frames, pc and handlers. Globals and the heap are SHARED, exactly as
+// goroutines share them on the go backend.
+//
+// Scheduling is cooperative and single-threaded, which is a deliberate choice
+// rather than a step towards OS threads. Two properties fall out of it that
+// preemption would cost:
+//
+//   * the output is DETERMINISTIC — tasks run in spawn order and switch only
+//     at defined points, so a program prints the same thing every run. A VM
+//     whose output depends on the host scheduler cannot be compared against
+//     the other backends at all, which is what invariant 1 needs.
+//   * no locking — since no two tasks are ever mid-instruction at once, a
+//     shared array or map cannot tear, and the interpreter loop pays nothing
+//     for concurrency it is not using.
+//
+// What it does NOT buy: CPU parallelism. Two compute-bound tasks take as long
+// as running them one after the other. The win is on WAITING — see sleep.
+type task struct {
+	id       int
+	stack    []Value
+	frames   []frame
+	pc       int
+	handlers []handler
+
+	done   bool
+	result Value
+
+	// parked until wakeAt (sleep), or waiting for `awaiting` to finish.
+	wakeAt   time.Time
+	sleeping bool
+	awaiting int // -1 = not waiting on a task
 }
 
 // ── debug state (for stack traces in fatal) ────────
@@ -855,13 +909,7 @@ func run(p *Program) {
 	dbgFrames = &frames
 	dbgPC = &pc
 
-	// exception handlers stack (try/catch)
-	type handler struct {
-		catchPC int
-		sp      int // operand stack depth upon entering try
-		fp      int // frame stack depth
-		slot    int // catch variable slot (noSlot = none)
-	}
+	// exception handlers stack (try/catch) — the running task's
 	var handlers []handler
 
 	rd16 := func() int { v := int(binary.LittleEndian.Uint16(code[pc:])); pc += 2; return v }
@@ -886,6 +934,83 @@ func run(p *Program) {
 		}
 		pc = h.catchPC
 		return true
+	}
+
+	// ── 12.5 — the scheduler ─────────────────────────
+	//
+	// run()'s locals (stack/frames/pc/handlers) ARE the running task's working
+	// set; save/load swap them. Doing it this way rather than indirecting every
+	// access through cur.* keeps the interpreter loop byte-for-byte the code it
+	// was before concurrency existed, so a single-task program pays nothing.
+	tasks := []*task{{id: 0, awaiting: -1}}
+	cur := tasks[0]
+	save := func() { cur.stack, cur.frames, cur.pc, cur.handlers = stack, frames, pc, handlers }
+	load := func() {
+		stack, frames, pc, handlers = cur.stack, cur.frames, cur.pc, cur.handlers
+		profSet(frames[len(frames)-1].fn)
+	}
+
+	ready := func(t *task) bool {
+		if t.done {
+			return false
+		}
+		if t.sleeping {
+			return !time.Now().Before(t.wakeAt)
+		}
+		if t.awaiting >= 0 {
+			return tasks[t.awaiting].done
+		}
+		return true
+	}
+
+	// pick: round-robin from the task after the current one, so tasks run in
+	// spawn order and the schedule does not depend on the host. Returns false
+	// when nothing can ever run again.
+	pick := func() bool {
+		n := len(tasks)
+		try := func() bool {
+			for off := 1; off <= n; off++ {
+				t := tasks[(cur.id+off)%n]
+				if ready(t) {
+					t.sleeping = false
+					cur = t
+					return true
+				}
+			}
+			return false
+		}
+		if try() {
+			return true
+		}
+		// Nothing runnable now. If someone is sleeping, the wait is real work:
+		// block until the earliest wake rather than spinning. This is what makes
+		// a fan-out of sleeps cost the LONGEST one instead of their sum.
+		var earliest time.Time
+		for _, t := range tasks {
+			if !t.done && t.sleeping && (earliest.IsZero() || t.wakeAt.Before(earliest)) {
+				earliest = t.wakeAt
+			}
+		}
+		if !earliest.IsZero() {
+			if d := time.Until(earliest); d > 0 {
+				time.Sleep(d)
+			}
+			return try()
+		}
+		return false
+	}
+
+	deadlock := func() {
+		// Naming the cycle matters: "deadlock" alone leaves the reader counting
+		// awaits by hand. A hang would be worse than either.
+		msg := "[Cryo Concurrency] deadlock: no task can make progress"
+		for _, t := range tasks {
+			if !t.done && t.awaiting >= 0 {
+				msg += fmt.Sprintf("\n  task %d is awaiting task %d, which has not finished",
+					t.id, t.awaiting)
+			}
+		}
+		fatal(msg)
 	}
 
 	profBegin(len(p.funcs))
@@ -1018,7 +1143,20 @@ func run(p *Program) {
 			fr := frames[len(frames)-1]
 			frames = frames[:len(frames)-1]
 			if fr.retpc < 0 {
-				return
+				if cur.id == 0 {
+					// The main task returning ends the program, and any task
+					// still in flight is dropped — the same thing that happens
+					// to a goroutine when main returns on the go backend.
+					return
+				}
+				cur.done = true
+				cur.result = ret
+				save()
+				if !pick() {
+					deadlock()
+				}
+				load()
+				break
 			}
 			profSet(frames[len(frames)-1].fn)
 			pc = fr.retpc
@@ -1121,6 +1259,53 @@ func run(p *Program) {
 				out[i] = keyToValue(k)
 			}
 			push(vArr(out))
+		case opSPAWN:
+			fnval := pop()
+			if fnval.k != kFunc {
+				fatal("spawn of a non-function value")
+			}
+			fi := int(fnval.i)
+			fn := p.funcs[fi]
+			locals := make([]Value, fn.nlocals)
+			if fnval.arr != nil {
+				copy(locals, *fnval.arr) // captured values lead the locals
+			}
+			nt := &task{
+				id:      len(tasks),
+				awaiting: -1,
+				frames:  []frame{{retpc: -1, locals: locals, fn: fi}},
+				pc:      int(fn.entry),
+			}
+			tasks = append(tasks, nt)
+			// The spawner keeps running: `spawn` fires work off, it does not
+			// hand over. The new task runs at the spawner's next yield.
+			push(vFuture(int64(nt.id)))
+		case opAWAIT:
+			fv := pop()
+			if fv.k != kFuture {
+				fatal("await of a non-future value")
+			}
+			tid := int(fv.i)
+			if tid == cur.id {
+				fatal("[Cryo Concurrency] a task cannot await itself")
+			}
+			if tasks[tid].done {
+				cur.awaiting = -1
+				push(tasks[tid].result)
+				break
+			}
+			// Not ready. Put the future back and rewind to this instruction, so
+			// resuming re-executes the await instead of finishing it inside
+			// whichever task runs next — the switch below changes the working
+			// set out from under this case.
+			push(fv)
+			pc--
+			cur.awaiting = tid
+			save()
+			if !pick() {
+				deadlock()
+			}
+			load()
 		case opNATIVE:
 			nid := int(code[pc])
 			argc := int(code[pc+1])
@@ -1129,6 +1314,22 @@ func run(p *Program) {
 			args := make([]Value, argc)
 			copy(args, stack[base:])
 			stack = stack[:base]
+			// 12.5 — sleep is the yield point, and the only one. A task that
+			// waits lets the others run, which is the whole reason to spawn:
+			// five tasks sleeping 30ms cost 30ms, not 150ms. With no other
+			// task alive it is an ordinary sleep, so a single-threaded program
+			// behaves exactly as before.
+			if nid == 26 && argc == 1 && len(tasks) > 1 {
+				cur.sleeping = true
+				cur.wakeAt = time.Now().Add(time.Duration(nativeInt(args[0])) * time.Millisecond)
+				push(vNull()) // sleep's own result, left for the resumed task
+				save()
+				if !pick() {
+					deadlock()
+				}
+				load()
+				break
+			}
 			push(native(nid, args))
 		default:
 			fatal(fmt.Sprintf("unknown opcode 0x%02X at pc=%d", op, pc-1))

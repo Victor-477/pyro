@@ -76,6 +76,13 @@
 #define opGETGLOBAL  0x76   // u16 slot -> push globals[slot]
 #define opSETGLOBAL  0x77   // u16 slot -> globals[slot] = pop()
 
+// Roadmap 12.5 — concurrency. Defined here so this VM can REFUSE them by
+// name; the scheduler itself lives in the Go VM only. Reserving the ids keeps
+// the two VMs' opcode space in agreement, which is what stops a later opcode
+// from being assigned 0x78 here and meaning something else there.
+#define opSPAWN      0x78   // pop a function value -> push a future
+#define opAWAIT      0x79   // pop a future -> its result
+
 // Roadmap 11.9 — embedded assets. The C VM fills this from the .pyro's asset
 // section; an AOT binary fills it from data baked into the generated C. Both
 // take ownership of the pointers.

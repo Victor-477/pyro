@@ -869,6 +869,15 @@ void run_program(Program* p) {
                     }
                 }
                 break;
+            case opSPAWN:
+            case opAWAIT:
+                // 12.5 — the scheduler is implemented in the Go VM. Refusing by
+                // name rather than falling through to "invalid opcode": the
+                // bytecode is perfectly valid, this VM just cannot run it, and
+                // an opcode number tells the reader nothing about which.
+                fatal("[Cryo Concurrency] spawn/await need the Go VM — "
+                      "this C VM has no scheduler (roadmap 12.5)");
+                break;
             default:
                 fatal("invalid opcode in bytecode");
         }
