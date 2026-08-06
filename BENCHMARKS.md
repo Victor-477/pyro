@@ -227,3 +227,37 @@ floor was fixed. **The first thing to measure is the measurement.**
 Correctness is unchanged and was checked before speed: `test_fuzz.py` 888
 malformed inputs across both VMs with no crash, `test_c_vm.py` 57 parity cases
 including abort messages, `test_aot.py` 22.
+
+## Where the VM's time actually goes (roadmap 13.4)
+
+11.22 built computed-goto threading, measured it **3% slower** and reverted it.
+That was a guess at the dispatch loop. This is a measurement of it.
+
+Capture a CPU profile of the interpreter itself — not of the Cryo program,
+which is what `--profile` (11.25) samples:
+
+```bash
+pyrovm --cpuprofile=arith.prof arith.pyro
+go tool pprof -top pyrovm.exe arith.prof
+```
+
+On `arith`, the densest opcode mix in the suite:
+
+| Function | flat | what it is |
+|---|---|---|
+| `main.run` | 65% | the dispatch loop and the opcode bodies |
+| `main.run.func2` | 14% | `pop` |
+| `main.run.func1` | 7% | `push` |
+| `main.binOp` | 7% | the arithmetic itself |
+
+**One fifth of the time is operand-stack traffic**, and only 7% is the
+arithmetic those instructions exist to perform. The stack is a Go slice and
+every `push` is an `append` with a capacity check, every `pop` a re-slice.
+
+That is the answer to why 11.22's result was negative: threading attacks the
+*selection* of the next opcode, and selection is not where the time is. A
+pre-sized stack with index arithmetic — no append, no capacity check — targets
+the 20%, and can be measured against these numbers rather than assumed.
+
+Note `fib` is too short to sample at the default rate (30ms, zero samples).
+Profiling it needs a larger iteration count; the numbers above are `arith`.

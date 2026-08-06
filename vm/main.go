@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"runtime"
 	"os"
+	"runtime/pprof"
 	"reflect"
 	"sort"
 	"strconv"
@@ -690,6 +691,10 @@ func stackTrace() string {
 }
 
 func fatal(msg string) {
+	if cpuStop != nil {
+		cpuStop()
+		cpuStop = nil
+	}
 	fmt.Fprintln(os.Stderr, "[Pyro VM] "+msg)
 	if tr := stackTrace(); tr != "" {
 		fmt.Fprintln(os.Stderr, tr)
@@ -2193,7 +2198,17 @@ const usage = `usage: pyrovm [options] program.pyro [args...]
                        those, as argv is visible to every process on the box.
 `
 
+// 13.4 — set by --cpuprofile; empty means no profiling and no cost.
+var cpuProfPath string
+
+// cpuStop is invoked before any os.Exit so the profile is flushed.
+// (profStop already exists in profile.go for the 11.25 sampler.)
+var cpuStop func()
+
 func main() {
+	if p := os.Getenv("PYRO_CPUPROFILE"); p != "" {
+		cpuProfPath = p
+	}
 	// Options come before the program; everything after it belongs to the
 	// program (the args() native), so a script's own --debug is left alone.
 	args := os.Args[1:]
@@ -2208,6 +2223,19 @@ func main() {
 			a, val = a[:i], a[i+1:]
 		}
 		switch a {
+		case "--cpuprofile":
+			// 13.4 — a CPU profile OF THE VM, not of the Cryo program.
+			// --profile (11.25) samples the running program's Cryo functions;
+			// this samples the interpreter itself, which is the only way to
+			// answer where the VM's time actually goes rather than guessing at
+			// the dispatch loop again.
+			// this loop uses `--flag=value`, so take it from val
+			if val != "" {
+				cpuProfPath = val
+			} else if len(args) > 0 {
+				cpuProfPath = args[0]
+				args = args[1:]
+			}
 		case "--debug":
 			debugging = true
 		case "--source":
@@ -2260,5 +2288,27 @@ func main() {
 		dbg = newDebugger(prog, source)
 		dbgOn = true
 	}
+	if cpuProfPath != "" {
+		f, err := os.Create(cpuProfPath)
+		if err == nil {
+			pprof.StartCPUProfile(f)
+			// Stopped explicitly rather than by defer: a Cryo program can end
+			// through fatal()/os.Exit, and a deferred stop never runs then —
+			// which produces an EMPTY profile file and looks like the profiler
+			// is broken rather than like the program exited.
+			defer func() {
+				pprof.StopCPUProfile()
+				f.Close()
+			}()
+			cpuStop = func() {
+				pprof.StopCPUProfile()
+				f.Close()
+			}
+		}
+	}
 	run(prog)
+	if cpuStop != nil {
+		cpuStop()
+		cpuStop = nil
+	}
 }
