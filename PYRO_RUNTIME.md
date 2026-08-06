@@ -50,7 +50,15 @@ Mixed `int`/`float` operations promote the integer to `float`; the result is
 - Same numeric category compares by value (with `int`/`float` promotion).
 - `string` compares by content; `bool` by value.
 - `null` compares equal only to `null` (`null == null` is true; `x == null` is false for any non-null container, scalar or function).
-- `array` and `map` compare by **reference identity** (pointer equality).
+- `array` and `map` compare by **reference identity** (pointer equality). Two
+  containers with equal contents are **not** equal — `[1] == [1]` is false,
+  `a == a` is true. This is observable, so it is the rule every backend follows
+  rather than a VM detail.
+- The `x == null` rule covers values that have no null to be. `""`, `0`, `0.0`,
+  `false` and a struct value are all **not** null (and `!= null` is true for
+  them), on every backend — including the ones where the comparison has to be
+  folded at compile time because the target language would reject it (go) or
+  answer differently (C, where `0 == NULL` is true).
 
 ### Truthiness (`value_truthy`)
 `false`, `null`, `0` (int), `0.0` (float) and `""` are falsy; everything else is truthy.
