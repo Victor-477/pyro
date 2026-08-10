@@ -628,6 +628,7 @@ type handler struct {
 type task struct {
 	id       int
 	stack    []Value
+	sp       int
 	frames   []frame
 	pc       int
 	handlers []handler
@@ -888,16 +889,67 @@ func indexSet(cont, key, val Value) {
 
 // ── execution ────────────────────────────────────────────────
 
+// 13.4 — the operand stack is a slice indexed by an integer `sp`, not a slice
+// grown with append.
+//
+// The profile in BENCHMARKS.md is what chose this. On `arith`, the densest
+// opcode mix in the suite, `pop` was 14% flat and `push` 7% while `binOp` — the
+// arithmetic the instructions exist to perform — was 7%. A fifth of the VM's
+// time was operand-stack bookkeeping: every push an `append` with a capacity
+// check and a slice-header write-back, every pop a re-slice, and both behind an
+// indirect call through a closure the compiler cannot inline (they are captured
+// by save/load, so they and the stack live on the heap).
+//
+// `stack[sp] = v; sp++` and `sp--; v := stack[sp]` at the use site have none of
+// that. The CEILING mirrors the C VM's `static Value stack[65536]`, so the two
+// engines overflow at the same depth on the same program — a Go VM that grew
+// without limit would accept a program the C VM aborts on, which is invariant 1
+// broken in the direction that is hardest to notice, since the engine that
+// disagrees is the one that appears to work.
+//
+// Underflow is caught by Go's own bounds check, exactly as the append version
+// caught it: sp-1 on an empty stack indexes out of range and panics.
+//
+// The stack GROWS rather than being allocated at stackMax up front, and that is
+// a measured decision, not caution. Allocating all 65536 slots made `strings`
+// — the allocation-heavy benchmark — 10% SLOWER while every other program got
+// faster. `Value` contains a string, a slice pointer and a map, so 65536 of
+// them is 4 MB the collector must scan on every cycle whether the program uses
+// two slots or twenty thousand: GODEBUG=gctrace showed GC going from 4% of
+// runtime to 13%. Starting small and doubling keeps the scan proportional to
+// what the program actually uses.
+//
+// One headroom check per instruction pays for it, in the same place and shape
+// the C VM has always had it. No instruction pushes more than it pops plus one,
+// so 4 slots of headroom is slack; the check is a single unsigned comparison
+// against a local, not append's capacity test plus call plus slice-header
+// write-back at every push site.
+const (
+	stackMax  = 65536 // mirrors the C VM's `static Value stack[65536]`
+	stackInit = 256
+)
+
+// growStack: out of line, because it runs once per doubling and inlining it
+// into the dispatch loop would cost code size on the path that never takes it.
+func growStack(s []Value) []Value {
+	n := len(s) * 2
+	if n > stackMax {
+		n = stackMax
+	}
+	if n == len(s) {
+		// Already at the ceiling. The C VM's wording, so a program that
+		// overflows reports the same thing on both engines.
+		fatal("malformed .pyro: value stack overflow")
+	}
+	out := make([]Value, n)
+	copy(out, s)
+	return out
+}
+
 func run(p *Program) {
 	code := p.code
-	var stack []Value
-	push := func(v Value) { stack = append(stack, v) }
-	pop := func() Value {
-		n := len(stack) - 1
-		v := stack[n]
-		stack = stack[:n]
-		return v
-	}
+	stack := make([]Value, stackInit)
+	sp := 0
 
 	main := p.funcs[p.entryFn]
 	frames := []frame{{retpc: -1, locals: make([]Value, main.nlocals), fn: p.entryFn}}
@@ -927,8 +979,8 @@ func run(p *Program) {
 		}
 		h := handlers[len(handlers)-1]
 		handlers = handlers[:len(handlers)-1]
-		if h.sp <= len(stack) {
-			stack = stack[:h.sp]
+		if h.sp <= sp {
+			sp = h.sp
 		}
 		frames = frames[:h.fp]
 		// An exception can unwind several frames at once; without this the
@@ -949,9 +1001,9 @@ func run(p *Program) {
 	// was before concurrency existed, so a single-task program pays nothing.
 	tasks := []*task{{id: 0, awaiting: -1}}
 	cur := tasks[0]
-	save := func() { cur.stack, cur.frames, cur.pc, cur.handlers = stack, frames, pc, handlers }
+	save := func() { cur.stack, cur.sp, cur.frames, cur.pc, cur.handlers = stack, sp, frames, pc, handlers }
 	load := func() {
-		stack, frames, pc, handlers = cur.stack, cur.frames, cur.pc, cur.handlers
+		stack, sp, frames, pc, handlers = cur.stack, cur.sp, cur.frames, cur.pc, cur.handlers
 		profSet(frames[len(frames)-1].fn)
 	}
 
@@ -1032,33 +1084,52 @@ func run(p *Program) {
 				return
 			}
 		}
+		// 13.4 — headroom for this instruction's pushes. One unsigned compare
+		// against a local; the growth itself is out of line and runs at most
+		// log2(stackMax/stackInit) times in a whole program.
+		if sp+4 > len(stack) {
+			stack = growStack(stack)
+		}
 		op := code[pc]
 		pc++
 		switch op {
 		case opHALT:
 			return
 		case opCONST:
-			push(p.consts[rd16()])
+			stack[sp] = p.consts[rd16()]
+			sp++
 		case opTRUE:
-			push(vBool(true))
+			stack[sp] = vBool(true)
+			sp++
 		case opFALSE:
-			push(vBool(false))
+			stack[sp] = vBool(false)
+			sp++
 		case opNULL:
-			push(vNull())
+			stack[sp] = vNull()
+			sp++
 		case opPOP:
-			pop()
+			sp--
 		case opLOAD:
-			push(frames[len(frames)-1].locals[rd16()])
+			stack[sp] = frames[len(frames)-1].locals[rd16()]
+			sp++
 		case opSTORE:
-			frames[len(frames)-1].locals[rd16()] = pop()
+			// rd16() advances pc, so the slot is read BEFORE the pop that
+			// feeds it — writing `locals[rd16()] = stack[sp-1]; sp--` would be
+			// the same order, but spelling the pop out first keeps every site
+			// in this switch reading the same way.
+			slot := rd16()
+			sp--
+			frames[len(frames)-1].locals[slot] = stack[sp]
 		case opGETGLOBAL:
 			i := int(rd16())
 			if i >= len(globals) {
 				// Reading before the initialiser ran. The compiler emits the
 				// initialiser first, so this is defensive rather than reachable.
-				push(Value{k: kNull})
+				stack[sp] = Value{k: kNull}
+				sp++
 			} else {
-				push(globals[i])
+				stack[sp] = globals[i]
+				sp++
 			}
 		case opSETGLOBAL:
 			i := int(rd16())
@@ -1067,35 +1138,38 @@ func run(p *Program) {
 			for len(globals) <= i {
 				globals = append(globals, Value{k: kNull})
 			}
-			globals[i] = pop()
+			sp--
+			globals[i] = stack[sp]
 		case opADD, opSUB, opMUL, opDIV, opMOD,
 			opBAND, opBOR, opBXOR, opSHL, opSHR,
 			opEQ, opNE, opLT, opGT, opLE, opGE:
-			b := pop()
-			a := pop()
-			push(binOp(op, a, b))
+			sp -= 2
+			stack[sp] = binOp(op, stack[sp], stack[sp+1])
+			sp++
 		case opNEG:
-			a := pop()
+			a := stack[sp-1]
 			if a.k == kFloat {
-				push(vFloat(-a.f))
+				stack[sp-1] = vFloat(-a.f)
 			} else {
-				push(vInt(-a.i))
+				stack[sp-1] = vInt(-a.i)
 			}
 		case opBNOT:
-			push(vInt(^pop().i))
+			stack[sp-1] = vInt(^stack[sp-1].i)
 		case opNOT:
-			push(vBool(!pop().truthy()))
+			stack[sp-1] = vBool(!stack[sp-1].truthy())
 		case opJMP:
 			rel := rdi32()
 			pc += rel
 		case opJMPF:
 			rel := rdi32()
-			if !pop().truthy() {
+			sp--
+			if !stack[sp].truthy() {
 				pc += rel
 			}
 		case opJMPT:
 			rel := rdi32()
-			if pop().truthy() {
+			sp--
+			if stack[sp].truthy() {
 				pc += rel
 			}
 		case opCALL:
@@ -1104,27 +1178,29 @@ func run(p *Program) {
 			pc++
 			fn := p.funcs[fi]
 			locals := make([]Value, fn.nlocals)
-			base := len(stack) - argc
-			copy(locals, stack[base:])
-			stack = stack[:base]
+			base := sp - argc
+			copy(locals, stack[base:sp])
+			sp = base
 			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi})
 			profSet(fi)
 			pc = int(fn.entry)
 		case opPUSHFN:
-			push(vFunc(int64(rd16())))
+			stack[sp] = vFunc(int64(rd16()))
+			sp++
 		case opCLOSURE:
 			fi := int64(rd16())
 			ncap := int(code[pc])
 			pc++
-			base := len(stack) - ncap
+			base := sp - ncap
 			cap := make([]Value, ncap)
-			copy(cap, stack[base:])
-			stack = stack[:base]
-			push(vClosure(fi, cap))
+			copy(cap, stack[base:sp])
+			sp = base
+			stack[sp] = vClosure(fi, cap)
+			sp++
 		case opCALLVALUE:
 			argc := int(code[pc])
 			pc++
-			base := len(stack) - argc
+			base := sp - argc
 			fnval := stack[base-1]
 			if fnval.k != kFunc {
 				fatal("call of a non-function value")
@@ -1138,13 +1214,14 @@ func run(p *Program) {
 				ncap = len(*fnval.arr)
 				copy(locals, *fnval.arr)
 			}
-			copy(locals[ncap:], stack[base:])
-			stack = stack[:base-1] // drop the args and the fn value beneath them
+			copy(locals[ncap:], stack[base:sp])
+			sp = base - 1 // drop the args and the fn value beneath them
 			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi})
 			profSet(fi)
 			pc = int(fn.entry)
 		case opRET:
-			ret := pop()
+			sp--
+			ret := stack[sp]
 			fr := frames[len(frames)-1]
 			frames = frames[:len(frames)-1]
 			if fr.retpc < 0 {
@@ -1165,14 +1242,17 @@ func run(p *Program) {
 			}
 			profSet(frames[len(frames)-1].fn)
 			pc = fr.retpc
-			push(ret)
+			stack[sp] = ret
+			sp++
 		case opPRINT:
-			fmt.Println(pop().String())
+			sp--
+			fmt.Println(stack[sp].String())
 		case opPRINTLN:
 			fmt.Println()
 		case opASSERT:
-			cond := pop()
-			msg := pop()
+			sp -= 2
+			cond := stack[sp+1]
+			msg := stack[sp]
 			if !cond.truthy() {
 				if !raise(vStr("[Cryo Assert] " + msg.String())) {
 					fatal("[Cryo Assert] " + msg.String())
@@ -1182,79 +1262,79 @@ func run(p *Program) {
 			rel := rdi32()
 			slot := rd16()
 			handlers = append(handlers, handler{
-				catchPC: pc + rel, sp: len(stack), fp: len(frames), slot: slot})
+				catchPC: pc + rel, sp: sp, fp: len(frames), slot: slot})
 		case opTRYPOP:
 			if len(handlers) > 0 {
 				handlers = handlers[:len(handlers)-1]
 			}
 		case opTHROW:
-			v := pop()
+			sp--
+			v := stack[sp]
 			if !raise(v) {
 				fatal("uncaught exception: " + v.String())
 			}
 		case opCOALESCE:
-			b := pop()
-			a := pop()
-			if a.k == kNull {
-				push(b)
-			} else {
-				push(a)
+			sp -= 2
+			if stack[sp].k == kNull {
+				stack[sp] = stack[sp+1]
 			}
+			sp++
 		case opUNWRAP:
-			a := pop()
-			if a.k == kNull {
+			if stack[sp-1].k == kNull {
+				sp--
 				if !raise(vStr("[Cryo Security] unwrap of null value")) {
 					fatal("[Cryo Security] unwrap of null value")
 				}
-			} else {
-				push(a)
 			}
 		case opNEWARR:
 			n := rd16()
-			base := len(stack) - n
+			base := sp - n
 			elems := make([]Value, n)
-			copy(elems, stack[base:])
-			stack = stack[:base]
-			push(vArr(elems))
+			copy(elems, stack[base:sp])
+			sp = base
+			stack[sp] = vArr(elems)
+			sp++
 		case opNEWMAP:
 			n := rd16()
-			base := len(stack) - 2*n
+			base := sp - 2*n
 			mm := make(map[any]Value, n)
 			for j := 0; j < n; j++ {
 				mm[keyOf(stack[base+2*j])] = stack[base+2*j+1]
 			}
-			stack = stack[:base]
-			push(vMap(mm))
+			sp = base
+			stack[sp] = vMap(mm)
+			sp++
 		case opINDEX:
-			key := pop()
-			cont := pop()
-			push(indexGet(cont, key))
+			sp -= 2
+			stack[sp] = indexGet(stack[sp], stack[sp+1])
+			sp++
 		case opSETIDX:
-			val := pop()
-			key := pop()
-			cont := pop()
-			indexSet(cont, key, val)
+			sp -= 3
+			indexSet(stack[sp], stack[sp+1], stack[sp+2])
 		case opLEN:
-			push(vInt(lengthOf(pop())))
+			stack[sp-1] = vInt(lengthOf(stack[sp-1]))
 		case opAPPEND:
-			val := pop()
-			arr := pop()
+			sp -= 2
+			arr := stack[sp]
 			if arr.k != kArray {
 				fatal("push on a non-array value")
 			}
-			*arr.arr = append(*arr.arr, val)
-			push(vInt(int64(len(*arr.arr))))
+			*arr.arr = append(*arr.arr, stack[sp+1])
+			stack[sp] = vInt(int64(len(*arr.arr)))
+			sp++
 		case opHAS:
-			key := pop()
-			mp := pop()
+			sp -= 2
+			mp := stack[sp]
 			if mp.k != kMap {
-				push(vBool(false))
+				stack[sp] = vBool(false)
 			} else {
-				_, ok := mp.m[keyOf(key)]
-				push(vBool(ok))
+				_, ok := mp.m[keyOf(stack[sp+1])]
+				stack[sp] = vBool(ok)
 			}
+			sp++
 		case opKEYS:
-			mp := pop()
+			sp--
+			mp := stack[sp]
 			if mp.k != kMap {
 				fatal("keys() applied to a non-map value")
 			}
@@ -1263,9 +1343,11 @@ func run(p *Program) {
 			for i, k := range ks {
 				out[i] = keyToValue(k)
 			}
-			push(vArr(out))
+			stack[sp] = vArr(out)
+			sp++
 		case opSPAWN:
-			fnval := pop()
+			sp--
+			fnval := stack[sp]
 			if fnval.k != kFunc {
 				fatal("spawn of a non-function value")
 			}
@@ -1276,17 +1358,23 @@ func run(p *Program) {
 				copy(locals, *fnval.arr) // captured values lead the locals
 			}
 			nt := &task{
-				id:      len(tasks),
+				id: len(tasks),
+				// Its own operand stack, allocated here rather than left nil:
+				// with an index-based stack there is no append to grow one on
+				// first use, and load() would hand the interpreter a nil slice.
+				stack:    make([]Value, stackInit),
 				awaiting: -1,
-				frames:  []frame{{retpc: -1, locals: locals, fn: fi}},
-				pc:      int(fn.entry),
+				frames:   []frame{{retpc: -1, locals: locals, fn: fi}},
+				pc:       int(fn.entry),
 			}
 			tasks = append(tasks, nt)
 			// The spawner keeps running: `spawn` fires work off, it does not
 			// hand over. The new task runs at the spawner's next yield.
-			push(vFuture(int64(nt.id)))
+			stack[sp] = vFuture(int64(nt.id))
+			sp++
 		case opAWAIT:
-			fv := pop()
+			sp--
+			fv := stack[sp]
 			if fv.k != kFuture {
 				fatal("await of a non-future value")
 			}
@@ -1296,14 +1384,16 @@ func run(p *Program) {
 			}
 			if tasks[tid].done {
 				cur.awaiting = -1
-				push(tasks[tid].result)
+				stack[sp] = tasks[tid].result
+				sp++
 				break
 			}
 			// Not ready. Put the future back and rewind to this instruction, so
 			// resuming re-executes the await instead of finishing it inside
 			// whichever task runs next — the switch below changes the working
 			// set out from under this case.
-			push(fv)
+			stack[sp] = fv
+			sp++
 			pc--
 			cur.awaiting = tid
 			save()
@@ -1315,10 +1405,10 @@ func run(p *Program) {
 			nid := int(code[pc])
 			argc := int(code[pc+1])
 			pc += 2
-			base := len(stack) - argc
+			base := sp - argc
 			args := make([]Value, argc)
-			copy(args, stack[base:])
-			stack = stack[:base]
+			copy(args, stack[base:sp])
+			sp = base
 			// 12.5 — sleep is the yield point, and the only one. A task that
 			// waits lets the others run, which is the whole reason to spawn:
 			// five tasks sleeping 30ms cost 30ms, not 150ms. With no other
@@ -1327,7 +1417,8 @@ func run(p *Program) {
 			if nid == 26 && argc == 1 && len(tasks) > 1 {
 				cur.sleeping = true
 				cur.wakeAt = time.Now().Add(time.Duration(nativeInt(args[0])) * time.Millisecond)
-				push(vNull()) // sleep's own result, left for the resumed task
+				stack[sp] = vNull() // sleep's own result, left for the resumed task
+				sp++
 				save()
 				if !pick() {
 					deadlock()
@@ -1335,7 +1426,8 @@ func run(p *Program) {
 				load()
 				break
 			}
-			push(native(nid, args))
+			stack[sp] = native(nid, args)
+			sp++
 		default:
 			fatal(fmt.Sprintf("unknown opcode 0x%02X at pc=%d", op, pc-1))
 		}

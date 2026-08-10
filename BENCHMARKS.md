@@ -15,12 +15,48 @@ change means nothing until both of those pass.
 
 | Program | .pyro | Go VM | C VM | go/c |
 |---|---:|---:|---:|---:|
+| `arith` | 182 B | 261 ms | — | — |
+| `calls` | 199 B | 44 ms | — | — |
+| `fib` | 148 B | 28 ms | — | — |
+| `array` | 211 B | 102 ms | — | — |
+| `branch` | 257 B | 172 ms | — | — |
+| `strings` | 156 B | 38 ms | — | — |
+
+> **`--save` only writes the table above.** Everything below it is written by
+> hand and `bench_vm.py --save` **deletes it** — the generator emits the header,
+> the table and "What each program isolates", nothing else. Copy the prose out
+> before running `--save` and paste it back, which is what was done for this
+> revision. Fixing the generator to append rather than truncate is worth doing;
+> until then, this warning is the safeguard.
+
+### The C VM column is not from this run
+
+There is no C toolchain on the machine that produced the table above, so
+`bench_vm.py` skipped the C VM entirely. The previous record, which had both,
+is kept here so the comparison is not silently lost:
+
+| Program | .pyro | Go VM | C VM | go/c |
+|---|---:|---:|---:|---:|
 | `arith` | 158 B | 297 ms | 272 ms | 1.09× |
 | `calls` | 175 B | 55 ms | 48 ms | 1.13× |
 | `fib` | 140 B | 31 ms | 19 ms | 1.63× |
 | `array` | 179 B | 66 ms | 40 ms | 1.65× |
 | `branch` | 217 B | 187 ms | 178 ms | 1.05× |
 | `strings` | 140 B | 33 ms | 44 ms | 0.76× |
+
+Two reasons not to read the Go VM columns as a before/after of the 13.4 change:
+
+- **The `.pyro` files are not the same programs.** Every one grew (158 → 182 B
+  on `arith`) because the front end moved between the two records. Different
+  bytecode, different work.
+- **`bench_vm.py` does not warm the binaries or alternate their order**, and
+  11.22 measured both of those as worth up to 15% on their own. `array` reading
+  66 ms then 102 ms across the two records is that, not a regression — the A/B
+  harness below, which does warm and alternate, has it at 58–66 ms on both VMs.
+
+The tracked table is a **record of the machine at a point in time**. A change to
+the VM is measured by the A/B procedure below, on one set of `.pyro` files and
+two binaries built from one source tree, never by diffing two `--save` runs.
 
 ## What each program isolates
 
@@ -32,6 +68,7 @@ change means nothing until both of those pass.
 | `array` | indexed reads and writes, with their bounds checks |
 | `branch` | unpredictable branching, where indirect-branch prediction shows |
 | `strings` | library-dominated work, as a control for how much dispatch matters at all |
+
 ## Computed-goto threading: measured, and not adopted
 
 Roadmap 11.22 asked for threaded dispatch in the C VM. It was implemented —
@@ -261,3 +298,155 @@ the 20%, and can be measured against these numbers rather than assumed.
 
 Note `fib` is too short to sample at the default rate (30ms, zero samples).
 Profiling it needs a larger iteration count; the numbers above are `arith`.
+
+## 13.4 — the operand stack: measured, and adopted
+
+The profile above said one fifth of the VM's time was operand-stack traffic and
+7% was the arithmetic. This is the change that acts on it, and the numbers that
+decided its shape.
+
+### What changed
+
+`run()`'s operand stack was a `[]Value` grown with `append`, behind two
+closures:
+
+```go
+var stack []Value
+push := func(v Value) { stack = append(stack, v) }
+pop  := func() Value  { n := len(stack) - 1; v := stack[n]; stack = stack[:n]; return v }
+```
+
+Every push was a capacity test, a possible `growslice`, and a slice-header
+write-back; every pop a re-slice. Both went through an indirect call the
+compiler cannot inline — `save`/`load` capture them, so the closures and the
+stack live on the heap, which is also why they showed up in the profile as
+`main.run.func1` and `main.run.func2` rather than being folded into `main.run`.
+
+It is now a slice indexed by an integer `sp`, written out at all 31 use sites:
+`stack[sp] = v; sp++` and `sp--; v := stack[sp]`. No closures, no append, no
+slice-header traffic.
+
+### The first version was wrong, and the control caught it
+
+Pre-sizing to the full 65536 slots up front measured **−12.4%** overall — and
+**+10% on `strings`**, the allocation-heavy program, reproducibly and well
+outside its noise band.
+
+`Value` holds a string, a slice pointer and a map, so 65536 of them is 4 MB that
+the garbage collector must scan on every cycle whether the program uses two
+slots or twenty thousand. `GODEBUG=gctrace=1` on `strings`:
+
+| | GC cycles | GC share of runtime | live heap |
+|---|---:|---:|---:|
+| append (before) | 69 | 4% | ~1 MB |
+| pre-sized 65536 | 35 | **13%** | ~5–6 MB |
+
+Fewer collections, each far more expensive. So the stack starts at 256 slots and
+doubles, capped at 65536, with one headroom check per instruction — the same
+place and shape the C VM has always had it. `strings` returns to its noise band
+and nothing else regresses.
+
+### The floor, measured first
+
+Two copies of one binary, alternating, both warmed on each program before any
+sample is taken:
+
+| A/A control | total, min | total, median |
+|---|---:|---:|
+| `new.exe` vs an identical copy | +0.73% | +1.03% |
+
+Per program the floor is wider than the total — ±2.7% on `array`, ±5% on
+`strings` — because the short programs swing more. Anything inside those bands
+is not a result.
+
+### The result
+
+Same six `.pyro` files, two binaries built from one source tree each, 11
+alternating reps, start-up subtracted:
+
+| Program | append | pre-sized + `sp` | min | median |
+|---|---:|---:|---:|---:|
+| `arith` | 291 ms | 255 ms | **−12.2%** | −3.1% |
+| `calls` | 51 ms | 44 ms | **−13.7%** | −16.3% |
+| `fib` | 27 ms | 26 ms | −4.4% | −6.6% |
+| `array` | 65 ms | 58 ms | **−10.7%** | −6.1% |
+| `branch` | 178 ms | 156 ms | **−12.5%** | −15.6% |
+| `strings` | 36 ms | 37 ms | +3.3% | +7.2% |
+| **total** | **647 ms** | **576 ms** | **−11.0%** | −7.4% |
+
+And with the binaries in the opposite slots, which is what separates a result
+from an artefact of position:
+
+| | total, min | total, median |
+|---|---:|---:|
+| old in slot A, new in slot B | −11.0% | −7.4% |
+| new in slot A, old in slot B | **+11.7%** | +9.2% |
+
+The sign follows the change, the magnitude is stable across orientations, and
+both are an order of magnitude outside the ±1% floor. `strings` is the one
+program that does not move consistently: +3.3% in one orientation and −7.3% in
+the other, which is noise rather than a small regression.
+
+**Roughly 11% faster overall**, and it is the first of the three attempts on
+this loop to survive its own control. 11.22's threading attacked instruction
+*selection* and lost 3%; the guard reshuffle won 4.5%; this attacks the operand
+traffic the profile actually pointed at.
+
+### One behaviour change, deliberate
+
+The Go VM used to grow its operand stack without limit. It now aborts at 65532
+slots with the C VM's own wording:
+
+```
+[Pyro VM] malformed .pyro: value stack overflow
+```
+
+That is a **parity fix, not a new limit**. `static Value stack[65536]` and the
+guard against it have been in `Pyro/vm/main.c` all along, so a program deep
+enough to hit this already aborted on the C VM and the AOT while the Go VM
+carried on — invariant 1 broken in the direction that is hardest to notice,
+since the engine that disagrees is the one that appears to work. A
+200,000-deep recursion is the shape that reaches it.
+
+**This has not been run against the C VM.** There is no C toolchain on this
+machine, so `test_c_vm.py` exits early and the matching abort text is verified
+by reading `main.c`, not by executing it. It needs a machine with gcc before the
+parity claim is more than an argument.
+
+### Correctness, checked before speed
+
+`test_smoke` 557, `test_parity` 200, `test_selfhost` 101, `test_bootstrap` 6,
+`test_examples` 43, `test_concurrency` 33, `test_fuzz` 6, `test_aot` 11, and
+`difftest.py --runs 60` at 60/60 agreeing across pyro/node/go.
+
+`test_bootstrap` is the load-bearing one: the self-hosted compiler's fixed point
+runs entirely on this interpreter, so a stack-indexing error that only appeared
+under one push/pop sequence would break it. `test_concurrency` matters for a
+second reason — each task owns its own operand stack, and `save`/`load` now
+carry `sp` alongside it.
+
+`test_c_vm.py` is the gate this change most wants and the one that could not
+run.
+
+### Reproducing
+
+`bench_vm.py` cannot answer this question — it neither warms the binaries nor
+alternates their order, and diffing two `--save` runs compares two
+machines-in-time rather than two versions of the code. The A/B harness is
+`Burnout/tests/bench_ab.py`, added with this change:
+
+```bash
+python Burnout/tests/bench_ab.py                    # HEAD vs the working tree
+python Burnout/tests/bench_ab.py --only arith --reps 21
+```
+
+It builds both sides from their own directory, compiles one set of `.pyro`
+files that both then run, warms each binary on each program, alternates which
+side goes first, subtracts start-up, and reports the A/A control plus **both**
+A/B orientations. It ends by saying which of the three readings you have:
+inside the floor (not a result), sign did not flip (position, not code), or a
+real change.
+
+Run the A/A control first and believe it. An A/A that does not come back near
+zero means the measurement is broken and every number taken under it is
+worthless — which is exactly what happened in 11.22, twice.
