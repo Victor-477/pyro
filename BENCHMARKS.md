@@ -15,12 +15,12 @@ change means nothing until both of those pass.
 
 | Program | .pyro | Go VM | C VM | go/c |
 |---|---:|---:|---:|---:|
-| `arith` | 182 B | 261 ms | — | — |
-| `calls` | 199 B | 44 ms | — | — |
-| `fib` | 148 B | 28 ms | — | — |
-| `array` | 211 B | 102 ms | — | — |
-| `branch` | 257 B | 172 ms | — | — |
-| `strings` | 156 B | 38 ms | — | — |
+| `arith` | 182 B | 232 ms | — | — |
+| `calls` | 199 B | 40 ms | — | — |
+| `fib` | 148 B | 24 ms | — | — |
+| `array` | 211 B | 57 ms | — | — |
+| `branch` | 257 B | 147 ms | — | — |
+| `strings` | 156 B | 32 ms | — | — |
 
 > **`--save` only writes the table above.** Everything below it is written by
 > hand and `bench_vm.py --save` **deletes it** — the generator emits the header,
@@ -450,3 +450,38 @@ real change.
 Run the A/A control first and believe it. An A/A that does not come back near
 zero means the measurement is broken and every number taken under it is
 worthless — which is exactly what happened in 11.22, twice.
+
+### Re-verified 2026-08-11 — the floor, and what could not be re-run
+
+The change was re-checked on the same machine. **The A/A control reproduces**,
+which is the reading that licenses every other number here:
+
+| A/A control, 11 reps | total, min | total, median |
+|---|---:|---:|
+| working tree vs an identical copy | **−1.02%** | −0.78% |
+
+Same ~1% band as the original run (+0.73% / +1.03%); the sign of a floor is
+meaningless, its magnitude is the point. Per program it is again wider than the
+total — −4.7% `calls`, −4.1% `fib`, −3.6% `strings`, under ±1% on the three long
+ones — so the short programs still cannot carry a result on their own. The
+tracked **−11.0%** is an order of magnitude outside this band and stands.
+
+The table at the top of this file was regenerated the same day. Every program
+is at or below its previous record (`arith` 261→232 ms, `array` 102→57,
+`branch` 172→147, `fib` 28→24, `calls` 44→40, `strings` 38→32) — but that
+comparison is worth **nothing** on its own and is recorded only because the
+table is dated: two `--save` runs are two machines-in-time, which is the exact
+mistake `bench_ab.py` exists to prevent. It is consistent with the optimisation
+being in place; it is not evidence of it.
+
+**What could not be re-run:** the A/B legs. `bench_ab.py` builds side A with
+`git show <ref>:vm/main.go`, and this working copy is not a git repository, so
+the pre-13.4 `main.go` is not reachable and the −11.0% / +11.7% pair was not
+re-derived. Reconstructing the append-and-closure version by hand to stand in
+for it was rejected: a stand-in that is not the historical code gives a number
+that looks like a measurement and is not one, which is worse than the gap.
+
+Correctness was re-run in full: `test_smoke` 557 pass, `test_fuzz` 6 pass,
+`test_concurrency` 33 pass. **`test_c_vm` still skips** — no C toolchain on this
+machine — so the 65532-slot overflow abort that this change added to match
+`main.c` remains unexecuted against the C VM, exactly as flagged above.
