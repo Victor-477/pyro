@@ -925,9 +925,39 @@ func indexSet(cont, key, val Value) {
 // against a local, not append's capacity test plus call plus slice-header
 // write-back at every push site.
 const (
-	stackMax  = 65536 // mirrors the C VM's `static Value stack[65536]`
-	stackInit = 256
+	// Every bounded resource the C VM has, with the C VM's own size. A Go VM
+	// that grows where the C VM is fixed ACCEPTS PROGRAMS THE C VM ABORTS ON,
+	// which is invariant 1 broken in the direction that is hardest to notice:
+	// the engine that disagrees is the one that appears to work. 13.4 applied
+	// that reasoning to the value stack and mirrored only that one; the other
+	// two were found by 14.1 writing the parity test for runaway recursion and
+	// discovering the two engines abort at different depths with different
+	// messages — 4095 frames and "call stack overflow" on C, 65531 frames and
+	// "value stack overflow" on Go.
+	stackMax   = 65536 // mirrors `static Value stack[65536]`   (main.c:61)
+	frameMax   = 4096  // mirrors `static Frame frames[4096]`   (main.c:57)
+	handlerMax = 4096  // mirrors `static Handler handlers[4096]` (main.c:59)
+	stackInit  = 256
 )
+
+// checkFrames / checkHandlers: the C VM's guards, in the C VM's shape.
+//
+// `> max-2` rather than `>= max` is not arbitrary — it is main.c:574 and
+// main.c:819 exactly, so both engines abort while pushing the SAME call, and
+// the stack traces this suite compares byte for byte are the same length.
+// Bounded here, not per instruction: these two stacks only move on a call, a
+// return and a try (the 11.22 note in main.c says the same).
+func checkFrames(n int) {
+	if n > frameMax-2 {
+		fatal("malformed .pyro: call stack overflow (runaway recursion?)")
+	}
+}
+
+func checkHandlers(n int) {
+	if n > handlerMax-2 {
+		fatal("malformed .pyro: exception handler stack overflow")
+	}
+}
 
 // growStack: out of line, because it runs once per doubling and inlining it
 // into the dispatch loop would cost code size on the path that never takes it.
@@ -1181,6 +1211,7 @@ func run(p *Program) {
 			base := sp - argc
 			copy(locals, stack[base:sp])
 			sp = base
+			checkFrames(len(frames))
 			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi})
 			profSet(fi)
 			pc = int(fn.entry)
@@ -1216,6 +1247,7 @@ func run(p *Program) {
 			}
 			copy(locals[ncap:], stack[base:sp])
 			sp = base - 1 // drop the args and the fn value beneath them
+			checkFrames(len(frames))
 			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi})
 			profSet(fi)
 			pc = int(fn.entry)
@@ -1261,6 +1293,7 @@ func run(p *Program) {
 		case opTRYPUSH:
 			rel := rdi32()
 			slot := rd16()
+			checkHandlers(len(handlers))
 			handlers = append(handlers, handler{
 				catchPC: pc + rel, sp: sp, fp: len(frames), slot: slot})
 		case opTRYPOP:
