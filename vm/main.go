@@ -594,6 +594,14 @@ type frame struct {
 	retpc  int
 	locals []Value
 	fn     int // function index (for stack trace)
+	// localsBase mirrors the C Frame's `locals_base`: this frame's offset
+	// into the single `locals_stack[65536]` the C VM carves every frame's
+	// locals out of. Go allocates each frame's locals on the heap and so
+	// cannot overflow that array — but it must still ABORT WHERE C DOES, or
+	// the two engines disagree about which programs are runnable. Kept in the
+	// frame rather than as a running counter so unwinding needs no bookkeeping:
+	// it is always re-derived from the frame below (see nextLocalsBase).
+	localsBase int
 }
 
 // exception handler (try/catch). Per-task: an unwind must not cross into
@@ -934,7 +942,8 @@ const (
 	// discovering the two engines abort at different depths with different
 	// messages — 4095 frames and "call stack overflow" on C, 65531 frames and
 	// "value stack overflow" on Go.
-	stackMax   = 65536 // mirrors `static Value stack[65536]`   (main.c:61)
+	stackMax   = 65536 // mirrors `static Value stack[65536]`        (main.c:61)
+	localsMax  = 65536 // mirrors `static Value locals_stack[65536]` (main.c:63)
 	frameMax   = 4096  // mirrors `static Frame frames[4096]`   (main.c:57)
 	handlerMax = 4096  // mirrors `static Handler handlers[4096]` (main.c:59)
 	stackInit  = 256
@@ -956,6 +965,32 @@ func checkFrames(n int) {
 func checkHandlers(n int) {
 	if n > handlerMax-2 {
 		fatal("malformed .pyro: exception handler stack overflow")
+	}
+}
+
+// nextLocalsBase: where the next frame's locals would start in the C VM's
+// `locals_stack`. Derived from the top frame, so it is correct after a return
+// or an exception unwind without either path having to adjust a counter.
+func nextLocalsBase(frames []frame) int {
+	if len(frames) == 0 {
+		return 0
+	}
+	top := frames[len(frames)-1]
+	return top.localsBase + len(top.locals)
+}
+
+// checkLocals: the C VM writes `locals_stack[next_base + i]` for every local of
+// the callee (main.c:565, main.c:616) and bounded NONE of it — with frames now
+// capped at 4095, a function with 17 locals recursing to ~3900 puts next_base
+// past 65536 and the C VM writes off the end of a static array. That is memory
+// corruption from a VALID program, not from malformed bytecode.
+//
+// Checked BEFORE the frame guard because that is the order the C VM's writes
+// happen in: it fills the locals and only then tests `fp`, so when a deep
+// recursion would trip both, the locals limit is the one that reports.
+func checkLocals(base, nlocals int) {
+	if base+nlocals > localsMax-2 {
+		fatal("malformed .pyro: locals stack overflow (runaway recursion?)")
 	}
 }
 
@@ -1207,12 +1242,14 @@ func run(p *Program) {
 			argc := int(code[pc])
 			pc++
 			fn := p.funcs[fi]
+			lbase := nextLocalsBase(frames)
+			checkLocals(lbase, int(fn.nlocals))
 			locals := make([]Value, fn.nlocals)
 			base := sp - argc
 			copy(locals, stack[base:sp])
 			sp = base
 			checkFrames(len(frames))
-			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi})
+			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi, localsBase: lbase})
 			profSet(fi)
 			pc = int(fn.entry)
 		case opPUSHFN:
@@ -1238,6 +1275,8 @@ func run(p *Program) {
 			}
 			fi := int(fnval.i)
 			fn := p.funcs[fi]
+			lbase := nextLocalsBase(frames)
+			checkLocals(lbase, int(fn.nlocals))
 			locals := make([]Value, fn.nlocals)
 			// captured values occupy the leading locals, then the arguments
 			ncap := 0
@@ -1248,7 +1287,7 @@ func run(p *Program) {
 			copy(locals[ncap:], stack[base:sp])
 			sp = base - 1 // drop the args and the fn value beneath them
 			checkFrames(len(frames))
-			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi})
+			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi, localsBase: lbase})
 			profSet(fi)
 			pc = int(fn.entry)
 		case opRET:

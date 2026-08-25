@@ -445,6 +445,45 @@ of bounds` (array set), `IndexError: string index out of bounds`;
 not a valid number`; `Sandbox: http_get() blocked by sandbox policy`. Outside
 safety: `[Cryo Assert] <msg>` and `uncaught exception: <value>`.
 
+### 6.1 Resource limits
+
+The interpreter's four stacks are **bounded, at the same sizes, in every
+implementation**. The sizes come from the C VM, whose stacks are fixed arrays;
+the Go VM's grow, so it must stop growing where the C VM runs out or it accepts
+programs the C VM aborts on — invariant 1 broken in the direction hardest to
+notice, since the engine that disagrees is the one that appears to work.
+
+| Resource | Size | Abort message |
+|---|---:|---|
+| operand stack | 65536 | `malformed .pyro: value stack overflow` |
+| call stack | 4096 | `malformed .pyro: call stack overflow (runaway recursion?)` |
+| locals stack | 65536 | `malformed .pyro: locals stack overflow (runaway recursion?)` |
+| handler stack | 4096 | `malformed .pyro: exception handler stack overflow` |
+
+Three rules make the limits observable in the same order on both engines:
+
+- **The call and locals stacks are checked on a call, not per instruction** —
+  they only move on a call, a return and a try — and the operand stack is checked
+  once per instruction, with four slots of headroom, because no instruction
+  pushes more than it pops plus one.
+- **The threshold is `> size - 2`, not `>= size`.** The slack matters less than
+  the fact that both engines use the same expression, so they abort while pushing
+  the *same* call and their stack traces are the same length.
+- **Locals are checked before frames.** A recursion deep enough to trip both
+  reports whichever it reaches first, and the C VM writes the callee's locals
+  before it tests the frame count — so the locals limit is the earlier one.
+
+Which limit a program reaches depends on its frame size: a function with fewer
+than about 16 locals exhausts the 4096 frames first, and one with more exhausts
+the 65536 local slots first. Both are reachable, and so is the operand stack,
+independently of the other two — a 65535-element array literal overflows it
+without exceeding 4095 frames.
+
+> These are per-implementation limits, not language semantics: a program that
+> depends on recursing deeper than 4095 is not portable across the runtimes and
+> never was. Bounding the Go VM did not make such a program invalid, it made the
+> two engines agree about it.
+
 ---
 
 ## 7. Runtime ↔ host boundary

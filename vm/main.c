@@ -561,6 +561,24 @@ void run_program(Program* p) {
                     if (fi >= p->nfuncs) fatal("malformed .pyro: function index out of range");
                     FuncInfo fn = p->funcs[fi];
                     int next_base = frames[fp - 1].locals_base + frames[fp - 1].nlocals;
+                    // 14.1 — bound the LOCALS stack. Nothing did.
+                    // Every local of the callee is written straight into
+                    // locals_stack just below, and with the frame stack capped
+                    // at 4095 a function with 31 locals recursing ~2114 deep
+                    // puts next_base past 65536 — this writes off the end of a
+                    // static array. A valid program, silent memory corruption,
+                    // no diagnostic. Found by the 14.1 audit after the frame
+                    // guard landed, since capping frames is what makes the
+                    // per-frame locals the binding constraint.
+                    //
+                    // Checked HERE, before the writes, and therefore before the
+                    // frame guard further down: whichever limit a deep
+                    // recursion reaches first is the one that reports, and the
+                    // Go VM checks in the same order for the same reason.
+                    if ((unsigned)(next_base + fn.nlocals) >
+                        (unsigned)(int)(sizeof(locals_stack) / sizeof(locals_stack[0])) - 2u) {
+                        fatal("malformed .pyro: locals stack overflow (runaway recursion?)");
+                    }
                     for (int i = 0; i < fn.nlocals; i++) {
                         locals_stack[next_base + i] = val_null();
                     }
@@ -612,6 +630,24 @@ void run_program(Program* p) {
                     if (fi >= p->nfuncs) fatal("malformed .pyro: function index out of range");
                     FuncInfo fn = p->funcs[fi];
                     int next_base = frames[fp - 1].locals_base + frames[fp - 1].nlocals;
+                    // 14.1 — bound the LOCALS stack. Nothing did.
+                    // Every local of the callee is written straight into
+                    // locals_stack just below, and with the frame stack capped
+                    // at 4095 a function with 31 locals recursing ~2114 deep
+                    // puts next_base past 65536 — this writes off the end of a
+                    // static array. A valid program, silent memory corruption,
+                    // no diagnostic. Found by the 14.1 audit after the frame
+                    // guard landed, since capping frames is what makes the
+                    // per-frame locals the binding constraint.
+                    //
+                    // Checked HERE, before the writes, and therefore before the
+                    // frame guard further down: whichever limit a deep
+                    // recursion reaches first is the one that reports, and the
+                    // Go VM checks in the same order for the same reason.
+                    if ((unsigned)(next_base + fn.nlocals) >
+                        (unsigned)(int)(sizeof(locals_stack) / sizeof(locals_stack[0])) - 2u) {
+                        fatal("malformed .pyro: locals stack overflow (runaway recursion?)");
+                    }
                     for (int i = 0; i < fn.nlocals; i++) {
                         locals_stack[next_base + i] = val_null();
                     }
