@@ -1,0 +1,15 @@
+C:\Users\senai\Desktop\Projetos\Pyro_Cryo\build\pyrovm_cs.exe
+C:\Users\senai\Desktop\Projetos\Pyro_Cryo\build\pyrovm_cs.deps.json
+C:\Users\senai\Desktop\Projetos\Pyro_Cryo\build\pyrovm_cs.runtimeconfig.json
+C:\Users\senai\Desktop\Projetos\Pyro_Cryo\build\pyrovm_cs.dll
+C:\Users\senai\Desktop\Projetos\Pyro_Cryo\build\pyrovm_cs.pdb
+C:\Users\senai\Desktop\Projetos\Pyro_Cryo\Pyro\vm\csharp\obj\Release\net8.0\PyroVM.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\senai\Desktop\Projetos\Pyro_Cryo\Pyro\vm\csharp\obj\Release\net8.0\PyroVM.AssemblyInfoInputs.cache
+C:\Users\senai\Desktop\Projetos\Pyro_Cryo\Pyro\vm\csharp\obj\Release\net8.0\PyroVM.AssemblyInfo.cs
+C:\Users\senai\Desktop\Projetos\Pyro_Cryo\Pyro\vm\csharp\obj\Release\net8.0\PyroVM.csproj.CoreCompileInputs.cache
+C:\Users\senai\Desktop\Projetos\Pyro_Cryo\Pyro\vm\csharp\obj\Release\net8.0\PyroVM.sourcelink.json
+C:\Users\senai\Desktop\Projetos\Pyro_Cryo\Pyro\vm\csharp\obj\Release\net8.0\pyrovm_cs.dll
+C:\Users\senai\Desktop\Projetos\Pyro_Cryo\Pyro\vm\csharp\obj\Release\net8.0\refint\pyrovm_cs.dll
+C:\Users\senai\Desktop\Projetos\Pyro_Cryo\Pyro\vm\csharp\obj\Release\net8.0\pyrovm_cs.pdb
+C:\Users\senai\Desktop\Projetos\Pyro_Cryo\Pyro\vm\csharp\obj\Release\net8.0\PyroVM.genruntimeconfig.cache
+C:\Users\senai\Desktop\Projetos\Pyro_Cryo\Pyro\vm\csharp\obj\Release\net8.0\ref\pyrovm_cs.dll
