@@ -208,6 +208,21 @@ already on disk, so new builtins only ever append.
 - **`json_encode`/`json_decode`** serialize/deserialize the value tree (object keys
   become maps; JSON integers become `int`).
 - **`http_get`/`http_post`** make network requests; **`sleep(ms)`** pauses.
+  Both return the response body **whatever the status**, and `""` on any
+  failure — bad URL, refused connection, timeout, malformed response.
+  `http_post` sends its body byte for byte (newlines included) with
+  `Content-Type: application/json`. Up to 10 redirects are followed;
+  301/302/303 turn a POST into a GET, 307/308 resend it. The whole exchange is
+  bounded by `PYRO_HTTP_CLIENT_TIMEOUT_MS` (default 15000).
+  In the C runtime (C VM and AOT executables) `http://` is spoken natively
+  over a socket. `https://` goes through `curl` — run as an argument vector
+  with **no shell**, the body on stdin (`--data-binary @-`), `-m` set from the
+  same timeout, redirects limited to http/https — because the runtime ships no
+  TLS stack; `curl.exe` is part of Windows 10 1803+ (`%SystemRoot%\System32`
+  is preferred over `PATH`). Without curl, `https://` yields `""`. Host names
+  are resolved with `gethostbyname`, which the deadline does not bound: address
+  plugins by IP or `localhost`. Neither engine re-checks the sandbox policy on
+  a redirect target.
 - **`write_bytes(path, int[]) -> bool`** writes an integer array as raw bytes
   (each element truncated to `& 0xFF`) to a file — the binary output that lets a
   program on the VM emit a `.pyro` (enables the self-hosted compiler).
@@ -260,6 +275,14 @@ already on disk, so new builtins only ever append.
 
   Requests are served **strictly one at a time**: one listener and one
   in-flight connection, which is what makes this safe with no locking.
+  So that one slow client cannot hold everyone else, a request must arrive
+  **complete** within `PYRO_HTTP_TIMEOUT_MS` of being accepted (default
+  10000) — an absolute deadline, not a per-read timeout, so a client
+  trickling a byte at a time is dropped too — and `http_respond` gets the
+  same budget to write. A request that misses the deadline, whose body is
+  shorter than its `Content-Length`, whose headers exceed 64 KB or whose body
+  exceeds 64 MB is dropped and `http_accept` returns the empty-`method` map.
+  `http_serve` applies the same timeout.
   `http_accept` **always returns a map**, never `null` — a failed or malformed
   request yields an empty `method`. The keys are `method`, `path`, `query`
   and `body`. Calling `http_accept` before `http_listen` aborts; calling it

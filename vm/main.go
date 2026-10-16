@@ -31,8 +31,37 @@ import (
 	"time"
 )
 
-// HTTP client with timeout, shared by network natives
+// HTTP client shared by http_get/http_post. Its Timeout is refreshed from
+// PYRO_HTTP_CLIENT_TIMEOUT_MS on every call (see httpEnvTimeout).
 var httpClient = &http.Client{Timeout: 15 * time.Second}
+
+// HTTP deadlines (ESCOPO L-09 / L-18), mirrored by pyro_runtime.c:
+//
+//	PYRO_HTTP_TIMEOUT_MS         server: read a request / write a response (10000)
+//	PYRO_HTTP_CLIENT_TIMEOUT_MS  http_get/http_post, whole exchange (15000)
+//
+// The server deadline is ABSOLUTE for the whole request, so a client trickling
+// one byte at a time cannot hold the sequential accept loop either.
+const (
+	httpServerTimeoutMs = 10000
+	httpClientTimeoutMs = 15000
+	httpMaxHeader       = 65535            // the C VM's request buffer
+	httpMaxBody         = 64 * 1024 * 1024 // request bodies above this are refused
+)
+
+func httpEnvTimeout(name string, dfltMs int64) time.Duration {
+	ms := dfltMs
+	if s := os.Getenv(name); s != "" {
+		if v, err := strconv.ParseInt(s, 10, 64); err == nil && v > 0 {
+			ms = v
+		}
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func httpServerTimeout() time.Duration {
+	return httpEnvTimeout("PYRO_HTTP_TIMEOUT_MS", httpServerTimeoutMs)
+}
 
 var stdin = bufio.NewReader(os.Stdin)
 
@@ -231,7 +260,7 @@ func httpParseRequest(c net.Conn) (method, path, query, body string, hdrs map[st
 		return "", "", "", "", hdrs, false
 	}
 	parts := strings.Fields(strings.TrimSpace(line))
-	if len(parts) < 2 {
+	if len(parts) < 2 || len(line) > httpMaxHeader {
 		return "", "", "", "", hdrs, false
 	}
 	method, target := parts[0], parts[1]
@@ -241,9 +270,13 @@ func httpParseRequest(c net.Conn) (method, path, query, body string, hdrs map[st
 		path = target
 	}
 	length := 0
+	headerBytes := len(line)
 	for {
 		h, err := r.ReadString('\n')
 		if err != nil {
+			return "", "", "", "", hdrs, false
+		}
+		if headerBytes += len(h); headerBytes > httpMaxHeader {
 			return "", "", "", "", hdrs, false
 		}
 		h = strings.TrimSpace(h)
@@ -258,6 +291,9 @@ func httpParseRequest(c net.Conn) (method, path, query, body string, hdrs map[st
 				length, _ = strconv.Atoi(val)
 			}
 		}
+	}
+	if length > httpMaxBody {
+		return "", "", "", "", hdrs, false
 	}
 	if length > 0 {
 		buf := make([]byte, length)
@@ -1568,24 +1604,33 @@ func goToValue(x interface{}) Value {
 }
 
 // httpGet: simple GET; returns the body, or "" in case of error (like in go).
+// A body cut short (timeout mid-read) is a failure too, as in the C VM.
 func httpGet(url string) string {
+	httpClient.Timeout = httpEnvTimeout("PYRO_HTTP_CLIENT_TIMEOUT_MS", httpClientTimeoutMs)
 	resp, err := httpClient.Get(url)
 	if err != nil {
 		return ""
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
 	return string(b)
 }
 
 // httpPost: POST with body (content-type application/json), like in the go backend.
 func httpPost(url, body string) string {
+	httpClient.Timeout = httpEnvTimeout("PYRO_HTTP_CLIENT_TIMEOUT_MS", httpClientTimeoutMs)
 	resp, err := httpClient.Post(url, "application/json", strings.NewReader(body))
 	if err != nil {
 		return ""
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
 	return string(b)
 }
 
@@ -1797,7 +1842,9 @@ func native(id int, a []Value) Value {
 			fsrv.ServeHTTP(w, r)
 		})
 		fmt.Printf("[pyro] serving %s on http://localhost:%d\n", dir, a[0].i)
-		if err := http.ListenAndServe(fmt.Sprintf(":%d", a[0].i), h); err != nil {
+		srv := &http.Server{Addr: fmt.Sprintf(":%d", a[0].i), Handler: h,
+			ReadTimeout: httpServerTimeout(), WriteTimeout: httpServerTimeout()}
+		if err := srv.ListenAndServe(); err != nil {
 			fatal("http_serve: " + err.Error())
 		}
 		return vNull()
@@ -2023,6 +2070,9 @@ func native(id int, a []Value) Value {
 		if err != nil {
 			return empty()
 		}
+		// An idle or trickling client is dropped at the deadline instead of
+		// holding the sequential server (L-09).
+		c.SetReadDeadline(time.Now().Add(httpServerTimeout()))
 		method, path, query, body, hdrs, ok := httpParseRequest(c)
 		if !ok {
 			c.Close()
@@ -2052,6 +2102,8 @@ func native(id int, a []Value) Value {
 			"Content-Type: " + ctype + "\r\n" +
 			"Content-Length: " + strconv.Itoa(len(payload)) + "\r\n" +
 			"Connection: close\r\n\r\n" + payload
+		// A client that stops reading must not hold the server either.
+		httpConn.SetWriteDeadline(time.Now().Add(httpServerTimeout()))
 		_, werr := httpConn.Write([]byte(resp))
 		httpConn.Close()
 		httpConn = nil
