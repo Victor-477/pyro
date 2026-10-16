@@ -2321,12 +2321,30 @@ func binOp(op byte, a, b Value) Value {
 	}
 	x, y := a.i, b.i
 	switch op {
+	// `+ - *` abort on overflow (PYRO_RUNTIME.md: "fail-fast"), with the same
+	// message the go and c backends print. They used to wrap silently, so the
+	// same program printed a wrong number here and panicked there.
 	case opADD:
-		return vInt(x + y)
+		s := x + y
+		if (y > 0 && s < x) || (y < 0 && s > x) {
+			fatal("[Cryo Security] Overflow: integer addition")
+		}
+		return vInt(s)
 	case opSUB:
-		return vInt(x - y)
+		s := x - y
+		if (y < 0 && s < x) || (y > 0 && s > x) {
+			fatal("[Cryo Security] Overflow: integer subtraction")
+		}
+		return vInt(s)
 	case opMUL:
-		return vInt(x * y)
+		if x == 0 || y == 0 {
+			return vInt(0)
+		}
+		s := x * y
+		if (x == -1 && y == -1<<63) || (y == -1 && x == -1<<63) || s/y != x {
+			fatal("[Cryo Security] Overflow: integer multiplication")
+		}
+		return vInt(s)
 	case opDIV:
 		if y == 0 {
 			fatal("[Cryo Security] DivByZero: integer division")

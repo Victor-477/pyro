@@ -4,6 +4,17 @@
 //  NATIVE builtins. Depends on host only for fatal()/pyro_sandboxed.
 //  Semantics specified in PYRO_RUNTIME.md.
 // ============================================================
+
+// Feature-test macro, before ANY header. Under -std=c11 (how the C VM test,
+// the C backend and `cryoc test --backend c` compile) glibc exposes only ISO C,
+// and this file uses POSIX/BSD on top of it: clock_gettime + CLOCK_REALTIME,
+// usleep, popen/pclose, S_IFDIR and the socket API. The C VM failed to build on
+// Linux with "'CLOCK_REALTIME' undeclared". _DEFAULT_SOURCE restores glibc's
+// non-strict default; other libcs ignore it.
+#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
+
 #include "pyro_runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -3109,6 +3120,45 @@ RcString* join_arr(RcArray* arr, const char* sep) {
 }
 
 // ── Binary Operations Implementation ──────────────────────────
+// Checked int64 arithmetic: 1 on overflow, else 0 with the result in *r.
+// Signed overflow is undefined behaviour in C, so the portable branch detects
+// it without performing it (CERT INT32-C); gcc/clang have builtins for it.
+static int pyro_add_ovf(int64_t a, int64_t b, int64_t* r) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_add_overflow(a, b, r);
+#else
+    if ((b > 0 && a > INT64_MAX - b) || (b < 0 && a < INT64_MIN - b)) return 1;
+    *r = a + b;
+    return 0;
+#endif
+}
+
+static int pyro_sub_ovf(int64_t a, int64_t b, int64_t* r) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_sub_overflow(a, b, r);
+#else
+    if ((b < 0 && a > INT64_MAX + b) || (b > 0 && a < INT64_MIN + b)) return 1;
+    *r = a - b;
+    return 0;
+#endif
+}
+
+static int pyro_mul_ovf(int64_t a, int64_t b, int64_t* r) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_mul_overflow(a, b, r);
+#else
+    if (a > 0) {
+        if (b > 0) { if (a > INT64_MAX / b) return 1; }
+        else       { if (b < INT64_MIN / a) return 1; }
+    } else {
+        if (b > 0) { if (a < INT64_MIN / b) return 1; }
+        else       { if (a != 0 && b < INT64_MAX / a) return 1; }
+    }
+    *r = a * b;
+    return 0;
+#endif
+}
+
 Value bin_op(uint8_t op, Value a, Value b) {
     if (op == opADD && (a.kind == VAL_STR || b.kind == VAL_STR)) {
         return str_concat(a, b);
@@ -3148,9 +3198,23 @@ Value bin_op(uint8_t op, Value a, Value b) {
     int64_t x = a.as.i;
     int64_t y = b.as.i;
     switch (op) {
-        case opADD: return val_int(x + y);
-        case opSUB: return val_int(x - y);
-        case opMUL: return val_int(x * y);
+        // `+ - *` abort on overflow, with the go/c backends' messages.
+        // Shared by the C VM, the C++ VM and the AOT route.
+        case opADD: {
+            int64_t r;
+            if (pyro_add_ovf(x, y, &r)) fatal("[Cryo Security] Overflow: integer addition");
+            return val_int(r);
+        }
+        case opSUB: {
+            int64_t r;
+            if (pyro_sub_ovf(x, y, &r)) fatal("[Cryo Security] Overflow: integer subtraction");
+            return val_int(r);
+        }
+        case opMUL: {
+            int64_t r;
+            if (pyro_mul_ovf(x, y, &r)) fatal("[Cryo Security] Overflow: integer multiplication");
+            return val_int(r);
+        }
         case opDIV:
             if (y == 0) {
                 fatal("[Cryo Security] DivByZero: integer division");
