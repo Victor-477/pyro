@@ -10,6 +10,11 @@
 #include <string.h>
 #include <math.h>
 #include <ctype.h>
+// strtoll/strtod report OUT OF RANGE through errno, and to_int/to_number
+// below have to see it. Included here rather than relying on the one inside
+// the POSIX branch of the socket section: that one is in an #else, so on
+// Windows errno was not declared at all.
+#include <errno.h>
 
 // strdup is POSIX, not ISO C: strict modes (-std=c11) hide it, and it would
 // then be implicitly declared as returning int — which truncates the pointer
@@ -2212,9 +2217,19 @@ Value native(int id, Value* a, int argc) {
                         const char* s = a[0].as.str->chars;
                         while (*s && isspace((unsigned char)*s)) s++;
                         char* end;
+                        // errno for OUT OF RANGE. Without it strtoll SATURATES
+                        // — to_int("99999999999999999999") returned
+                        // 9223372036854775807 here while the Go VM aborted, so
+                        // the same program meant two different things on the
+                        // two VMs, and the C one silently turned a typo into
+                        // the largest representable quantity. The Go VM uses
+                        // strconv.ParseInt and fails on any error, range
+                        // included; this now matches it.
+                        errno = 0;
                         long long val = strtoll(s, &end, 10);
+                        int out_of_range = (errno == ERANGE);
                         while (*end && isspace((unsigned char)*end)) end++;
-                        if (*end != '\0' || end == s) {
+                        if (*end != '\0' || end == s || out_of_range) {
                             char err[1024];
                             sprintf(err, "[Cryo Security] to_int: '%s' is not a valid integer", a[0].as.str->chars);
                             fatal(err);   // parity with the Go VM: fail-fast (uncatchable)
@@ -2235,9 +2250,20 @@ Value native(int id, Value* a, int argc) {
                         const char* s = a[0].as.str->chars;
                         while (*s && isspace((unsigned char)*s)) s++;
                         char* end;
+                        // OVERFLOW only, which is what Go's ParseFloat calls a
+                        // range error: to_number("1e999") returned +Inf here
+                        // and aborted on the Go VM. strtod also sets ERANGE on
+                        // UNDERFLOW, where it returns zero or a denormal — and
+                        // there the two VMs already agreed that "1e-999" is 0,
+                        // because Go does not treat underflow as an error. So
+                        // the test is ERANGE *and* infinite, which separates
+                        // the two exactly. A literal "Inf" is unaffected:
+                        // strtod parses it without setting ERANGE.
+                        errno = 0;
                         double val = strtod(s, &end);
+                        int out_of_range = (errno == ERANGE && isinf(val));
                         while (*end && isspace((unsigned char)*end)) end++;
-                        if (*end != '\0' || end == s) {
+                        if (*end != '\0' || end == s || out_of_range) {
                             char err[1024];
                             sprintf(err, "[Cryo Security] to_number: '%s' is not a valid number", a[0].as.str->chars);
                             fatal(err);   // parity with the Go VM: fail-fast (uncatchable)
