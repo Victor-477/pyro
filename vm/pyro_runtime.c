@@ -21,6 +21,11 @@
 #include <string.h>
 #include <math.h>
 #include <ctype.h>
+// strtoll/strtod report OUT OF RANGE through errno, and to_int/to_number
+// below have to see it. Included here rather than relying on the one inside
+// the POSIX branch of the socket section: that one is in an #else, so on
+// Windows errno was not declared at all.
+#include <errno.h>
 
 // strdup is POSIX, not ISO C: strict modes (-std=c11) hide it, and it would
 // then be implicitly declared as returning int — which truncates the pointer
@@ -2223,9 +2228,19 @@ Value native(int id, Value* a, int argc) {
                         const char* s = a[0].as.str->chars;
                         while (*s && isspace((unsigned char)*s)) s++;
                         char* end;
+                        // errno for OUT OF RANGE. Without it strtoll SATURATES
+                        // — to_int("99999999999999999999") returned
+                        // 9223372036854775807 here while the Go VM aborted, so
+                        // the same program meant two different things on the
+                        // two VMs, and the C one silently turned a typo into
+                        // the largest representable quantity. The Go VM uses
+                        // strconv.ParseInt and fails on any error, range
+                        // included; this now matches it.
+                        errno = 0;
                         long long val = strtoll(s, &end, 10);
+                        int out_of_range = (errno == ERANGE);
                         while (*end && isspace((unsigned char)*end)) end++;
-                        if (*end != '\0' || end == s) {
+                        if (*end != '\0' || end == s || out_of_range) {
                             char err[1024];
                             sprintf(err, "[Cryo Security] to_int: '%s' is not a valid integer", a[0].as.str->chars);
                             fatal(err);   // parity with the Go VM: fail-fast (uncatchable)
@@ -2246,9 +2261,20 @@ Value native(int id, Value* a, int argc) {
                         const char* s = a[0].as.str->chars;
                         while (*s && isspace((unsigned char)*s)) s++;
                         char* end;
+                        // OVERFLOW only, which is what Go's ParseFloat calls a
+                        // range error: to_number("1e999") returned +Inf here
+                        // and aborted on the Go VM. strtod also sets ERANGE on
+                        // UNDERFLOW, where it returns zero or a denormal — and
+                        // there the two VMs already agreed that "1e-999" is 0,
+                        // because Go does not treat underflow as an error. So
+                        // the test is ERANGE *and* infinite, which separates
+                        // the two exactly. A literal "Inf" is unaffected:
+                        // strtod parses it without setting ERANGE.
+                        errno = 0;
                         double val = strtod(s, &end);
+                        int out_of_range = (errno == ERANGE && isinf(val));
                         while (*end && isspace((unsigned char)*end)) end++;
-                        if (*end != '\0' || end == s) {
+                        if (*end != '\0' || end == s || out_of_range) {
                             char err[1024];
                             sprintf(err, "[Cryo Security] to_number: '%s' is not a valid number", a[0].as.str->chars);
                             fatal(err);   // parity with the Go VM: fail-fast (uncatchable)
@@ -3068,10 +3094,26 @@ RcArray* split_str(const char* s, const char* sep) {
     int64_t slen = strlen(s);
     int64_t seplen = strlen(sep);
     if (seplen == 0) {
-        for (int64_t i = 0; i < slen; i++) {
-            Value ch = val_str(s + i, 1);
+        /* ONE CHARACTER per element, not one byte. The Go VM reaches this
+         * through Go's strings.Split, whose empty separator steps RUNES, so
+         * split("Ação", "") is four elements there and was six here — with
+         * four half-characters in the middle. chars() is built on this, and
+         * so is every helper built on chars(), which made the C VM corrupt
+         * text that the Go VM handled correctly.
+         *
+         * A malformed sequence yields one byte and moves on, so data read
+         * from a file or a socket cannot stall the loop. */
+        for (int64_t i = 0; i < slen; ) {
+            unsigned char c = (unsigned char)s[i];
+            int64_t n = 1;
+            if      ((c & 0xE0) == 0xC0) n = 2;
+            else if ((c & 0xF0) == 0xE0) n = 3;
+            else if ((c & 0xF8) == 0xF0) n = 4;
+            if (i + n > slen) n = 1;              /* truncated at the end */
+            Value ch = val_str(s + i, (size_t)n);
             rc_array_push(arr, ch);
             release_value(ch);
+            i += n;
         }
         return arr;
     }
