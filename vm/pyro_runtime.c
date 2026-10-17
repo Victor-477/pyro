@@ -3083,10 +3083,26 @@ RcArray* split_str(const char* s, const char* sep) {
     int64_t slen = strlen(s);
     int64_t seplen = strlen(sep);
     if (seplen == 0) {
-        for (int64_t i = 0; i < slen; i++) {
-            Value ch = val_str(s + i, 1);
+        /* ONE CHARACTER per element, not one byte. The Go VM reaches this
+         * through Go's strings.Split, whose empty separator steps RUNES, so
+         * split("Ação", "") is four elements there and was six here — with
+         * four half-characters in the middle. chars() is built on this, and
+         * so is every helper built on chars(), which made the C VM corrupt
+         * text that the Go VM handled correctly.
+         *
+         * A malformed sequence yields one byte and moves on, so data read
+         * from a file or a socket cannot stall the loop. */
+        for (int64_t i = 0; i < slen; ) {
+            unsigned char c = (unsigned char)s[i];
+            int64_t n = 1;
+            if      ((c & 0xE0) == 0xC0) n = 2;
+            else if ((c & 0xF0) == 0xE0) n = 3;
+            else if ((c & 0xF8) == 0xF0) n = 4;
+            if (i + n > slen) n = 1;              /* truncated at the end */
+            Value ch = val_str(s + i, (size_t)n);
             rc_array_push(arr, ch);
             release_value(ch);
+            i += n;
         }
         return arr;
     }
