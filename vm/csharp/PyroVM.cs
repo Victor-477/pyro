@@ -327,7 +327,10 @@ public class VM {
                         double fb = (b.Kind == ValueKind.Float) ? b.F : (double)b.I;
                         _stack[_sp++] = Value.FromFloat(fa + fb);
                     } else {
-                        _stack[_sp++] = Value.FromInt(a.I + b.I);
+                        long ires;
+                        try { ires = checked(a.I + b.I); }
+                        catch (OverflowException) { Fatal("[Cryo Security] Overflow: integer addition"); ires = 0; }
+                        _stack[_sp++] = Value.FromInt(ires);
                     }
                     break;
                 }
@@ -340,7 +343,10 @@ public class VM {
                         double fb = (b.Kind == ValueKind.Float) ? b.F : (double)b.I;
                         _stack[_sp++] = Value.FromFloat(fa - fb);
                     } else {
-                        _stack[_sp++] = Value.FromInt(a.I - b.I);
+                        long ires;
+                        try { ires = checked(a.I - b.I); }
+                        catch (OverflowException) { Fatal("[Cryo Security] Overflow: integer subtraction"); ires = 0; }
+                        _stack[_sp++] = Value.FromInt(ires);
                     }
                     break;
                 }
@@ -353,7 +359,10 @@ public class VM {
                         double fb = (b.Kind == ValueKind.Float) ? b.F : (double)b.I;
                         _stack[_sp++] = Value.FromFloat(fa * fb);
                     } else {
-                        _stack[_sp++] = Value.FromInt(a.I * b.I);
+                        long ires;
+                        try { ires = checked(a.I * b.I); }
+                        catch (OverflowException) { Fatal("[Cryo Security] Overflow: integer multiplication"); ires = 0; }
+                        _stack[_sp++] = Value.FromInt(ires);
                     }
                     break;
                 }
