@@ -1848,6 +1848,84 @@ void pyro_asset_add(char* name, char* data, int64_t len) {
 // ── filesystem helpers (roadmap 11.7) ──────────────────────
 #include <dirent.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#include <wchar.h>
+#endif
+
+// ── M1: a Cryo path is UTF-8; a Windows path is UTF-16 ─────
+//
+// fopen, stat, remove, rename and _mkdir take a path in the process ANSI
+// codepage, so the UTF-8 bytes of an accented path reached the filesystem as
+// their cp1252 reading: pyro_write_file("build/Produção.txt", …) created
+// "ProduÃ§Ã£o.txt" on disk.
+//
+// IT DID NOT FAIL. file_exists, read_file and file_size all agreed
+// afterwards, because they mangled the name the same way — so the program
+// saw a clean round trip while the file was unreachable under the name it
+// believed it had. The GO VM gets this right for free, because Go's os
+// package converts to UTF-16 on Windows, so the same .pyro file produced
+// two different filenames depending on which VM ran it.
+//
+// The POSIX build is untouched: there a path is bytes and fopen already
+// takes UTF-8.
+#ifdef _WIN32
+static wchar_t* pyro_wpath(const char* s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    if (n <= 0) return NULL;
+    wchar_t* w = (wchar_t*)malloc((size_t)n * sizeof(wchar_t));
+    if (!w) return NULL;
+    if (MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n) <= 0) { free(w); return NULL; }
+    return w;
+}
+static FILE* pyro_fopen(const char* path, const char* mode) {
+    wchar_t* wp = pyro_wpath(path);
+    if (!wp) return NULL;
+    wchar_t wm[8];
+    size_t i = 0;
+    for (; mode[i] && i < 7; i++) wm[i] = (wchar_t)(unsigned char)mode[i];
+    wm[i] = L'\0';
+    FILE* f = _wfopen(wp, wm);
+    free(wp);
+    return f;
+}
+// Win32 rather than a CRT stat: MinGW.org's headers do not expose
+// `struct _stat64`, and existence, directory-ness and size are all in one
+// attribute query.
+static int pyro_attrs(const char* path, WIN32_FILE_ATTRIBUTE_DATA* out) {
+    wchar_t* wp = pyro_wpath(path);
+    if (!wp) return -1;
+    BOOL ok = GetFileAttributesExW(wp, GetFileExInfoStandard, out);
+    free(wp);
+    return ok ? 0 : -1;
+}
+static int pyro_remove(const char* path) {
+    wchar_t* wp = pyro_wpath(path);
+    if (!wp) return -1;
+    int r = _wremove(wp);
+    free(wp);
+    return r;
+}
+static int pyro_rename(const char* a, const char* b) {
+    wchar_t* wa = pyro_wpath(a);
+    wchar_t* wb = pyro_wpath(b);
+    int r = (wa && wb) ? _wrename(wa, wb) : -1;
+    free(wa); free(wb);
+    return r;
+}
+static int pyro_mkdir(const char* path) {
+    wchar_t* wp = pyro_wpath(path);
+    if (!wp) return -1;
+    int r = _wmkdir(wp);
+    free(wp);
+    return r;
+}
+#else
+#define pyro_fopen  fopen
+#define pyro_remove remove
+#define pyro_rename rename
+#define pyro_mkdir(p) mkdir((p), 0755)
+#endif
 
 // list_dir sorts its names so the Go VM and this runtime return the same
 // order. Go uses sort.Strings; strcmp gives the same byte ordering.
@@ -1856,9 +1934,15 @@ static int pyro_name_cmp(const void* a, const void* b) {
 }
 
 static int pyro_is_dir(const char* path) {
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (pyro_attrs(path, &d) != 0) return 0;
+    return (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
     struct stat st;
     if (stat(path, &st) != 0) return 0;
     return (st.st_mode & S_IFMT) == S_IFDIR;
+#endif
 }
 
 // Creates every missing component, like Go's os.MkdirAll. Returns 1 on
@@ -1873,21 +1957,13 @@ static int pyro_mkdir_all(const char* path) {
             char save = buf[i];
             buf[i] = '\0';
             if (buf[0] && !pyro_is_dir(buf)) {
-#ifdef _WIN32
-                _mkdir(buf);
-#else
-                mkdir(buf, 0755);
-#endif
+                pyro_mkdir(buf);
             }
             buf[i] = save;
         }
     }
     if (pyro_is_dir(buf)) return 1;
-#ifdef _WIN32
-    return _mkdir(buf) == 0 || pyro_is_dir(buf);
-#else
-    return mkdir(buf, 0755) == 0 || pyro_is_dir(buf);
-#endif
+    return pyro_mkdir(buf) == 0 || pyro_is_dir(buf);
 }
 
 // ── HTTP server (roadmap 11.6) ─────────────────────────────
@@ -2093,7 +2169,7 @@ void http_serve_dir(const char* dir, int port) {
 
         char full[2048];
         snprintf(full, sizeof(full), "%s/%s", dir, path + 1);
-        FILE* f = fopen(full, "rb");
+        FILE* f = pyro_fopen(full, "rb");
         if (!f) {
             const char* m = "404 page not found";
             http_send(c, 404, "Not Found", "text/plain", m, (long)strlen(m));
@@ -2483,7 +2559,7 @@ Value native(int id, Value* a, int argc) {
                   cap_fs(false, wp, "write_bytes()"); free(wp); }
                 if (a[1].kind != VAL_ARRAY) return val_bool(false);
                 char* path = value_to_string(a[0]);
-                FILE* fp = fopen(path, "wb");
+                FILE* fp = pyro_fopen(path, "wb");
                 free(path);
                 if (!fp) return val_bool(false);
                 RcArray* arr = a[1].as.arr;
@@ -2500,7 +2576,7 @@ Value native(int id, Value* a, int argc) {
                 { char* rp = value_to_string(a[0]);
                   cap_fs(true, rp, "read_file()"); free(rp); }
                 char* path = value_to_string(a[0]);
-                FILE* fp = fopen(path, "rb");
+                FILE* fp = pyro_fopen(path, "rb");
                 free(path);
                 if (!fp) return val_str("", 0);
                 fseek(fp, 0, SEEK_END);
@@ -2849,8 +2925,13 @@ Value native(int id, Value* a, int argc) {
         case 55: // file_exists(path) -> bool
             {
                 char* p = value_to_string(a[0]);
+#ifdef _WIN32
+                WIN32_FILE_ATTRIBUTE_DATA d;
+                bool ok = (pyro_attrs(p, &d) == 0);
+#else
                 struct stat st;
                 bool ok = (stat(p, &st) == 0);
+#endif
                 free(p);
                 return val_bool(ok);
             }
@@ -2907,15 +2988,22 @@ Value native(int id, Value* a, int argc) {
                 char* p = value_to_string(a[0]);
                 cap_fs(false, p, "delete_file()");
                 bool ok = false;
-                if (!pyro_is_dir(p)) ok = (remove(p) == 0);
+                if (!pyro_is_dir(p)) ok = (pyro_remove(p) == 0);
                 free(p);
                 return val_bool(ok);
             }
         case 60: // file_size(path) -> int (-1 when it cannot be read)
             {
                 char* p = value_to_string(a[0]);
+#ifdef _WIN32
+                WIN32_FILE_ATTRIBUTE_DATA d;
+                int64_t sz = (pyro_attrs(p, &d) == 0)
+                    ? (((int64_t)d.nFileSizeHigh << 32) | (int64_t)d.nFileSizeLow)
+                    : -1;
+#else
                 struct stat st;
                 int64_t sz = (stat(p, &st) == 0) ? (int64_t)st.st_size : -1;
+#endif
                 free(p);
                 return val_int(sz);
             }
@@ -2924,7 +3012,7 @@ Value native(int id, Value* a, int argc) {
                 char* p = value_to_string(a[0]);
                 cap_fs(false, p, "write_file()");
                 char* c = value_to_string(a[1]);
-                FILE* f = fopen(p, "wb");
+                FILE* f = pyro_fopen(p, "wb");
                 bool ok = false;
                 if (f) {
                     size_t len = strlen(c);
@@ -2993,7 +3081,7 @@ Value native(int id, Value* a, int argc) {
                 if (tmp) {
                     memcpy(tmp, path, plen);
                     memcpy(tmp + plen, ".tmp", 5);
-                    FILE* f = fopen(tmp, "wb");
+                    FILE* f = pyro_fopen(tmp, "wb");
                     if (f) {
                         size_t dlen = strlen(data);
                         ok = (fwrite(data, 1, dlen, f) == dlen);
@@ -3005,10 +3093,10 @@ Value native(int id, Value* a, int argc) {
                             // MoveFileEx replaces it in one step.
                             ok = MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING) != 0;
 #else
-                            ok = (rename(tmp, path) == 0);
+                            ok = (pyro_rename(tmp, path) == 0);
 #endif
                         }
-                        if (!ok) remove(tmp);
+                        if (!ok) pyro_remove(tmp);
                     }
                     free(tmp);
                 }
