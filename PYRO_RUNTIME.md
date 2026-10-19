@@ -50,7 +50,15 @@ Mixed `int`/`float` operations promote the integer to `float`; the result is
 - Same numeric category compares by value (with `int`/`float` promotion).
 - `string` compares by content; `bool` by value.
 - `null` compares equal only to `null` (`null == null` is true; `x == null` is false for any non-null container, scalar or function).
-- `array` and `map` compare by **reference identity** (pointer equality).
+- `array` and `map` compare by **reference identity** (pointer equality). Two
+  containers with equal contents are **not** equal — `[1] == [1]` is false,
+  `a == a` is true. This is observable, so it is the rule every backend follows
+  rather than a VM detail.
+- The `x == null` rule covers values that have no null to be. `""`, `0`, `0.0`,
+  `false` and a struct value are all **not** null (and `!= null` is true for
+  them), on every backend — including the ones where the comparison has to be
+  folded at compile time because the target language would reject it (go) or
+  answer differently (C, where `0 == NULL` is true).
 
 ### Truthiness (`value_truthy`)
 `false`, `null`, `0` (int), `0.0` (float) and `""` are falsy; everything else is truthy.
@@ -200,6 +208,21 @@ already on disk, so new builtins only ever append.
 - **`json_encode`/`json_decode`** serialize/deserialize the value tree (object keys
   become maps; JSON integers become `int`).
 - **`http_get`/`http_post`** make network requests; **`sleep(ms)`** pauses.
+  Both return the response body **whatever the status**, and `""` on any
+  failure — bad URL, refused connection, timeout, malformed response.
+  `http_post` sends its body byte for byte (newlines included) with
+  `Content-Type: application/json`. Up to 10 redirects are followed;
+  301/302/303 turn a POST into a GET, 307/308 resend it. The whole exchange is
+  bounded by `PYRO_HTTP_CLIENT_TIMEOUT_MS` (default 15000).
+  In the C runtime (C VM and AOT executables) `http://` is spoken natively
+  over a socket. `https://` goes through `curl` — run as an argument vector
+  with **no shell**, the body on stdin (`--data-binary @-`), `-m` set from the
+  same timeout, redirects limited to http/https — because the runtime ships no
+  TLS stack; `curl.exe` is part of Windows 10 1803+ (`%SystemRoot%\System32`
+  is preferred over `PATH`). Without curl, `https://` yields `""`. Host names
+  are resolved with `gethostbyname`, which the deadline does not bound: address
+  plugins by IP or `localhost`. Neither engine re-checks the sandbox policy on
+  a redirect target.
 - **`write_bytes(path, int[]) -> bool`** writes an integer array as raw bytes
   (each element truncated to `& 0xFF`) to a file — the binary output that lets a
   program on the VM emit a `.pyro` (enables the self-hosted compiler).
@@ -252,6 +275,14 @@ already on disk, so new builtins only ever append.
 
   Requests are served **strictly one at a time**: one listener and one
   in-flight connection, which is what makes this safe with no locking.
+  So that one slow client cannot hold everyone else, a request must arrive
+  **complete** within `PYRO_HTTP_TIMEOUT_MS` of being accepted (default
+  10000) — an absolute deadline, not a per-read timeout, so a client
+  trickling a byte at a time is dropped too — and `http_respond` gets the
+  same budget to write. A request that misses the deadline, whose body is
+  shorter than its `Content-Length`, whose headers exceed 64 KB or whose body
+  exceeds 64 MB is dropped and `http_accept` returns the empty-`method` map.
+  `http_serve` applies the same timeout.
   `http_accept` **always returns a map**, never `null` — a failed or malformed
   request yields an empty `method`. The keys are `method`, `path`, `query`
   and `body`. Calling `http_accept` before `http_listen` aborts; calling it
@@ -436,6 +467,45 @@ of bounds` (array set), `IndexError: string index out of bounds`;
 `unwrap of null value`; `to_int: '…' is not a valid integer`; `to_number: '…' is
 not a valid number`; `Sandbox: http_get() blocked by sandbox policy`. Outside
 safety: `[Cryo Assert] <msg>` and `uncaught exception: <value>`.
+
+### 6.1 Resource limits
+
+The interpreter's four stacks are **bounded, at the same sizes, in every
+implementation**. The sizes come from the C VM, whose stacks are fixed arrays;
+the Go VM's grow, so it must stop growing where the C VM runs out or it accepts
+programs the C VM aborts on — invariant 1 broken in the direction hardest to
+notice, since the engine that disagrees is the one that appears to work.
+
+| Resource | Size | Abort message |
+|---|---:|---|
+| operand stack | 65536 | `malformed .pyro: value stack overflow` |
+| call stack | 4096 | `malformed .pyro: call stack overflow (runaway recursion?)` |
+| locals stack | 65536 | `malformed .pyro: locals stack overflow (runaway recursion?)` |
+| handler stack | 4096 | `malformed .pyro: exception handler stack overflow` |
+
+Three rules make the limits observable in the same order on both engines:
+
+- **The call and locals stacks are checked on a call, not per instruction** —
+  they only move on a call, a return and a try — and the operand stack is checked
+  once per instruction, with four slots of headroom, because no instruction
+  pushes more than it pops plus one.
+- **The threshold is `> size - 2`, not `>= size`.** The slack matters less than
+  the fact that both engines use the same expression, so they abort while pushing
+  the *same* call and their stack traces are the same length.
+- **Locals are checked before frames.** A recursion deep enough to trip both
+  reports whichever it reaches first, and the C VM writes the callee's locals
+  before it tests the frame count — so the locals limit is the earlier one.
+
+Which limit a program reaches depends on its frame size: a function with fewer
+than about 16 locals exhausts the 4096 frames first, and one with more exhausts
+the 65536 local slots first. Both are reachable, and so is the operand stack,
+independently of the other two — a 65535-element array literal overflows it
+without exceeding 4095 frames.
+
+> These are per-implementation limits, not language semantics: a program that
+> depends on recursing deeper than 4095 is not portable across the runtimes and
+> never was. Bounding the Go VM did not make such a program invalid, it made the
+> two engines agree about it.
 
 ---
 

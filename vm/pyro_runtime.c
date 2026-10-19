@@ -4,12 +4,28 @@
 //  NATIVE builtins. Depends on host only for fatal()/pyro_sandboxed.
 //  Semantics specified in PYRO_RUNTIME.md.
 // ============================================================
+
+// Feature-test macro, before ANY header. Under -std=c11 (how the C VM test,
+// the C backend and `cryoc test --backend c` compile) glibc exposes only ISO C,
+// and this file uses POSIX/BSD on top of it: clock_gettime + CLOCK_REALTIME,
+// usleep, popen/pclose, S_IFDIR and the socket API. The C VM failed to build on
+// Linux with "'CLOCK_REALTIME' undeclared". _DEFAULT_SOURCE restores glibc's
+// non-strict default; other libcs ignore it.
+#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
+
 #include "pyro_runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <ctype.h>
+// strtoll/strtod report OUT OF RANGE through errno, and to_int/to_number
+// below have to see it. Included here rather than relying on the one inside
+// the POSIX branch of the socket section: that one is in an #else, so on
+// Windows errno was not declared at all.
+#include <errno.h>
 
 // strdup is POSIX, not ISO C: strict modes (-std=c11) hide it, and it would
 // then be implicitly declared as returning int — which truncates the pointer
@@ -870,88 +886,633 @@ Value parse_json_value(const char** p) {
     }
 }
 
-char* http_get_curl(const char* url) {
-    char cmd[2048];
-    #ifdef _WIN32
-    sprintf(cmd, "curl -s -L \"%s\"", url);
-    #else
-    sprintf(cmd, "curl -s -L '%s'", url);
-    #endif
-    FILE* f = popen(cmd, "r");
-    if (!f) return strdup("");
-    size_t capacity = 4096;
-    size_t length = 0;
-    char* buf = malloc(capacity);
-    char chunk[1024];
-    while (fgets(chunk, sizeof(chunk), f)) {
-        size_t clen = strlen(chunk);
-        if (length + clen + 1 >= capacity) {
-            capacity *= 2;
-            buf = realloc(buf, capacity);
-        }
-        strcpy(buf + length, chunk);
-        length += clen;
-    }
-    pclose(f);
-    buf[length] = '\0';
-    return buf;
-}
-
-char* http_post_curl(const char* url, const char* body) {
-    char tmp_filename[256];
-    sprintf(tmp_filename, "pyro_tmp_post_%d.json", (int)getpid());
-    FILE* tf = fopen(tmp_filename, "w");
-    if (!tf) return strdup("");
-    fputs(body, tf);
-    fclose(tf);
-    
-    char cmd[1024];
-    #ifdef _WIN32
-    sprintf(cmd, "curl -s -L -X POST -H \"Content-Type: application/json\" -d @%s \"%s\"", tmp_filename, url);
-    #else
-    sprintf(cmd, "curl -s -L -X POST -H 'Content-Type: application/json' -d @%s '%s'", tmp_filename, url);
-    #endif
-    
-    FILE* f = popen(cmd, "r");
-    if (!f) {
-        remove(tmp_filename);
-        return strdup("");
-    }
-    size_t capacity = 4096;
-    size_t length = 0;
-    char* buf = malloc(capacity);
-    char chunk[1024];
-    while (fgets(chunk, sizeof(chunk), f)) {
-        size_t clen = strlen(chunk);
-        if (length + clen + 1 >= capacity) {
-            capacity *= 2;
-            buf = realloc(buf, capacity);
-        }
-        strcpy(buf + length, chunk);
-        length += clen;
-    }
-    pclose(f);
-    remove(tmp_filename);
-    buf[length] = '\0';
-    return buf;
-}
-
 // ── Minimal static HTTP server (backs http_serve) ────────────
 // Single-threaded HTTP/1.1, one connection at a time: enough to serve a demo
 // (page + .wasm) and to keep the C VM at parity with the Go VM's http_serve.
 #ifdef _WIN32
 #include <winsock2.h>
 typedef SOCKET pyro_sock;
+typedef int pyro_socklen;
 #define PYRO_BADSOCK  INVALID_SOCKET
 #define pyro_closesock closesocket
 #else
 #include <sys/socket.h>
+#include <sys/select.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <signal.h>
+#include <time.h>
 typedef int pyro_sock;
+typedef socklen_t pyro_socklen;
 #define PYRO_BADSOCK  (-1)
 #define pyro_closesock close
 #endif
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0   // Windows has no SIGPIPE; macOS uses SO_NOSIGPIPE
+#endif
+
+// ── socket I/O with deadlines (ESCOPO L-09 / L-18) ──────────
+// Every HTTP socket — the server's accepted connection and the client's
+// outgoing one — is non-blocking and driven through select() against an
+// ABSOLUTE deadline. A per-call SO_RCVTIMEO would reset on every byte, so a
+// client trickling one byte every few seconds could still hold the sequential
+// server forever; a deadline bounds the whole request instead. Mirrors the
+// SetDeadline calls in main.go.
+//
+//   PYRO_HTTP_TIMEOUT_MS         server: read a request / write a response (10000)
+//   PYRO_HTTP_CLIENT_TIMEOUT_MS  http_get/http_post, whole exchange (15000)
+#define PYRO_HTTP_SERVER_TIMEOUT_MS 10000
+#define PYRO_HTTP_CLIENT_TIMEOUT_MS 15000
+#define PYRO_HTTP_MAX_BODY (64L * 1024 * 1024)   // request bodies above this are refused
+
+static int64_t http_env_ms(const char* name, int64_t dflt) {
+    const char* s = getenv(name);
+    if (!s || !*s) return dflt;
+    char* end = NULL;
+    long long v = strtoll(s, &end, 10);
+    if (!end || *end || v <= 0) return dflt;
+    return (int64_t)v;
+}
+
+// Monotonic milliseconds: deadlines must not jump with the wall clock.
+static int64_t http_clock_ms(void) {
+#ifdef _WIN32
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (int64_t)((c.QuadPart / f.QuadPart) * 1000 +
+                     (c.QuadPart % f.QuadPart) * 1000 / f.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)ts.tv_nsec / 1000000;
+#endif
+}
+
+static int http_wsa_ready(void) {
+#ifdef _WIN32
+    static int done = 0;
+    if (!done) {
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 0;
+        done = 1;
+    }
+#endif
+    return 1;
+}
+
+static void sock_set_nonblocking(pyro_sock s) {
+#ifdef _WIN32
+    u_long on = 1;
+    ioctlsocket(s, FIONBIO, &on);
+#else
+    int fl = fcntl(s, F_GETFL, 0);
+    if (fl >= 0) fcntl(s, F_SETFL, fl | O_NONBLOCK);
+#endif
+}
+
+static int sock_would_block(void) {
+#ifdef _WIN32
+    int e = WSAGetLastError();
+    return e == WSAEWOULDBLOCK || e == WSAEINTR;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+#endif
+}
+
+// Waits until `s` is readable (or writable) or the deadline passes.
+// 1 = ready, 0 = timed out or failed. `exc` also wakes on the exception set,
+// which is where Windows reports a failed non-blocking connect().
+static int sock_wait(pyro_sock s, int for_write, int exc, int64_t deadline) {
+    for (;;) {
+        int64_t left = deadline - http_clock_ms();
+        if (left <= 0) return 0;
+        fd_set rs, ws, es;
+        FD_ZERO(&rs); FD_ZERO(&ws); FD_ZERO(&es);
+        FD_SET(s, for_write ? &ws : &rs);
+        if (exc) FD_SET(s, &es);
+        struct timeval tv;
+        tv.tv_sec  = (long)(left / 1000);
+        tv.tv_usec = (long)((left % 1000) * 1000);
+        int r = select((int)s + 1, for_write ? NULL : &rs, for_write ? &ws : NULL,
+                       exc ? &es : NULL, &tv);
+        if (r > 0) return 1;
+        if (r == 0) return 0;
+#ifndef _WIN32
+        if (errno == EINTR) continue;
+#endif
+        return 0;
+    }
+}
+
+// recv against a deadline: >0 bytes read, 0 orderly close, -1 error/timeout.
+static int sock_recv(pyro_sock s, char* buf, int n, int64_t deadline) {
+    for (;;) {
+        int got = (int)recv(s, buf, n, 0);
+        if (got >= 0) return got;
+        if (!sock_would_block() || !sock_wait(s, 0, 0, deadline)) return -1;
+    }
+}
+
+// send all of buf against a deadline. 1 = everything sent.
+static int sock_send_all(pyro_sock s, const char* buf, size_t n, int64_t deadline) {
+    while (n > 0) {
+        int chunk = n > (1u << 30) ? (1 << 30) : (int)n;
+        int put = (int)send(s, buf, chunk, MSG_NOSIGNAL);
+        if (put > 0) { buf += put; n -= (size_t)put; continue; }
+        if (put < 0 && sock_would_block() && sock_wait(s, 1, 0, deadline)) continue;
+        return 0;
+    }
+    return 1;
+}
+
+// ── HTTP client (backs http_get / http_post) ────────────────
+// Replaces the old `curl` + popen client, which built a shell command with
+// sprintf into a 1–2 KB buffer (overflow on a long URL), interpolated the URL
+// into that command line (injection), spilled the POST body to a file in the
+// current directory, sent it with -d (which strips newlines) and had no
+// timeout. http:// is now spoken natively over a socket; https:// still goes
+// through curl, but as an argv vector with no shell, the body on stdin
+// (--data-binary @-) and -m bounding it. No TLS stack ships with the runtime,
+// and curl.exe is part of Windows 10 1803+.
+//
+// Contract, identical to the Go VM: the response body whatever the status,
+// "" on any failure (bad URL, refused, timeout, malformed response). POST
+// sends Content-Type: application/json. Up to 10 redirects are followed;
+// 301/302/303 turn a POST into a GET, 307/308 resend it.
+typedef struct { char* p; size_t n, cap; } HBuf;
+
+static int hbuf_add(HBuf* b, const char* s, size_t n) {
+    if (b->n + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap : 1024;
+        while (b->n + n + 1 > cap) cap *= 2;
+        char* g = (char*)realloc(b->p, cap);
+        if (!g) return 0;
+        b->p = g; b->cap = cap;
+    }
+    if (n) memcpy(b->p + b->n, s, n);
+    b->n += n;
+    b->p[b->n] = '\0';
+    return 1;
+}
+static int hbuf_str(HBuf* b, const char* s) { return hbuf_add(b, s, strlen(s)); }
+
+static int http_prefix_ci(const char* s, const char* prefix) {
+    for (; *prefix; s++, prefix++)
+        if (tolower((unsigned char)*s) != *prefix) return 0;
+    return 1;
+}
+
+typedef struct { int https; char host[256]; int port; char* target; } HUrl;
+
+// Splits an absolute http(s) URL. Refuses control characters (as Go's
+// url.Parse does), userinfo and IPv6 literals; percent-encodes the bytes that
+// cannot appear raw in a request line. Returns 0 on a URL it will not send.
+static int http_parse_url(const char* url, HUrl* u) {
+    memset(u, 0, sizeof(*u));
+    for (const unsigned char* c = (const unsigned char*)url; *c; c++)
+        if (*c < 0x20 || *c == 0x7f) return 0;
+    const char* p;
+    if (http_prefix_ci(url, "http://"))       { p = url + 7; u->port = 80; }
+    else if (http_prefix_ci(url, "https://")) { p = url + 8; u->port = 443; u->https = 1; }
+    else return 0;
+    size_t alen = strcspn(p, "/?#");
+    const char* colon = (const char*)memchr(p, ':', alen);
+    size_t hlen = colon ? (size_t)(colon - p) : alen;
+    if (hlen == 0 || hlen >= sizeof(u->host)) return 0;
+    for (size_t i = 0; i < hlen; i++) {
+        char ch = p[i];
+        if (!isalnum((unsigned char)ch) && ch != '.' && ch != '-' && ch != '_') return 0;
+    }
+    memcpy(u->host, p, hlen);
+    u->host[hlen] = '\0';
+    if (colon) {
+        const char* d = colon + 1;
+        long port = 0;
+        if (d == p + alen) return 0;
+        for (; d < p + alen; d++) {
+            if (!isdigit((unsigned char)*d)) return 0;
+            port = port * 10 + (*d - '0');
+            if (port > 65535) return 0;
+        }
+        if (port == 0) return 0;
+        u->port = (int)port;
+    }
+    const char* rest = p + alen;
+    size_t rlen = strcspn(rest, "#");                // the fragment is never sent
+    HBuf t = {0};
+    if (rlen == 0 || rest[0] == '?') hbuf_add(&t, "/", 1);
+    for (size_t i = 0; i < rlen; i++) {
+        unsigned char ch = (unsigned char)rest[i];
+        if (ch == ' ' || ch == '"' || ch == '<' || ch == '>' || ch >= 0x80) {
+            char esc[4];
+            snprintf(esc, sizeof(esc), "%%%02X", ch);
+            hbuf_add(&t, esc, 3);
+        } else {
+            hbuf_add(&t, (const char*)&ch, 1);
+        }
+    }
+    if (!t.p) return 0;
+    u->target = t.p;
+    return 1;
+}
+
+static pyro_sock http_dial(const char* host, int port, int64_t deadline) {
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((unsigned short)port);
+    unsigned long ip = inet_addr(host);
+    if (ip == INADDR_NONE) {
+        if (strcmp(host, "localhost") == 0) {
+            ip = htonl(INADDR_LOOPBACK);
+        } else {
+            // Name lookup itself is not bounded by the deadline (gethostbyname
+            // has no timeout); plugins are addressed by IP or localhost.
+            struct hostent* he = gethostbyname(host);
+            if (!he || he->h_addrtype != AF_INET || !he->h_addr_list[0]) return PYRO_BADSOCK;
+            memcpy(&ip, he->h_addr_list[0], 4);
+        }
+    }
+    addr.sin_addr.s_addr = (unsigned int)ip;
+    pyro_sock s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == PYRO_BADSOCK) return PYRO_BADSOCK;
+    sock_set_nonblocking(s);
+    if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+#ifdef _WIN32
+        int pending = WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+        int pending = errno == EINPROGRESS || errno == EINTR;
+#endif
+        int err = 0;
+        pyro_socklen elen = sizeof(err);
+        if (!pending || !sock_wait(s, 1, 1, deadline) ||
+            getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&err, &elen) != 0 || err != 0) {
+            pyro_closesock(s);
+            return PYRO_BADSOCK;
+        }
+    }
+    return s;
+}
+
+static const char* http_find_crlf(const char* p, const char* end) {
+    for (; p + 1 < end; p++)
+        if (p[0] == '\r' && p[1] == '\n') return p;
+    return NULL;
+}
+
+// Decodes a chunked body. 1 = complete, 0 = needs more bytes, -1 = malformed.
+static int http_dechunk(const char* p, size_t n, HBuf* out) {
+    const char* end = p + n;
+    const char* c = p;
+    out->n = 0;
+    if (out->p) out->p[0] = '\0';
+    for (;;) {
+        const char* eol = http_find_crlf(c, end);
+        if (!eol) return 0;
+        size_t sz = 0;
+        int digits = 0;
+        for (const char* d = c; d < eol && isxdigit((unsigned char)*d); d++, digits++) {
+            if (sz > ((size_t)-1 >> 5)) return -1;      // would overflow size_t
+            sz = sz * 16 + (size_t)(isdigit((unsigned char)*d) ? *d - '0'
+                                    : tolower((unsigned char)*d) - 'a' + 10);
+        }
+        if (!digits) return -1;
+        c = eol + 2;
+        if (sz == 0) {                                // trailers, then a blank line
+            for (;;) {
+                const char* t = http_find_crlf(c, end);
+                if (!t) return 0;
+                if (t == c) return 1;
+                c = t + 2;
+            }
+        }
+        if ((size_t)(end - c) < sz + 2) return 0;
+        if (!hbuf_add(out, c, sz)) return -1;
+        c += sz;
+        if (c[0] != '\r' || c[1] != '\n') return -1;
+        c += 2;
+    }
+}
+
+// One request/response exchange over a fresh connection. Returns 1 with
+// *status, the decoded body and (for a redirect) a malloc'd *location; 0 on
+// any failure, timeout included.
+static int http_exchange(const HUrl* u, const char* method, const char* body, size_t blen,
+                         int64_t deadline, int* status, HBuf* out, char** location) {
+    *location = NULL;
+    pyro_sock s = http_dial(u->host, u->port, deadline);
+    if (s == PYRO_BADSOCK) return 0;
+
+    HBuf req = {0};
+    char line[384];
+    hbuf_str(&req, method); hbuf_add(&req, " ", 1);
+    hbuf_str(&req, u->target);
+    if (u->port == 80) snprintf(line, sizeof(line), " HTTP/1.1\r\nHost: %s\r\n", u->host);
+    else snprintf(line, sizeof(line), " HTTP/1.1\r\nHost: %s:%d\r\n", u->host, u->port);
+    hbuf_str(&req, line);
+    hbuf_str(&req, "User-Agent: pyro-runtime\r\nConnection: close\r\n");
+    if (body) {
+        snprintf(line, sizeof(line),
+                 "Content-Type: application/json\r\nContent-Length: %lu\r\n", (unsigned long)blen);
+        hbuf_str(&req, line);
+    }
+    hbuf_add(&req, "\r\n", 2);
+    int ok = req.p && sock_send_all(s, req.p, req.n, deadline) &&
+             (!body || sock_send_all(s, body, blen, deadline));
+    free(req.p);
+    if (!ok) { pyro_closesock(s); return 0; }
+
+    HBuf resp = {0};
+    size_t hdr_end = 0;
+    long long clen = -1;
+    int chunked = 0, no_body = 0, done = 0, eof = 0;
+    char chunk[16384];
+    while (!done) {
+        int got = sock_recv(s, chunk, (int)sizeof(chunk), deadline);
+        if (got < 0) break;
+        if (got == 0) eof = 1;
+        else if (!hbuf_add(&resp, chunk, (size_t)got)) break;
+
+        while (!hdr_end && resp.p) {
+            const char* he = strstr(resp.p, "\r\n\r\n");
+            if (!he) break;
+            size_t hend = (size_t)(he - resp.p) + 4;
+            int st = 0;
+            if (strncmp(resp.p, "HTTP/", 5) != 0) { eof = 1; got = -1; break; }
+            const char* sp = strchr(resp.p, ' ');
+            if (sp && sp < he) st = atoi(sp + 1);
+            if (st < 100 || st > 999) { eof = 1; got = -1; break; }
+            if (st >= 100 && st < 200) {             // interim response: drop it
+                memmove(resp.p, resp.p + hend, resp.n - hend + 1);
+                resp.n -= hend;
+                continue;
+            }
+            *status = st;
+            hdr_end = hend;
+            no_body = (st == 204 || st == 304);
+            for (const char* h = strstr(resp.p, "\r\n") + 2; h < he; ) {
+                const char* eol = strstr(h, "\r\n");
+                const char* colon = (const char*)memchr(h, ':', (size_t)(eol - h));
+                if (colon) {
+                    const char* v = colon + 1;
+                    while (*v == ' ' || *v == '\t') v++;
+                    size_t nlen = (size_t)(colon - h), vlen = (size_t)(eol - v);
+                    if (nlen == 14 && http_prefix_ci(h, "content-length"))
+                        clen = strtoll(v, NULL, 10);
+                    else if (nlen == 17 && http_prefix_ci(h, "transfer-encoding")) {
+                        for (size_t i = 0; i + 7 <= vlen; i++)
+                            if (http_prefix_ci(v + i, "chunked")) chunked = 1;
+                    } else if (nlen == 8 && http_prefix_ci(h, "location")) {
+                        free(*location);
+                        *location = (char*)malloc(vlen + 1);
+                        if (*location) { memcpy(*location, v, vlen); (*location)[vlen] = '\0'; }
+                    }
+                }
+                h = eol + 2;
+            }
+        }
+        if (got < 0) break;
+        if (resp.n > ((size_t)1 << 20) && !hdr_end) break;   // 1 MB of headers: give up
+        if (hdr_end) {
+            const char* b = resp.p + hdr_end;
+            size_t have = resp.n - hdr_end;
+            if (no_body) {
+                done = 1;
+            } else if (chunked) {
+                // Re-decoding on every read would be quadratic: only try once
+                // the terminating chunk can be there, or the peer has closed.
+                if (eof || (have >= 5 && memcmp(b + have - 5, "0\r\n\r\n", 5) == 0)) {
+                    int r = http_dechunk(b, have, out);
+                    if (r == 1) done = 1;
+                    else if (r < 0 || eof) break;
+                }
+            } else if (clen >= 0) {
+                if ((long long)have >= clen) { hbuf_add(out, b, (size_t)clen); done = 1; }
+                else if (eof) break;
+            } else if (eof) {
+                hbuf_add(out, b, have);
+                done = 1;
+            }
+        }
+        if (eof && !done) break;
+    }
+    pyro_closesock(s);
+    free(resp.p);
+    if (!done) { free(*location); *location = NULL; return 0; }
+    if (!out->p) hbuf_add(out, "", 0);
+    return out->p != NULL;
+}
+
+// Resolves a Location header against the URL it came from. Caller frees.
+static char* http_resolve_location(const HUrl* u, const char* loc) {
+    HBuf r = {0};
+    if (http_prefix_ci(loc, "http://") || http_prefix_ci(loc, "https://")) {
+        hbuf_str(&r, loc);
+        return r.p;
+    }
+    hbuf_str(&r, u->https ? "https:" : "http:");
+    if (loc[0] == '/' && loc[1] == '/') { hbuf_str(&r, loc); return r.p; }
+    char hp[300];
+    if (u->port == (u->https ? 443 : 80)) snprintf(hp, sizeof(hp), "//%s", u->host);
+    else snprintf(hp, sizeof(hp), "//%s:%d", u->host, u->port);
+    hbuf_str(&r, hp);
+    if (loc[0] == '/') { hbuf_str(&r, loc); return r.p; }
+    size_t dir = strcspn(u->target, "?");             // relative: the target's directory
+    while (dir > 0 && u->target[dir - 1] != '/') dir--;
+    hbuf_add(&r, u->target, dir);
+    hbuf_str(&r, loc);
+    return r.p;
+}
+
+#ifdef _WIN32
+// Quotes one argument the way the MSVCRT argv parser reads it back. No shell
+// is involved (CreateProcess, not cmd.exe), so this is the only escaping.
+static void win_quote_arg(HBuf* cmd, const char* a) {
+    size_t bs = 0;
+    hbuf_add(cmd, " \"", 2);
+    for (const char* c = a; ; c++) {
+        if (*c == '\\') { bs++; continue; }
+        if (*c == '"' || *c == '\0') {
+            for (size_t k = 0; k < bs * 2; k++) hbuf_add(cmd, "\\", 1);
+            bs = 0;
+            if (!*c) break;
+            hbuf_add(cmd, "\\\"", 2);
+            continue;
+        }
+        for (size_t k = 0; k < bs; k++) hbuf_add(cmd, "\\", 1);
+        bs = 0;
+        hbuf_add(cmd, c, 1);
+    }
+    hbuf_add(cmd, "\"", 1);
+}
+#endif
+
+// https:// through curl: argv only, body on stdin, bounded by -m.
+static char* http_via_curl(const char* url, const char* body, size_t blen, int64_t deadline) {
+    int64_t left = deadline - http_clock_ms();
+    if (left <= 0) return NULL;
+    char secs[32];
+    snprintf(secs, sizeof(secs), "%ld", (long)((left + 999) / 1000));
+    const char* argv[20];
+    int ac = 0;
+    argv[ac++] = "curl"; argv[ac++] = "-s"; argv[ac++] = "-L";
+    argv[ac++] = "--max-redirs"; argv[ac++] = "10";
+    argv[ac++] = "--proto"; argv[ac++] = "=http,https";
+    argv[ac++] = "--proto-redir"; argv[ac++] = "=http,https";
+    argv[ac++] = "-m"; argv[ac++] = secs;
+    if (body) {
+        argv[ac++] = "-H"; argv[ac++] = "Content-Type: application/json";
+        argv[ac++] = "--data-binary"; argv[ac++] = "@-";
+    }
+    argv[ac++] = "--url"; argv[ac++] = url;
+    argv[ac] = NULL;
+
+    HBuf out = {0};
+    int ok = 0;
+#ifdef _WIN32
+    HBuf cmd = {0};
+    hbuf_str(&cmd, "curl.exe");
+    for (int i = 1; i < ac; i++) win_quote_arg(&cmd, argv[i]);
+    // Prefer the curl.exe Windows ships, so one dropped in the current
+    // directory is never picked up first.
+    char app[MAX_PATH + 16];
+    UINT sl = GetSystemDirectoryA(app, MAX_PATH);
+    const char* appname = NULL;
+    if (sl > 0 && sl < MAX_PATH) {
+        strcat(app, "\\curl.exe");
+        if (GetFileAttributesA(app) != INVALID_FILE_ATTRIBUTES) appname = app;
+    }
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE in_r = NULL, in_w = NULL, out_r = NULL, out_w = NULL;
+    HANDLE nul = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+    if (cmd.p && CreatePipe(&in_r, &in_w, &sa, 0) && CreatePipe(&out_r, &out_w, &sa, 0)) {
+        SetHandleInformation(in_w, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
+        STARTUPINFOA si;
+        PROCESS_INFORMATION pi;
+        memset(&si, 0, sizeof(si));
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = in_r; si.hStdOutput = out_w;
+        si.hStdError = nul != INVALID_HANDLE_VALUE ? nul : out_w;
+        BOOL started = CreateProcessA(appname, cmd.p, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                                      NULL, NULL, &si, &pi);
+        CloseHandle(in_r); in_r = NULL;
+        CloseHandle(out_w); out_w = NULL;
+        if (started) {
+            const char* bp = body;
+            size_t rem = body ? blen : 0;
+            while (rem > 0) {
+                DWORD put = 0, want = rem > 65536 ? 65536 : (DWORD)rem;
+                if (!WriteFile(in_w, bp, want, &put, NULL) || put == 0) break;
+                bp += put; rem -= put;
+            }
+            CloseHandle(in_w); in_w = NULL;
+            char buf[16384];
+            DWORD got = 0;
+            while (ReadFile(out_r, buf, sizeof(buf), &got, NULL) && got > 0)
+                hbuf_add(&out, buf, got);
+            DWORD code = 1;
+            if (WaitForSingleObject(pi.hProcess, 5000) != WAIT_OBJECT_0)
+                TerminateProcess(pi.hProcess, 1);
+            else
+                GetExitCodeProcess(pi.hProcess, &code);
+            ok = (code == 0);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
+    }
+    if (in_r) CloseHandle(in_r);
+    if (in_w) CloseHandle(in_w);
+    if (out_r) CloseHandle(out_r);
+    if (out_w) CloseHandle(out_w);
+    if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
+    free(cmd.p);
+#else
+    int inp[2], outp[2];
+    if (pipe(inp) == 0) {
+        if (pipe(outp) == 0) {
+            pid_t pid = fork();
+            if (pid == 0) {
+                dup2(inp[0], 0);
+                dup2(outp[1], 1);
+                int dn = open("/dev/null", O_WRONLY);
+                if (dn >= 0) dup2(dn, 2);
+                close(inp[0]); close(inp[1]); close(outp[0]); close(outp[1]);
+                execvp("curl", (char* const*)argv);
+                _exit(127);
+            }
+            close(inp[0]); close(outp[1]);
+            if (pid > 0) {
+                void (*old)(int) = signal(SIGPIPE, SIG_IGN);
+                const char* bp = body;
+                size_t rem = body ? blen : 0;
+                while (rem > 0) {
+                    ssize_t put = write(inp[1], bp, rem);
+                    if (put <= 0) break;
+                    bp += put; rem -= (size_t)put;
+                }
+                close(inp[1]);
+                signal(SIGPIPE, old);
+                char buf[16384];
+                ssize_t got;
+                while ((got = read(outp[0], buf, sizeof(buf))) > 0)
+                    hbuf_add(&out, buf, (size_t)got);
+                int st = 0;
+                ok = waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+            } else {
+                close(inp[1]);
+            }
+            close(outp[0]);
+        } else {
+            close(inp[0]); close(inp[1]);
+        }
+    }
+#endif
+    if (!ok) { free(out.p); return NULL; }
+    if (!out.p) hbuf_add(&out, "", 0);
+    return out.p;
+}
+
+// GET (body == NULL) or POST. Always returns a malloc'd string; "" on failure.
+static char* http_client_request(const char* url0, const char* body, size_t blen) {
+    int64_t deadline = http_clock_ms() +
+        http_env_ms("PYRO_HTTP_CLIENT_TIMEOUT_MS", PYRO_HTTP_CLIENT_TIMEOUT_MS);
+    char* url = strdup(url0);
+    const char* method = body ? "POST" : "GET";
+    char* result = NULL;
+    for (int hop = 0; url && hop <= 10 && http_wsa_ready(); hop++) {
+        HUrl u;
+        if (!http_parse_url(url, &u)) break;
+        if (u.https) {                                // curl follows its own redirects
+            result = http_via_curl(url, body, blen, deadline);
+            free(u.target);
+            break;
+        }
+        int status = 0;
+        HBuf out = {0};
+        char* loc = NULL;
+        if (!http_exchange(&u, method, body, blen, deadline, &status, &out, &loc)) {
+            free(u.target);
+            break;
+        }
+        int redirect = loc && (status == 301 || status == 302 || status == 303 ||
+                               status == 307 || status == 308);
+        if (!redirect) { free(loc); free(u.target); result = out.p; break; }
+        free(out.p);
+        char* next = (hop < 10) ? http_resolve_location(&u, loc) : NULL;
+        free(loc); free(u.target); free(url);
+        url = next;
+        if (status != 307 && status != 308) { method = "GET"; body = NULL; blen = 0; }
+    }
+    free(url);
+    return result ? result : strdup("");
+}
 
 static const char* mime_for(const char* path) {
     const char* dot = strrchr(path, '.');
@@ -979,12 +1540,14 @@ static bool path_is_safe(const char* p) {
 
 static void http_send(pyro_sock c, int status, const char* reason,
                       const char* ctype, const char* body, long blen) {
+    int64_t deadline = http_clock_ms() +
+        http_env_ms("PYRO_HTTP_TIMEOUT_MS", PYRO_HTTP_SERVER_TIMEOUT_MS);
     char head[512];
     int n = snprintf(head, sizeof(head),
                      "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %ld\r\n"
                      "Connection: close\r\n\r\n", status, reason, ctype, blen);
-    send(c, head, n, 0);
-    if (body && blen > 0) send(c, body, (int)blen, 0);
+    if (sock_send_all(c, head, (size_t)n, deadline) && body && blen > 0)
+        sock_send_all(c, body, (size_t)blen, deadline);
 }
 
 // ── capability policy (roadmap 11.11) ──────────────────────
@@ -1285,6 +1848,84 @@ void pyro_asset_add(char* name, char* data, int64_t len) {
 // ── filesystem helpers (roadmap 11.7) ──────────────────────
 #include <dirent.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#include <wchar.h>
+#endif
+
+// ── M1: a Cryo path is UTF-8; a Windows path is UTF-16 ─────
+//
+// fopen, stat, remove, rename and _mkdir take a path in the process ANSI
+// codepage, so the UTF-8 bytes of an accented path reached the filesystem as
+// their cp1252 reading: pyro_write_file("build/Produção.txt", …) created
+// "ProduÃ§Ã£o.txt" on disk.
+//
+// IT DID NOT FAIL. file_exists, read_file and file_size all agreed
+// afterwards, because they mangled the name the same way — so the program
+// saw a clean round trip while the file was unreachable under the name it
+// believed it had. The GO VM gets this right for free, because Go's os
+// package converts to UTF-16 on Windows, so the same .pyro file produced
+// two different filenames depending on which VM ran it.
+//
+// The POSIX build is untouched: there a path is bytes and fopen already
+// takes UTF-8.
+#ifdef _WIN32
+static wchar_t* pyro_wpath(const char* s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    if (n <= 0) return NULL;
+    wchar_t* w = (wchar_t*)malloc((size_t)n * sizeof(wchar_t));
+    if (!w) return NULL;
+    if (MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n) <= 0) { free(w); return NULL; }
+    return w;
+}
+static FILE* pyro_fopen(const char* path, const char* mode) {
+    wchar_t* wp = pyro_wpath(path);
+    if (!wp) return NULL;
+    wchar_t wm[8];
+    size_t i = 0;
+    for (; mode[i] && i < 7; i++) wm[i] = (wchar_t)(unsigned char)mode[i];
+    wm[i] = L'\0';
+    FILE* f = _wfopen(wp, wm);
+    free(wp);
+    return f;
+}
+// Win32 rather than a CRT stat: MinGW.org's headers do not expose
+// `struct _stat64`, and existence, directory-ness and size are all in one
+// attribute query.
+static int pyro_attrs(const char* path, WIN32_FILE_ATTRIBUTE_DATA* out) {
+    wchar_t* wp = pyro_wpath(path);
+    if (!wp) return -1;
+    BOOL ok = GetFileAttributesExW(wp, GetFileExInfoStandard, out);
+    free(wp);
+    return ok ? 0 : -1;
+}
+static int pyro_remove(const char* path) {
+    wchar_t* wp = pyro_wpath(path);
+    if (!wp) return -1;
+    int r = _wremove(wp);
+    free(wp);
+    return r;
+}
+static int pyro_rename(const char* a, const char* b) {
+    wchar_t* wa = pyro_wpath(a);
+    wchar_t* wb = pyro_wpath(b);
+    int r = (wa && wb) ? _wrename(wa, wb) : -1;
+    free(wa); free(wb);
+    return r;
+}
+static int pyro_mkdir(const char* path) {
+    wchar_t* wp = pyro_wpath(path);
+    if (!wp) return -1;
+    int r = _wmkdir(wp);
+    free(wp);
+    return r;
+}
+#else
+#define pyro_fopen  fopen
+#define pyro_remove remove
+#define pyro_rename rename
+#define pyro_mkdir(p) mkdir((p), 0755)
+#endif
 
 // list_dir sorts its names so the Go VM and this runtime return the same
 // order. Go uses sort.Strings; strcmp gives the same byte ordering.
@@ -1293,9 +1934,15 @@ static int pyro_name_cmp(const void* a, const void* b) {
 }
 
 static int pyro_is_dir(const char* path) {
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (pyro_attrs(path, &d) != 0) return 0;
+    return (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
     struct stat st;
     if (stat(path, &st) != 0) return 0;
     return (st.st_mode & S_IFMT) == S_IFDIR;
+#endif
 }
 
 // Creates every missing component, like Go's os.MkdirAll. Returns 1 on
@@ -1310,21 +1957,13 @@ static int pyro_mkdir_all(const char* path) {
             char save = buf[i];
             buf[i] = '\0';
             if (buf[0] && !pyro_is_dir(buf)) {
-#ifdef _WIN32
-                _mkdir(buf);
-#else
-                mkdir(buf, 0755);
-#endif
+                pyro_mkdir(buf);
             }
             buf[i] = save;
         }
     }
     if (pyro_is_dir(buf)) return 1;
-#ifdef _WIN32
-    return _mkdir(buf) == 0 || pyro_is_dir(buf);
-#else
-    return mkdir(buf, 0755) == 0 || pyro_is_dir(buf);
-#endif
+    return pyro_mkdir(buf) == 0 || pyro_is_dir(buf);
 }
 
 // ── HTTP server (roadmap 11.6) ─────────────────────────────
@@ -1358,14 +1997,17 @@ static const char* http_status_text(int64_t code) {
     }
 }
 
-// Reads one HTTP/1.1 request. Returns 0 on a malformed or closed connection.
+// Reads one HTTP/1.1 request. Returns 0 on a malformed or closed connection,
+// on a request that is not complete by `deadline` (L-09: an idle or trickling
+// client must not hold the sequential server), on a body shorter than its
+// Content-Length, and on a body above PYRO_HTTP_MAX_BODY.
 // Kept deliberately minimal and behaviour-identical to httpParseRequest in Go.
 // Headers are handed back as a single "name: value\n" blob, which the caller
 // splits into the request map. A blob keeps this signature from growing a
 // parallel array pair, and the map keys end up identical to the Go VM's.
 static int http_read_request(pyro_sock c, char* method, size_t msz,
                              char* path, size_t psz, char* query, size_t qsz,
-                             char** body_out, char** hdrs_out) {
+                             char** body_out, char** hdrs_out, int64_t deadline) {
     static char buf[65536];
     int total = 0;
     int header_end = -1;
@@ -1374,7 +2016,7 @@ static int http_read_request(pyro_sock c, char* method, size_t msz,
 
     // read until the end of the headers
     while (total < (int)sizeof(buf) - 1) {
-        int got = recv(c, buf + total, (int)sizeof(buf) - 1 - total, 0);
+        int got = sock_recv(c, buf + total, (int)sizeof(buf) - 1 - total, deadline);
         if (got <= 0) return 0;
         total += got;
         buf[total] = '\0';
@@ -1455,6 +2097,7 @@ static int http_read_request(pyro_sock c, char* method, size_t msz,
         h = eol + 2;
     }
     if (hdrs_out) *hdrs_out = hblob; else free(hblob);
+    if (clen > PYRO_HTTP_MAX_BODY) return 0;
     if (clen > 0) {
         char* body = (char*)malloc((size_t)clen + 1);
         if (!body) return 0;
@@ -1462,8 +2105,8 @@ static int http_read_request(pyro_sock c, char* method, size_t msz,
         if (have > clen) have = (int)clen;
         if (have > 0) memcpy(body, buf + header_end, (size_t)have);
         while (have < clen) {
-            int got = recv(c, body + have, (int)(clen - have), 0);
-            if (got <= 0) break;
+            int got = sock_recv(c, body + have, (int)(clen - have), deadline);
+            if (got <= 0) { free(body); return 0; }   // timed out or cut short
             have += got;
         }
         body[have] = '\0';
@@ -1473,10 +2116,7 @@ static int http_read_request(pyro_sock c, char* method, size_t msz,
 }
 
 void http_serve_dir(const char* dir, int port) {
-#ifdef _WIN32
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) fatal("http_serve: WSAStartup failed");
-#endif
+    if (!http_wsa_ready()) fatal("http_serve: WSAStartup failed");
     pyro_sock srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv == PYRO_BADSOCK) fatal("http_serve: socket() failed");
     int yes = 1;
@@ -1493,9 +2133,11 @@ void http_serve_dir(const char* dir, int port) {
     for (;;) {
         pyro_sock c = accept(srv, NULL, NULL);
         if (c == PYRO_BADSOCK) continue;
+        sock_set_nonblocking(c);
 
         char req[2048];
-        int got = recv(c, req, (int)sizeof(req) - 1, 0);
+        int got = sock_recv(c, req, (int)sizeof(req) - 1, http_clock_ms() +
+                            http_env_ms("PYRO_HTTP_TIMEOUT_MS", PYRO_HTTP_SERVER_TIMEOUT_MS));
         if (got <= 0) { pyro_closesock(c); continue; }
         req[got] = '\0';
 
@@ -1527,7 +2169,7 @@ void http_serve_dir(const char* dir, int port) {
 
         char full[2048];
         snprintf(full, sizeof(full), "%s/%s", dir, path + 1);
-        FILE* f = fopen(full, "rb");
+        FILE* f = pyro_fopen(full, "rb");
         if (!f) {
             const char* m = "404 page not found";
             http_send(c, 404, "Not Found", "text/plain", m, (long)strlen(m));
@@ -1662,9 +2304,19 @@ Value native(int id, Value* a, int argc) {
                         const char* s = a[0].as.str->chars;
                         while (*s && isspace((unsigned char)*s)) s++;
                         char* end;
+                        // errno for OUT OF RANGE. Without it strtoll SATURATES
+                        // — to_int("99999999999999999999") returned
+                        // 9223372036854775807 here while the Go VM aborted, so
+                        // the same program meant two different things on the
+                        // two VMs, and the C one silently turned a typo into
+                        // the largest representable quantity. The Go VM uses
+                        // strconv.ParseInt and fails on any error, range
+                        // included; this now matches it.
+                        errno = 0;
                         long long val = strtoll(s, &end, 10);
+                        int out_of_range = (errno == ERANGE);
                         while (*end && isspace((unsigned char)*end)) end++;
-                        if (*end != '\0' || end == s) {
+                        if (*end != '\0' || end == s || out_of_range) {
                             char err[1024];
                             sprintf(err, "[Cryo Security] to_int: '%s' is not a valid integer", a[0].as.str->chars);
                             fatal(err);   // parity with the Go VM: fail-fast (uncatchable)
@@ -1685,9 +2337,20 @@ Value native(int id, Value* a, int argc) {
                         const char* s = a[0].as.str->chars;
                         while (*s && isspace((unsigned char)*s)) s++;
                         char* end;
+                        // OVERFLOW only, which is what Go's ParseFloat calls a
+                        // range error: to_number("1e999") returned +Inf here
+                        // and aborted on the Go VM. strtod also sets ERANGE on
+                        // UNDERFLOW, where it returns zero or a denormal — and
+                        // there the two VMs already agreed that "1e-999" is 0,
+                        // because Go does not treat underflow as an error. So
+                        // the test is ERANGE *and* infinite, which separates
+                        // the two exactly. A literal "Inf" is unaffected:
+                        // strtod parses it without setting ERANGE.
+                        errno = 0;
                         double val = strtod(s, &end);
+                        int out_of_range = (errno == ERANGE && isinf(val));
                         while (*end && isspace((unsigned char)*end)) end++;
-                        if (*end != '\0' || end == s) {
+                        if (*end != '\0' || end == s || out_of_range) {
                             char err[1024];
                             sprintf(err, "[Cryo Security] to_number: '%s' is not a valid number", a[0].as.str->chars);
                             fatal(err);   // parity with the Go VM: fail-fast (uncatchable)
@@ -1869,7 +2532,7 @@ Value native(int id, Value* a, int argc) {
             {
                 { char* u = value_to_string(a[0]); cap_net(u, "http_get()"); free(u); }
                 char* url = value_to_string(a[0]);
-                char* res = http_get_curl(url);
+                char* res = http_client_request(url, NULL, 0);
                 Value rval = val_str(res, strlen(res));
                 free(url); free(res);
                 return rval;
@@ -1879,7 +2542,7 @@ Value native(int id, Value* a, int argc) {
                 { char* u = value_to_string(a[0]); cap_net(u, "http_post()"); free(u); }
                 char* url = value_to_string(a[0]);
                 char* body = value_to_string(a[1]);
-                char* res = http_post_curl(url, body);
+                char* res = http_client_request(url, body, strlen(body));
                 Value rval = val_str(res, strlen(res));
                 free(url); free(body); free(res);
                 return rval;
@@ -1896,7 +2559,7 @@ Value native(int id, Value* a, int argc) {
                   cap_fs(false, wp, "write_bytes()"); free(wp); }
                 if (a[1].kind != VAL_ARRAY) return val_bool(false);
                 char* path = value_to_string(a[0]);
-                FILE* fp = fopen(path, "wb");
+                FILE* fp = pyro_fopen(path, "wb");
                 free(path);
                 if (!fp) return val_bool(false);
                 RcArray* arr = a[1].as.arr;
@@ -1913,7 +2576,7 @@ Value native(int id, Value* a, int argc) {
                 { char* rp = value_to_string(a[0]);
                   cap_fs(true, rp, "read_file()"); free(rp); }
                 char* path = value_to_string(a[0]);
-                FILE* fp = fopen(path, "rb");
+                FILE* fp = pyro_fopen(path, "rb");
                 free(path);
                 if (!fp) return val_str("", 0);
                 fseek(fp, 0, SEEK_END);
@@ -2151,10 +2814,7 @@ Value native(int id, Value* a, int argc) {
         case 52: // http_listen(port) -> bool
             {
                 cap_net("listen", "http_listen()");
-#ifdef _WIN32
-                WSADATA wsa;
-                if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return val_bool(false);
-#endif
+                if (!http_wsa_ready()) return val_bool(false);
                 if (g_http_srv != PYRO_BADSOCK) pyro_closesock(g_http_srv);
                 int64_t port = (a[0].kind == VAL_INT) ? a[0].as.i : (int64_t)value_as_float(a[0]);
                 pyro_sock srv = socket(AF_INET, SOCK_STREAM, 0);
@@ -2191,9 +2851,12 @@ Value native(int id, Value* a, int argc) {
                 method[0] = '\0'; path[0] = '\0'; query[0] = '\0';
                 pyro_sock c = accept(g_http_srv, NULL, NULL);
                 char* hdrs = NULL;
+                if (c != PYRO_BADSOCK) sock_set_nonblocking(c);
                 if (c != PYRO_BADSOCK &&
                     !http_read_request(c, method, sizeof(method), path, sizeof(path),
-                                       query, sizeof(query), &body, &hdrs)) {
+                                       query, sizeof(query), &body, &hdrs,
+                                       http_clock_ms() + http_env_ms("PYRO_HTTP_TIMEOUT_MS",
+                                                                     PYRO_HTTP_SERVER_TIMEOUT_MS))) {
                     pyro_closesock(c);
                     c = PYRO_BADSOCK;
                     method[0] = '\0'; path[0] = '\0'; query[0] = '\0';
@@ -2245,7 +2908,10 @@ Value native(int id, Value* a, int argc) {
                         "Connection: close\r\n\r\n%s",
                         (long long)status, http_status_text(status), ctype,
                         (long long)plen, payload);
-                    ok = (send(g_http_conn, resp, n, 0) == n);
+                    // A client that stops reading must not hold the server either.
+                    ok = n > 0 && sock_send_all(g_http_conn, resp, (size_t)n,
+                             http_clock_ms() + http_env_ms("PYRO_HTTP_TIMEOUT_MS",
+                                                           PYRO_HTTP_SERVER_TIMEOUT_MS));
                     free(resp);
                 }
                 free(ctype); free(payload);
@@ -2259,8 +2925,13 @@ Value native(int id, Value* a, int argc) {
         case 55: // file_exists(path) -> bool
             {
                 char* p = value_to_string(a[0]);
+#ifdef _WIN32
+                WIN32_FILE_ATTRIBUTE_DATA d;
+                bool ok = (pyro_attrs(p, &d) == 0);
+#else
                 struct stat st;
                 bool ok = (stat(p, &st) == 0);
+#endif
                 free(p);
                 return val_bool(ok);
             }
@@ -2317,15 +2988,22 @@ Value native(int id, Value* a, int argc) {
                 char* p = value_to_string(a[0]);
                 cap_fs(false, p, "delete_file()");
                 bool ok = false;
-                if (!pyro_is_dir(p)) ok = (remove(p) == 0);
+                if (!pyro_is_dir(p)) ok = (pyro_remove(p) == 0);
                 free(p);
                 return val_bool(ok);
             }
         case 60: // file_size(path) -> int (-1 when it cannot be read)
             {
                 char* p = value_to_string(a[0]);
+#ifdef _WIN32
+                WIN32_FILE_ATTRIBUTE_DATA d;
+                int64_t sz = (pyro_attrs(p, &d) == 0)
+                    ? (((int64_t)d.nFileSizeHigh << 32) | (int64_t)d.nFileSizeLow)
+                    : -1;
+#else
                 struct stat st;
                 int64_t sz = (stat(p, &st) == 0) ? (int64_t)st.st_size : -1;
+#endif
                 free(p);
                 return val_int(sz);
             }
@@ -2334,7 +3012,7 @@ Value native(int id, Value* a, int argc) {
                 char* p = value_to_string(a[0]);
                 cap_fs(false, p, "write_file()");
                 char* c = value_to_string(a[1]);
-                FILE* f = fopen(p, "wb");
+                FILE* f = pyro_fopen(p, "wb");
                 bool ok = false;
                 if (f) {
                     size_t len = strlen(c);
@@ -2403,7 +3081,7 @@ Value native(int id, Value* a, int argc) {
                 if (tmp) {
                     memcpy(tmp, path, plen);
                     memcpy(tmp + plen, ".tmp", 5);
-                    FILE* f = fopen(tmp, "wb");
+                    FILE* f = pyro_fopen(tmp, "wb");
                     if (f) {
                         size_t dlen = strlen(data);
                         ok = (fwrite(data, 1, dlen, f) == dlen);
@@ -2415,10 +3093,10 @@ Value native(int id, Value* a, int argc) {
                             // MoveFileEx replaces it in one step.
                             ok = MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING) != 0;
 #else
-                            ok = (rename(tmp, path) == 0);
+                            ok = (pyro_rename(tmp, path) == 0);
 #endif
                         }
-                        if (!ok) remove(tmp);
+                        if (!ok) pyro_remove(tmp);
                     }
                     free(tmp);
                 }
@@ -2504,10 +3182,26 @@ RcArray* split_str(const char* s, const char* sep) {
     int64_t slen = strlen(s);
     int64_t seplen = strlen(sep);
     if (seplen == 0) {
-        for (int64_t i = 0; i < slen; i++) {
-            Value ch = val_str(s + i, 1);
+        /* ONE CHARACTER per element, not one byte. The Go VM reaches this
+         * through Go's strings.Split, whose empty separator steps RUNES, so
+         * split("Ação", "") is four elements there and was six here — with
+         * four half-characters in the middle. chars() is built on this, and
+         * so is every helper built on chars(), which made the C VM corrupt
+         * text that the Go VM handled correctly.
+         *
+         * A malformed sequence yields one byte and moves on, so data read
+         * from a file or a socket cannot stall the loop. */
+        for (int64_t i = 0; i < slen; ) {
+            unsigned char c = (unsigned char)s[i];
+            int64_t n = 1;
+            if      ((c & 0xE0) == 0xC0) n = 2;
+            else if ((c & 0xF0) == 0xE0) n = 3;
+            else if ((c & 0xF8) == 0xF0) n = 4;
+            if (i + n > slen) n = 1;              /* truncated at the end */
+            Value ch = val_str(s + i, (size_t)n);
             rc_array_push(arr, ch);
             release_value(ch);
+            i += n;
         }
         return arr;
     }
@@ -2556,6 +3250,45 @@ RcString* join_arr(RcArray* arr, const char* sep) {
 }
 
 // ── Binary Operations Implementation ──────────────────────────
+// Checked int64 arithmetic: 1 on overflow, else 0 with the result in *r.
+// Signed overflow is undefined behaviour in C, so the portable branch detects
+// it without performing it (CERT INT32-C); gcc/clang have builtins for it.
+static int pyro_add_ovf(int64_t a, int64_t b, int64_t* r) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_add_overflow(a, b, r);
+#else
+    if ((b > 0 && a > INT64_MAX - b) || (b < 0 && a < INT64_MIN - b)) return 1;
+    *r = a + b;
+    return 0;
+#endif
+}
+
+static int pyro_sub_ovf(int64_t a, int64_t b, int64_t* r) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_sub_overflow(a, b, r);
+#else
+    if ((b < 0 && a > INT64_MAX + b) || (b > 0 && a < INT64_MIN + b)) return 1;
+    *r = a - b;
+    return 0;
+#endif
+}
+
+static int pyro_mul_ovf(int64_t a, int64_t b, int64_t* r) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_mul_overflow(a, b, r);
+#else
+    if (a > 0) {
+        if (b > 0) { if (a > INT64_MAX / b) return 1; }
+        else       { if (b < INT64_MIN / a) return 1; }
+    } else {
+        if (b > 0) { if (a < INT64_MIN / b) return 1; }
+        else       { if (a != 0 && b < INT64_MAX / a) return 1; }
+    }
+    *r = a * b;
+    return 0;
+#endif
+}
+
 Value bin_op(uint8_t op, Value a, Value b) {
     if (op == opADD && (a.kind == VAL_STR || b.kind == VAL_STR)) {
         return str_concat(a, b);
@@ -2595,9 +3328,23 @@ Value bin_op(uint8_t op, Value a, Value b) {
     int64_t x = a.as.i;
     int64_t y = b.as.i;
     switch (op) {
-        case opADD: return val_int(x + y);
-        case opSUB: return val_int(x - y);
-        case opMUL: return val_int(x * y);
+        // `+ - *` abort on overflow, with the go/c backends' messages.
+        // Shared by the C VM, the C++ VM and the AOT route.
+        case opADD: {
+            int64_t r;
+            if (pyro_add_ovf(x, y, &r)) fatal("[Cryo Security] Overflow: integer addition");
+            return val_int(r);
+        }
+        case opSUB: {
+            int64_t r;
+            if (pyro_sub_ovf(x, y, &r)) fatal("[Cryo Security] Overflow: integer subtraction");
+            return val_int(r);
+        }
+        case opMUL: {
+            int64_t r;
+            if (pyro_mul_ovf(x, y, &r)) fatal("[Cryo Security] Overflow: integer multiplication");
+            return val_int(r);
+        }
         case opDIV:
             if (y == 0) {
                 fatal("[Cryo Security] DivByZero: integer division");

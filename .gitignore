@@ -6,3 +6,6 @@ __pycache__/
 *.exe
 vm/pyrovm
 vm/pyrovm_go
+
+# 11.23 — incremental compilation cache (content-addressed, disposable)
+.cryocache/

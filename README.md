@@ -67,8 +67,12 @@ To compile both the Go and C virtual machines, you need a Go compiler (Go 1.18+)
 **Go VM Compilation:**
 ```bash
 cd Pyro/vm
-go build -o pyrovm_go.exe main.go
+go build -o pyrovm_go.exe .
 ```
+
+Build the package, not `main.go` — the debugger and the sampling profiler
+(11.25) live in `debug.go` and `profile.go` beside it, and naming one file
+leaves them out.
 
 **C VM Compilation (GCC/MinGW/Clang):**
 ```bash
@@ -94,3 +98,61 @@ It builds both interpreters (auto-detecting gcc/clang/MSVC) and compares stdout,
 stderr and exit codes across the examples, abort/try-catch cases, `write_bytes`
 output, runtime semantics regressions, and the responses served by `http_serve` —
 33 scenarios. It skips cleanly when no C toolchain is present.
+
+---
+
+## 🐞 Debugging and profiling (11.25)
+
+Both are options of the VM, and both read the **debug section** the compiler
+already writes (`flags` bit1, `pc → line`). Nothing about the file format
+changes, so a `.pyro` built before either existed can be debugged and profiled.
+
+Options come **before** the program; everything after it is the program's, so a
+script that takes its own `--debug` is never intercepted.
+
+### Debugger
+
+```bash
+python Burnout/pyro.py debug program.cryo
+# or, on a .pyro directly:
+Pyro/vm/pyrovm_go.exe --debug --source=program.cryo program.pyro
+```
+
+| | |
+|---|---|
+| `break <line>` / `break <function>` | stop there — `delete <line>`, `delete all` |
+| `step` / `next` | one source line, into or over calls |
+| `stepi` | one bytecode instruction |
+| `finish` | run until the current function returns |
+| `continue` | run to the next breakpoint |
+| `backtrace`, `list`, `info locals`, `info break` | inspect where you are |
+
+Breakpoints resolve to **statement boundaries**, which is exactly what the
+debug section records. `break 12` on a line that begins no statement is refused
+and names the nearest line that does, rather than arming a breakpoint that can
+never fire. `break <function>` resolves to the function's first statement — not
+to its entry pc, which is prologue and belongs to whatever came before it.
+
+**Locals are shown by slot**, not by name: the debug section holds `pc → line`
+and nothing else, so the names are not in the file to show. Parameters come
+first, in declaration order.
+
+### Sampling profiler
+
+```bash
+python Burnout/pyro.py profile program.cryo --hz 5000
+```
+
+```
+=== Pyro profile — 30.8 ms, 51 samples at 5000 Hz ===
+   samples     self    self ms  function
+        51  100.00%       30.8  slow
+```
+
+It reports **self** time — the function on top of the stack when the sample was
+taken. Time inside natives (`sleep`, `http_get`, file reads) is charged to the
+Cryo function that called them. A program that finishes inside one sampling
+period is told so rather than shown an empty table; raise `--hz`.
+
+Neither costs anything when unused: see [BENCHMARKS.md](BENCHMARKS.md), where
+the per-instruction check is measured rather than argued about.

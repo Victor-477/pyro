@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"runtime"
 	"os"
+	"runtime/pprof"
 	"reflect"
 	"sort"
 	"strconv"
@@ -30,8 +31,37 @@ import (
 	"time"
 )
 
-// HTTP client with timeout, shared by network natives
+// HTTP client shared by http_get/http_post. Its Timeout is refreshed from
+// PYRO_HTTP_CLIENT_TIMEOUT_MS on every call (see httpEnvTimeout).
 var httpClient = &http.Client{Timeout: 15 * time.Second}
+
+// HTTP deadlines (ESCOPO L-09 / L-18), mirrored by pyro_runtime.c:
+//
+//	PYRO_HTTP_TIMEOUT_MS         server: read a request / write a response (10000)
+//	PYRO_HTTP_CLIENT_TIMEOUT_MS  http_get/http_post, whole exchange (15000)
+//
+// The server deadline is ABSOLUTE for the whole request, so a client trickling
+// one byte at a time cannot hold the sequential accept loop either.
+const (
+	httpServerTimeoutMs = 10000
+	httpClientTimeoutMs = 15000
+	httpMaxHeader       = 65535            // the C VM's request buffer
+	httpMaxBody         = 64 * 1024 * 1024 // request bodies above this are refused
+)
+
+func httpEnvTimeout(name string, dfltMs int64) time.Duration {
+	ms := dfltMs
+	if s := os.Getenv(name); s != "" {
+		if v, err := strconv.ParseInt(s, 10, 64); err == nil && v > 0 {
+			ms = v
+		}
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func httpServerTimeout() time.Duration {
+	return httpEnvTimeout("PYRO_HTTP_TIMEOUT_MS", httpServerTimeoutMs)
+}
 
 var stdin = bufio.NewReader(os.Stdin)
 
@@ -230,7 +260,7 @@ func httpParseRequest(c net.Conn) (method, path, query, body string, hdrs map[st
 		return "", "", "", "", hdrs, false
 	}
 	parts := strings.Fields(strings.TrimSpace(line))
-	if len(parts) < 2 {
+	if len(parts) < 2 || len(line) > httpMaxHeader {
 		return "", "", "", "", hdrs, false
 	}
 	method, target := parts[0], parts[1]
@@ -240,9 +270,13 @@ func httpParseRequest(c net.Conn) (method, path, query, body string, hdrs map[st
 		path = target
 	}
 	length := 0
+	headerBytes := len(line)
 	for {
 		h, err := r.ReadString('\n')
 		if err != nil {
+			return "", "", "", "", hdrs, false
+		}
+		if headerBytes += len(h); headerBytes > httpMaxHeader {
 			return "", "", "", "", hdrs, false
 		}
 		h = strings.TrimSpace(h)
@@ -257,6 +291,9 @@ func httpParseRequest(c net.Conn) (method, path, query, body string, hdrs map[st
 				length, _ = strconv.Atoi(val)
 			}
 		}
+	}
+	if length > httpMaxBody {
+		return "", "", "", "", hdrs, false
 	}
 	if length > 0 {
 		buf := make([]byte, length)
@@ -366,6 +403,11 @@ const (
 	// function read and assign them. Operand is a u16 slot index.
 	opGETGLOBAL = 0x76
 	opSETGLOBAL = 0x77
+	// Roadmap 12.5 — concurrency. opSPAWN pops a function value (a closure over
+	// the spawned expression) and starts a task; opAWAIT pops a future and
+	// yields until that task has produced its value.
+	opSPAWN = 0x78
+	opAWAIT = 0x79
 )
 
 const noSlot = 0xFFFF
@@ -380,6 +422,7 @@ const (
 	kArray // *[]Value (reference: push/setidx mutate the shared array)
 	kMap   // map[any]Value (structs also use this type)
 	kFunc  // first-class function value (i = function index)
+	kFuture // 12.5 — a spawned task's result (i = task id)
 )
 
 type Value struct {
@@ -400,6 +443,7 @@ func vNull() Value            { return Value{k: kNull} }
 func vArr(a []Value) Value    { return Value{k: kArray, arr: &a} }
 func vMap(m map[any]Value) Value { return Value{k: kMap, m: m} }
 func vFunc(idx int64) Value    { return Value{k: kFunc, i: idx} }
+func vFuture(id int64) Value  { return Value{k: kFuture, i: id} }
 
 // vClosure: a function value carrying captured values (captured BY VALUE).
 // They are copied into the leading locals of the callee by opCALLVALUE.
@@ -532,6 +576,8 @@ func (v Value) String() string {
 		return "{" + join(parts, ", ") + "}"
 	case kFunc:
 		return "<fn#" + strconv.FormatInt(v.i, 10) + ">"
+	case kFuture:
+		return "<future#" + strconv.FormatInt(v.i, 10) + ">"
 	default:
 		return "null"
 	}
@@ -584,6 +630,60 @@ type frame struct {
 	retpc  int
 	locals []Value
 	fn     int // function index (for stack trace)
+	// localsBase mirrors the C Frame's `locals_base`: this frame's offset
+	// into the single `locals_stack[65536]` the C VM carves every frame's
+	// locals out of. Go allocates each frame's locals on the heap and so
+	// cannot overflow that array — but it must still ABORT WHERE C DOES, or
+	// the two engines disagree about which programs are runnable. Kept in the
+	// frame rather than as a running counter so unwinding needs no bookkeeping:
+	// it is always re-derived from the frame below (see nextLocalsBase).
+	localsBase int
+}
+
+// exception handler (try/catch). Per-task: an unwind must not cross into
+// another task's stack, so 12.5 moved this out of run()'s locals.
+type handler struct {
+	catchPC int
+	sp      int // operand stack depth upon entering try
+	fp      int // frame stack depth
+	slot    int // catch variable slot (noSlot = none)
+}
+
+// ── 12.5: tasks ─────────────────────────────────────────────
+//
+// A task is one independent execution context: its own operand stack, call
+// frames, pc and handlers. Globals and the heap are SHARED, exactly as
+// goroutines share them on the go backend.
+//
+// Scheduling is cooperative and single-threaded, which is a deliberate choice
+// rather than a step towards OS threads. Two properties fall out of it that
+// preemption would cost:
+//
+//   * the output is DETERMINISTIC — tasks run in spawn order and switch only
+//     at defined points, so a program prints the same thing every run. A VM
+//     whose output depends on the host scheduler cannot be compared against
+//     the other backends at all, which is what invariant 1 needs.
+//   * no locking — since no two tasks are ever mid-instruction at once, a
+//     shared array or map cannot tear, and the interpreter loop pays nothing
+//     for concurrency it is not using.
+//
+// What it does NOT buy: CPU parallelism. Two compute-bound tasks take as long
+// as running them one after the other. The win is on WAITING — see sleep.
+type task struct {
+	id       int
+	stack    []Value
+	sp       int
+	frames   []frame
+	pc       int
+	handlers []handler
+
+	done   bool
+	result Value
+
+	// parked until wakeAt (sleep), or waiting for `awaiting` to finish.
+	wakeAt   time.Time
+	sleeping bool
+	awaiting int // -1 = not waiting on a task
 }
 
 // ── debug state (for stack traces in fatal) ────────
@@ -636,6 +736,10 @@ func stackTrace() string {
 }
 
 func fatal(msg string) {
+	if cpuStop != nil {
+		cpuStop()
+		cpuStop = nil
+	}
 	fmt.Fprintln(os.Stderr, "[Pyro VM] "+msg)
 	if tr := stackTrace(); tr != "" {
 		fmt.Fprintln(os.Stderr, tr)
@@ -655,6 +759,10 @@ func load(data []byte) *Program {
 		fatal("unsupported .pyro version (expected v2 or v3)")
 	}
 	flags := data[5]
+	// 11.14 — integrity. Checked BEFORE anything is parsed: everything below
+	// reads offsets and lengths out of this buffer, and a tampered container is
+	// exactly the input that makes those lie.
+	data = verifySignature(data, flags)
 	p := &Program{}
 	pos := 6
 	rd16 := func() int { v := int(binary.LittleEndian.Uint16(data[pos:])); pos += 2; return v }
@@ -825,16 +933,124 @@ func indexSet(cont, key, val Value) {
 
 // ── execution ────────────────────────────────────────────────
 
+// 13.4 — the operand stack is a slice indexed by an integer `sp`, not a slice
+// grown with append.
+//
+// The profile in BENCHMARKS.md is what chose this. On `arith`, the densest
+// opcode mix in the suite, `pop` was 14% flat and `push` 7% while `binOp` — the
+// arithmetic the instructions exist to perform — was 7%. A fifth of the VM's
+// time was operand-stack bookkeeping: every push an `append` with a capacity
+// check and a slice-header write-back, every pop a re-slice, and both behind an
+// indirect call through a closure the compiler cannot inline (they are captured
+// by save/load, so they and the stack live on the heap).
+//
+// `stack[sp] = v; sp++` and `sp--; v := stack[sp]` at the use site have none of
+// that. The CEILING mirrors the C VM's `static Value stack[65536]`, so the two
+// engines overflow at the same depth on the same program — a Go VM that grew
+// without limit would accept a program the C VM aborts on, which is invariant 1
+// broken in the direction that is hardest to notice, since the engine that
+// disagrees is the one that appears to work.
+//
+// Underflow is caught by Go's own bounds check, exactly as the append version
+// caught it: sp-1 on an empty stack indexes out of range and panics.
+//
+// The stack GROWS rather than being allocated at stackMax up front, and that is
+// a measured decision, not caution. Allocating all 65536 slots made `strings`
+// — the allocation-heavy benchmark — 10% SLOWER while every other program got
+// faster. `Value` contains a string, a slice pointer and a map, so 65536 of
+// them is 4 MB the collector must scan on every cycle whether the program uses
+// two slots or twenty thousand: GODEBUG=gctrace showed GC going from 4% of
+// runtime to 13%. Starting small and doubling keeps the scan proportional to
+// what the program actually uses.
+//
+// One headroom check per instruction pays for it, in the same place and shape
+// the C VM has always had it. No instruction pushes more than it pops plus one,
+// so 4 slots of headroom is slack; the check is a single unsigned comparison
+// against a local, not append's capacity test plus call plus slice-header
+// write-back at every push site.
+const (
+	// Every bounded resource the C VM has, with the C VM's own size. A Go VM
+	// that grows where the C VM is fixed ACCEPTS PROGRAMS THE C VM ABORTS ON,
+	// which is invariant 1 broken in the direction that is hardest to notice:
+	// the engine that disagrees is the one that appears to work. 13.4 applied
+	// that reasoning to the value stack and mirrored only that one; the other
+	// two were found by 14.1 writing the parity test for runaway recursion and
+	// discovering the two engines abort at different depths with different
+	// messages — 4095 frames and "call stack overflow" on C, 65531 frames and
+	// "value stack overflow" on Go.
+	stackMax   = 65536 // mirrors `static Value stack[65536]`        (main.c:61)
+	localsMax  = 65536 // mirrors `static Value locals_stack[65536]` (main.c:63)
+	frameMax   = 4096  // mirrors `static Frame frames[4096]`   (main.c:57)
+	handlerMax = 4096  // mirrors `static Handler handlers[4096]` (main.c:59)
+	stackInit  = 256
+)
+
+// checkFrames / checkHandlers: the C VM's guards, in the C VM's shape.
+//
+// `> max-2` rather than `>= max` is not arbitrary — it is main.c:574 and
+// main.c:819 exactly, so both engines abort while pushing the SAME call, and
+// the stack traces this suite compares byte for byte are the same length.
+// Bounded here, not per instruction: these two stacks only move on a call, a
+// return and a try (the 11.22 note in main.c says the same).
+func checkFrames(n int) {
+	if n > frameMax-2 {
+		fatal("malformed .pyro: call stack overflow (runaway recursion?)")
+	}
+}
+
+func checkHandlers(n int) {
+	if n > handlerMax-2 {
+		fatal("malformed .pyro: exception handler stack overflow")
+	}
+}
+
+// nextLocalsBase: where the next frame's locals would start in the C VM's
+// `locals_stack`. Derived from the top frame, so it is correct after a return
+// or an exception unwind without either path having to adjust a counter.
+func nextLocalsBase(frames []frame) int {
+	if len(frames) == 0 {
+		return 0
+	}
+	top := frames[len(frames)-1]
+	return top.localsBase + len(top.locals)
+}
+
+// checkLocals: the C VM writes `locals_stack[next_base + i]` for every local of
+// the callee (main.c:565, main.c:616) and bounded NONE of it — with frames now
+// capped at 4095, a function with 17 locals recursing to ~3900 puts next_base
+// past 65536 and the C VM writes off the end of a static array. That is memory
+// corruption from a VALID program, not from malformed bytecode.
+//
+// Checked BEFORE the frame guard because that is the order the C VM's writes
+// happen in: it fills the locals and only then tests `fp`, so when a deep
+// recursion would trip both, the locals limit is the one that reports.
+func checkLocals(base, nlocals int) {
+	if base+nlocals > localsMax-2 {
+		fatal("malformed .pyro: locals stack overflow (runaway recursion?)")
+	}
+}
+
+// growStack: out of line, because it runs once per doubling and inlining it
+// into the dispatch loop would cost code size on the path that never takes it.
+func growStack(s []Value) []Value {
+	n := len(s) * 2
+	if n > stackMax {
+		n = stackMax
+	}
+	if n == len(s) {
+		// Already at the ceiling. The C VM's wording, so a program that
+		// overflows reports the same thing on both engines.
+		fatal("malformed .pyro: value stack overflow")
+	}
+	out := make([]Value, n)
+	copy(out, s)
+	return out
+}
+
 func run(p *Program) {
 	code := p.code
-	var stack []Value
-	push := func(v Value) { stack = append(stack, v) }
-	pop := func() Value {
-		n := len(stack) - 1
-		v := stack[n]
-		stack = stack[:n]
-		return v
-	}
+	stack := make([]Value, stackInit)
+	sp := 0
 
 	main := p.funcs[p.entryFn]
 	frames := []frame{{retpc: -1, locals: make([]Value, main.nlocals), fn: p.entryFn}}
@@ -851,13 +1067,7 @@ func run(p *Program) {
 	dbgFrames = &frames
 	dbgPC = &pc
 
-	// exception handlers stack (try/catch)
-	type handler struct {
-		catchPC int
-		sp      int // operand stack depth upon entering try
-		fp      int // frame stack depth
-		slot    int // catch variable slot (noSlot = none)
-	}
+	// exception handlers stack (try/catch) — the running task's
 	var handlers []handler
 
 	rd16 := func() int { v := int(binary.LittleEndian.Uint16(code[pc:])); pc += 2; return v }
@@ -870,10 +1080,13 @@ func run(p *Program) {
 		}
 		h := handlers[len(handlers)-1]
 		handlers = handlers[:len(handlers)-1]
-		if h.sp <= len(stack) {
-			stack = stack[:h.sp]
+		if h.sp <= sp {
+			sp = h.sp
 		}
 		frames = frames[:h.fp]
+		// An exception can unwind several frames at once; without this the
+		// profile would keep charging time to a function that already returned.
+		profSet(frames[len(frames)-1].fn)
 		if h.slot != noSlot {
 			frames[len(frames)-1].locals[h.slot] = v
 		}
@@ -881,34 +1094,143 @@ func run(p *Program) {
 		return true
 	}
 
+	// ── 12.5 — the scheduler ─────────────────────────
+	//
+	// run()'s locals (stack/frames/pc/handlers) ARE the running task's working
+	// set; save/load swap them. Doing it this way rather than indirecting every
+	// access through cur.* keeps the interpreter loop byte-for-byte the code it
+	// was before concurrency existed, so a single-task program pays nothing.
+	tasks := []*task{{id: 0, awaiting: -1}}
+	cur := tasks[0]
+	save := func() { cur.stack, cur.sp, cur.frames, cur.pc, cur.handlers = stack, sp, frames, pc, handlers }
+	load := func() {
+		stack, sp, frames, pc, handlers = cur.stack, cur.sp, cur.frames, cur.pc, cur.handlers
+		profSet(frames[len(frames)-1].fn)
+	}
+
+	ready := func(t *task) bool {
+		if t.done {
+			return false
+		}
+		if t.sleeping {
+			return !time.Now().Before(t.wakeAt)
+		}
+		if t.awaiting >= 0 {
+			return tasks[t.awaiting].done
+		}
+		return true
+	}
+
+	// pick: round-robin from the task after the current one, so tasks run in
+	// spawn order and the schedule does not depend on the host. Returns false
+	// when nothing can ever run again.
+	pick := func() bool {
+		n := len(tasks)
+		try := func() bool {
+			for off := 1; off <= n; off++ {
+				t := tasks[(cur.id+off)%n]
+				if ready(t) {
+					t.sleeping = false
+					cur = t
+					return true
+				}
+			}
+			return false
+		}
+		if try() {
+			return true
+		}
+		// Nothing runnable now. If someone is sleeping, the wait is real work:
+		// block until the earliest wake rather than spinning. This is what makes
+		// a fan-out of sleeps cost the LONGEST one instead of their sum.
+		var earliest time.Time
+		for _, t := range tasks {
+			if !t.done && t.sleeping && (earliest.IsZero() || t.wakeAt.Before(earliest)) {
+				earliest = t.wakeAt
+			}
+		}
+		if !earliest.IsZero() {
+			if d := time.Until(earliest); d > 0 {
+				time.Sleep(d)
+			}
+			return try()
+		}
+		return false
+	}
+
+	deadlock := func() {
+		// Naming the cycle matters: "deadlock" alone leaves the reader counting
+		// awaits by hand. A hang would be worse than either.
+		msg := "[Cryo Concurrency] deadlock: no task can make progress"
+		for _, t := range tasks {
+			if !t.done && t.awaiting >= 0 {
+				msg += fmt.Sprintf("\n  task %d is awaiting task %d, which has not finished",
+					t.id, t.awaiting)
+			}
+		}
+		fatal(msg)
+	}
+
+	profBegin(len(p.funcs))
+	profSet(p.entryFn)
+	defer profEnd(p.funcs)
+
 	for {
+		// 11.25 — the debugger's only per-instruction cost. dbgOn is false in
+		// every normal run, and `continue` with no breakpoints set turns it
+		// back off, so a debugged program runs at full speed once it is past
+		// the part you were looking at.
+		if dbgOn {
+			if !dbg.before(pc, frames) {
+				return
+			}
+		}
+		// 13.4 — headroom for this instruction's pushes. One unsigned compare
+		// against a local; the growth itself is out of line and runs at most
+		// log2(stackMax/stackInit) times in a whole program.
+		if sp+4 > len(stack) {
+			stack = growStack(stack)
+		}
 		op := code[pc]
 		pc++
 		switch op {
 		case opHALT:
 			return
 		case opCONST:
-			push(p.consts[rd16()])
+			stack[sp] = p.consts[rd16()]
+			sp++
 		case opTRUE:
-			push(vBool(true))
+			stack[sp] = vBool(true)
+			sp++
 		case opFALSE:
-			push(vBool(false))
+			stack[sp] = vBool(false)
+			sp++
 		case opNULL:
-			push(vNull())
+			stack[sp] = vNull()
+			sp++
 		case opPOP:
-			pop()
+			sp--
 		case opLOAD:
-			push(frames[len(frames)-1].locals[rd16()])
+			stack[sp] = frames[len(frames)-1].locals[rd16()]
+			sp++
 		case opSTORE:
-			frames[len(frames)-1].locals[rd16()] = pop()
+			// rd16() advances pc, so the slot is read BEFORE the pop that
+			// feeds it — writing `locals[rd16()] = stack[sp-1]; sp--` would be
+			// the same order, but spelling the pop out first keeps every site
+			// in this switch reading the same way.
+			slot := rd16()
+			sp--
+			frames[len(frames)-1].locals[slot] = stack[sp]
 		case opGETGLOBAL:
 			i := int(rd16())
 			if i >= len(globals) {
 				// Reading before the initialiser ran. The compiler emits the
 				// initialiser first, so this is defensive rather than reachable.
-				push(Value{k: kNull})
+				stack[sp] = Value{k: kNull}
+				sp++
 			} else {
-				push(globals[i])
+				stack[sp] = globals[i]
+				sp++
 			}
 		case opSETGLOBAL:
 			i := int(rd16())
@@ -917,35 +1239,38 @@ func run(p *Program) {
 			for len(globals) <= i {
 				globals = append(globals, Value{k: kNull})
 			}
-			globals[i] = pop()
+			sp--
+			globals[i] = stack[sp]
 		case opADD, opSUB, opMUL, opDIV, opMOD,
 			opBAND, opBOR, opBXOR, opSHL, opSHR,
 			opEQ, opNE, opLT, opGT, opLE, opGE:
-			b := pop()
-			a := pop()
-			push(binOp(op, a, b))
+			sp -= 2
+			stack[sp] = binOp(op, stack[sp], stack[sp+1])
+			sp++
 		case opNEG:
-			a := pop()
+			a := stack[sp-1]
 			if a.k == kFloat {
-				push(vFloat(-a.f))
+				stack[sp-1] = vFloat(-a.f)
 			} else {
-				push(vInt(-a.i))
+				stack[sp-1] = vInt(-a.i)
 			}
 		case opBNOT:
-			push(vInt(^pop().i))
+			stack[sp-1] = vInt(^stack[sp-1].i)
 		case opNOT:
-			push(vBool(!pop().truthy()))
+			stack[sp-1] = vBool(!stack[sp-1].truthy())
 		case opJMP:
 			rel := rdi32()
 			pc += rel
 		case opJMPF:
 			rel := rdi32()
-			if !pop().truthy() {
+			sp--
+			if !stack[sp].truthy() {
 				pc += rel
 			}
 		case opJMPT:
 			rel := rdi32()
-			if pop().truthy() {
+			sp--
+			if stack[sp].truthy() {
 				pc += rel
 			}
 		case opCALL:
@@ -953,33 +1278,41 @@ func run(p *Program) {
 			argc := int(code[pc])
 			pc++
 			fn := p.funcs[fi]
+			lbase := nextLocalsBase(frames)
+			checkLocals(lbase, int(fn.nlocals))
 			locals := make([]Value, fn.nlocals)
-			base := len(stack) - argc
-			copy(locals, stack[base:])
-			stack = stack[:base]
-			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi})
+			base := sp - argc
+			copy(locals, stack[base:sp])
+			sp = base
+			checkFrames(len(frames))
+			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi, localsBase: lbase})
+			profSet(fi)
 			pc = int(fn.entry)
 		case opPUSHFN:
-			push(vFunc(int64(rd16())))
+			stack[sp] = vFunc(int64(rd16()))
+			sp++
 		case opCLOSURE:
 			fi := int64(rd16())
 			ncap := int(code[pc])
 			pc++
-			base := len(stack) - ncap
+			base := sp - ncap
 			cap := make([]Value, ncap)
-			copy(cap, stack[base:])
-			stack = stack[:base]
-			push(vClosure(fi, cap))
+			copy(cap, stack[base:sp])
+			sp = base
+			stack[sp] = vClosure(fi, cap)
+			sp++
 		case opCALLVALUE:
 			argc := int(code[pc])
 			pc++
-			base := len(stack) - argc
+			base := sp - argc
 			fnval := stack[base-1]
 			if fnval.k != kFunc {
 				fatal("call of a non-function value")
 			}
 			fi := int(fnval.i)
 			fn := p.funcs[fi]
+			lbase := nextLocalsBase(frames)
+			checkLocals(lbase, int(fn.nlocals))
 			locals := make([]Value, fn.nlocals)
 			// captured values occupy the leading locals, then the arguments
 			ncap := 0
@@ -987,26 +1320,46 @@ func run(p *Program) {
 				ncap = len(*fnval.arr)
 				copy(locals, *fnval.arr)
 			}
-			copy(locals[ncap:], stack[base:])
-			stack = stack[:base-1] // drop the args and the fn value beneath them
-			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi})
+			copy(locals[ncap:], stack[base:sp])
+			sp = base - 1 // drop the args and the fn value beneath them
+			checkFrames(len(frames))
+			frames = append(frames, frame{retpc: pc, locals: locals, fn: fi, localsBase: lbase})
+			profSet(fi)
 			pc = int(fn.entry)
 		case opRET:
-			ret := pop()
+			sp--
+			ret := stack[sp]
 			fr := frames[len(frames)-1]
 			frames = frames[:len(frames)-1]
 			if fr.retpc < 0 {
-				return
+				if cur.id == 0 {
+					// The main task returning ends the program, and any task
+					// still in flight is dropped — the same thing that happens
+					// to a goroutine when main returns on the go backend.
+					return
+				}
+				cur.done = true
+				cur.result = ret
+				save()
+				if !pick() {
+					deadlock()
+				}
+				load()
+				break
 			}
+			profSet(frames[len(frames)-1].fn)
 			pc = fr.retpc
-			push(ret)
+			stack[sp] = ret
+			sp++
 		case opPRINT:
-			fmt.Println(pop().String())
+			sp--
+			fmt.Println(stack[sp].String())
 		case opPRINTLN:
 			fmt.Println()
 		case opASSERT:
-			cond := pop()
-			msg := pop()
+			sp -= 2
+			cond := stack[sp+1]
+			msg := stack[sp]
 			if !cond.truthy() {
 				if !raise(vStr("[Cryo Assert] " + msg.String())) {
 					fatal("[Cryo Assert] " + msg.String())
@@ -1015,80 +1368,81 @@ func run(p *Program) {
 		case opTRYPUSH:
 			rel := rdi32()
 			slot := rd16()
+			checkHandlers(len(handlers))
 			handlers = append(handlers, handler{
-				catchPC: pc + rel, sp: len(stack), fp: len(frames), slot: slot})
+				catchPC: pc + rel, sp: sp, fp: len(frames), slot: slot})
 		case opTRYPOP:
 			if len(handlers) > 0 {
 				handlers = handlers[:len(handlers)-1]
 			}
 		case opTHROW:
-			v := pop()
+			sp--
+			v := stack[sp]
 			if !raise(v) {
 				fatal("uncaught exception: " + v.String())
 			}
 		case opCOALESCE:
-			b := pop()
-			a := pop()
-			if a.k == kNull {
-				push(b)
-			} else {
-				push(a)
+			sp -= 2
+			if stack[sp].k == kNull {
+				stack[sp] = stack[sp+1]
 			}
+			sp++
 		case opUNWRAP:
-			a := pop()
-			if a.k == kNull {
+			if stack[sp-1].k == kNull {
+				sp--
 				if !raise(vStr("[Cryo Security] unwrap of null value")) {
 					fatal("[Cryo Security] unwrap of null value")
 				}
-			} else {
-				push(a)
 			}
 		case opNEWARR:
 			n := rd16()
-			base := len(stack) - n
+			base := sp - n
 			elems := make([]Value, n)
-			copy(elems, stack[base:])
-			stack = stack[:base]
-			push(vArr(elems))
+			copy(elems, stack[base:sp])
+			sp = base
+			stack[sp] = vArr(elems)
+			sp++
 		case opNEWMAP:
 			n := rd16()
-			base := len(stack) - 2*n
+			base := sp - 2*n
 			mm := make(map[any]Value, n)
 			for j := 0; j < n; j++ {
 				mm[keyOf(stack[base+2*j])] = stack[base+2*j+1]
 			}
-			stack = stack[:base]
-			push(vMap(mm))
+			sp = base
+			stack[sp] = vMap(mm)
+			sp++
 		case opINDEX:
-			key := pop()
-			cont := pop()
-			push(indexGet(cont, key))
+			sp -= 2
+			stack[sp] = indexGet(stack[sp], stack[sp+1])
+			sp++
 		case opSETIDX:
-			val := pop()
-			key := pop()
-			cont := pop()
-			indexSet(cont, key, val)
+			sp -= 3
+			indexSet(stack[sp], stack[sp+1], stack[sp+2])
 		case opLEN:
-			push(vInt(lengthOf(pop())))
+			stack[sp-1] = vInt(lengthOf(stack[sp-1]))
 		case opAPPEND:
-			val := pop()
-			arr := pop()
+			sp -= 2
+			arr := stack[sp]
 			if arr.k != kArray {
 				fatal("push on a non-array value")
 			}
-			*arr.arr = append(*arr.arr, val)
-			push(vInt(int64(len(*arr.arr))))
+			*arr.arr = append(*arr.arr, stack[sp+1])
+			stack[sp] = vInt(int64(len(*arr.arr)))
+			sp++
 		case opHAS:
-			key := pop()
-			mp := pop()
+			sp -= 2
+			mp := stack[sp]
 			if mp.k != kMap {
-				push(vBool(false))
+				stack[sp] = vBool(false)
 			} else {
-				_, ok := mp.m[keyOf(key)]
-				push(vBool(ok))
+				_, ok := mp.m[keyOf(stack[sp+1])]
+				stack[sp] = vBool(ok)
 			}
+			sp++
 		case opKEYS:
-			mp := pop()
+			sp--
+			mp := stack[sp]
 			if mp.k != kMap {
 				fatal("keys() applied to a non-map value")
 			}
@@ -1097,16 +1451,91 @@ func run(p *Program) {
 			for i, k := range ks {
 				out[i] = keyToValue(k)
 			}
-			push(vArr(out))
+			stack[sp] = vArr(out)
+			sp++
+		case opSPAWN:
+			sp--
+			fnval := stack[sp]
+			if fnval.k != kFunc {
+				fatal("spawn of a non-function value")
+			}
+			fi := int(fnval.i)
+			fn := p.funcs[fi]
+			locals := make([]Value, fn.nlocals)
+			if fnval.arr != nil {
+				copy(locals, *fnval.arr) // captured values lead the locals
+			}
+			nt := &task{
+				id: len(tasks),
+				// Its own operand stack, allocated here rather than left nil:
+				// with an index-based stack there is no append to grow one on
+				// first use, and load() would hand the interpreter a nil slice.
+				stack:    make([]Value, stackInit),
+				awaiting: -1,
+				frames:   []frame{{retpc: -1, locals: locals, fn: fi}},
+				pc:       int(fn.entry),
+			}
+			tasks = append(tasks, nt)
+			// The spawner keeps running: `spawn` fires work off, it does not
+			// hand over. The new task runs at the spawner's next yield.
+			stack[sp] = vFuture(int64(nt.id))
+			sp++
+		case opAWAIT:
+			sp--
+			fv := stack[sp]
+			if fv.k != kFuture {
+				fatal("await of a non-future value")
+			}
+			tid := int(fv.i)
+			if tid == cur.id {
+				fatal("[Cryo Concurrency] a task cannot await itself")
+			}
+			if tasks[tid].done {
+				cur.awaiting = -1
+				stack[sp] = tasks[tid].result
+				sp++
+				break
+			}
+			// Not ready. Put the future back and rewind to this instruction, so
+			// resuming re-executes the await instead of finishing it inside
+			// whichever task runs next — the switch below changes the working
+			// set out from under this case.
+			stack[sp] = fv
+			sp++
+			pc--
+			cur.awaiting = tid
+			save()
+			if !pick() {
+				deadlock()
+			}
+			load()
 		case opNATIVE:
 			nid := int(code[pc])
 			argc := int(code[pc+1])
 			pc += 2
-			base := len(stack) - argc
+			base := sp - argc
 			args := make([]Value, argc)
-			copy(args, stack[base:])
-			stack = stack[:base]
-			push(native(nid, args))
+			copy(args, stack[base:sp])
+			sp = base
+			// 12.5 — sleep is the yield point, and the only one. A task that
+			// waits lets the others run, which is the whole reason to spawn:
+			// five tasks sleeping 30ms cost 30ms, not 150ms. With no other
+			// task alive it is an ordinary sleep, so a single-threaded program
+			// behaves exactly as before.
+			if nid == 26 && argc == 1 && len(tasks) > 1 {
+				cur.sleeping = true
+				cur.wakeAt = time.Now().Add(time.Duration(nativeInt(args[0])) * time.Millisecond)
+				stack[sp] = vNull() // sleep's own result, left for the resumed task
+				sp++
+				save()
+				if !pick() {
+					deadlock()
+				}
+				load()
+				break
+			}
+			stack[sp] = native(nid, args)
+			sp++
 		default:
 			fatal(fmt.Sprintf("unknown opcode 0x%02X at pc=%d", op, pc-1))
 		}
@@ -1175,24 +1604,33 @@ func goToValue(x interface{}) Value {
 }
 
 // httpGet: simple GET; returns the body, or "" in case of error (like in go).
+// A body cut short (timeout mid-read) is a failure too, as in the C VM.
 func httpGet(url string) string {
+	httpClient.Timeout = httpEnvTimeout("PYRO_HTTP_CLIENT_TIMEOUT_MS", httpClientTimeoutMs)
 	resp, err := httpClient.Get(url)
 	if err != nil {
 		return ""
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
 	return string(b)
 }
 
 // httpPost: POST with body (content-type application/json), like in the go backend.
 func httpPost(url, body string) string {
+	httpClient.Timeout = httpEnvTimeout("PYRO_HTTP_CLIENT_TIMEOUT_MS", httpClientTimeoutMs)
 	resp, err := httpClient.Post(url, "application/json", strings.NewReader(body))
 	if err != nil {
 		return ""
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
 	return string(b)
 }
 
@@ -1404,7 +1842,9 @@ func native(id int, a []Value) Value {
 			fsrv.ServeHTTP(w, r)
 		})
 		fmt.Printf("[pyro] serving %s on http://localhost:%d\n", dir, a[0].i)
-		if err := http.ListenAndServe(fmt.Sprintf(":%d", a[0].i), h); err != nil {
+		srv := &http.Server{Addr: fmt.Sprintf(":%d", a[0].i), Handler: h,
+			ReadTimeout: httpServerTimeout(), WriteTimeout: httpServerTimeout()}
+		if err := srv.ListenAndServe(); err != nil {
 			fatal("http_serve: " + err.Error())
 		}
 		return vNull()
@@ -1630,6 +2070,9 @@ func native(id int, a []Value) Value {
 		if err != nil {
 			return empty()
 		}
+		// An idle or trickling client is dropped at the deadline instead of
+		// holding the sequential server (L-09).
+		c.SetReadDeadline(time.Now().Add(httpServerTimeout()))
 		method, path, query, body, hdrs, ok := httpParseRequest(c)
 		if !ok {
 			c.Close()
@@ -1659,6 +2102,8 @@ func native(id int, a []Value) Value {
 			"Content-Type: " + ctype + "\r\n" +
 			"Content-Length: " + strconv.Itoa(len(payload)) + "\r\n" +
 			"Connection: close\r\n\r\n" + payload
+		// A client that stops reading must not hold the server either.
+		httpConn.SetWriteDeadline(time.Now().Add(httpServerTimeout()))
 		_, werr := httpConn.Write([]byte(resp))
 		httpConn.Close()
 		httpConn = nil
@@ -1876,12 +2321,30 @@ func binOp(op byte, a, b Value) Value {
 	}
 	x, y := a.i, b.i
 	switch op {
+	// `+ - *` abort on overflow (PYRO_RUNTIME.md: "fail-fast"), with the same
+	// message the go and c backends print. They used to wrap silently, so the
+	// same program printed a wrong number here and panicked there.
 	case opADD:
-		return vInt(x + y)
+		s := x + y
+		if (y > 0 && s < x) || (y < 0 && s > x) {
+			fatal("[Cryo Security] Overflow: integer addition")
+		}
+		return vInt(s)
 	case opSUB:
-		return vInt(x - y)
+		s := x - y
+		if (y < 0 && s < x) || (y > 0 && s > x) {
+			fatal("[Cryo Security] Overflow: integer subtraction")
+		}
+		return vInt(s)
 	case opMUL:
-		return vInt(x * y)
+		if x == 0 || y == 0 {
+			return vInt(0)
+		}
+		s := x * y
+		if (x == -1 && y == -1<<63) || (y == -1 && x == -1<<63) || s/y != x {
+			fatal("[Cryo Security] Overflow: integer multiplication")
+		}
+		return vInt(s)
 	case opDIV:
 		if y == 0 {
 			fatal("[Cryo Security] DivByZero: integer division")
@@ -1956,11 +2419,87 @@ func valueEq(a, b Value) bool {
 	return a.k == b.k && a.i == b.i
 }
 
+const usage = `usage: pyrovm [options] program.pyro [args...]
+
+  --debug              stop before the first statement and read commands
+  --source=FILE        the .cryo source, so the debugger can show lines
+  --profile            sample the running program and report time per function
+  --profile-hz=N       sampling rate, default 1000
+  --profile-out=FILE   write the profile there instead of stderr
+  --key=KEY            verify the .pyro signature: refuses a file that does not
+                       match the key, and refuses an UNSIGNED one. Also read
+                       from PYRO_KEY, or PYRO_KEY_FILE for a path — prefer
+                       those, as argv is visible to every process on the box.
+`
+
+// 13.4 — set by --cpuprofile; empty means no profiling and no cost.
+var cpuProfPath string
+
+// cpuStop is invoked before any os.Exit so the profile is flushed.
+// (profStop already exists in profile.go for the 11.25 sampler.)
+var cpuStop func()
+
 func main() {
-	if len(os.Args) < 2 {
-		fatal("usage: pyrovm program.pyro")
+	if p := os.Getenv("PYRO_CPUPROFILE"); p != "" {
+		cpuProfPath = p
 	}
-	data, err := os.ReadFile(os.Args[1])
+	// Options come before the program; everything after it belongs to the
+	// program (the args() native), so a script's own --debug is left alone.
+	args := os.Args[1:]
+	source := ""
+	keySpec := ""
+	debugging := false
+	for len(args) > 0 && strings.HasPrefix(args[0], "--") {
+		a := args[0]
+		args = args[1:]
+		val := ""
+		if i := strings.IndexByte(a, '='); i >= 0 {
+			a, val = a[:i], a[i+1:]
+		}
+		switch a {
+		case "--cpuprofile":
+			// 13.4 — a CPU profile OF THE VM, not of the Cryo program.
+			// --profile (11.25) samples the running program's Cryo functions;
+			// this samples the interpreter itself, which is the only way to
+			// answer where the VM's time actually goes rather than guessing at
+			// the dispatch loop again.
+			// this loop uses `--flag=value`, so take it from val
+			if val != "" {
+				cpuProfPath = val
+			} else if len(args) > 0 {
+				cpuProfPath = args[0]
+				args = args[1:]
+			}
+		case "--debug":
+			debugging = true
+		case "--source":
+			source = val
+		case "--profile":
+			profOn = true
+		case "--profile-hz":
+			n, err := strconv.Atoi(val)
+			if err != nil || n <= 0 {
+				fatal("--profile-hz needs a positive number, got " + val)
+			}
+			profHz = n
+		case "--profile-out":
+			profOut = val
+		case "--key":
+			keySpec = val
+		case "--help", "-h":
+			fmt.Print(usage)
+			return
+		default:
+			fatal("unknown option " + a + "\n" + usage)
+		}
+	}
+	if len(args) < 1 {
+		fatal(usage)
+	}
+	// Before the file is read: a configured key decides whether we are willing
+	// to run it at all (11.14).
+	loadSigningKey(keySpec)
+	data, err := os.ReadFile(args[0])
 	if err != nil {
 		fatal("could not read: " + err.Error())
 	}
@@ -1972,6 +2511,38 @@ func main() {
 	if os.Getenv("PYRO_SANDBOX") == "1" {
 		sandboxed = true
 	}
-	progArgs = os.Args[2:]   // exposed to the program via the args() native
-	run(load(data))
+	progArgs = args[1:] // exposed to the program via the args() native
+	prog := load(data)
+	if debugging {
+		if len(prog.dbg) == 0 {
+			// Without the debug section there are no lines to stop at, and a
+			// prompt that can only step opcodes is not what was asked for.
+			fatal("this .pyro has no debug section — recompile without stripping it")
+		}
+		dbg = newDebugger(prog, source)
+		dbgOn = true
+	}
+	if cpuProfPath != "" {
+		f, err := os.Create(cpuProfPath)
+		if err == nil {
+			pprof.StartCPUProfile(f)
+			// Stopped explicitly rather than by defer: a Cryo program can end
+			// through fatal()/os.Exit, and a deferred stop never runs then —
+			// which produces an EMPTY profile file and looks like the profiler
+			// is broken rather than like the program exited.
+			defer func() {
+				pprof.StopCPUProfile()
+				f.Close()
+			}()
+			cpuStop = func() {
+				pprof.StopCPUProfile()
+				f.Close()
+			}
+		}
+	}
+	run(prog)
+	if cpuStop != nil {
+		cpuStop()
+		cpuStop = nil
+	}
 }
