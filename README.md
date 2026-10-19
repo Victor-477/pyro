@@ -11,9 +11,11 @@
 ## ⚡ Key Highlights
 
 * **Custom ISA Specification:** Invented instruction set containing register-push-pop, local variable slots, nested scopes, runtime call frames, container instantiation, and native function routes.
-* **Double VM Implementation:**
+* **Multiple VM Implementations:**
   - **Go VM:** Multi-platform VM implemented in Go, featuring fast execution, reflection-based parsing, and automated garbage collection.
-  - **C VM:** Lightweight VM implemented in pure C, featuring deterministic **Reference Counting** memory management (`retain`/`release`) and absolute portability.
+  - **C VM:** Lightweight VM implemented in pure C, featuring deterministic **Reference Counting** memory management (`retain`/`release`) and absolute portability. Builds warning-free under `-std=c11 -Wall` on Linux.
+  - **C++ and C# VMs:** `vm/main.cpp` (over the same C runtime) and `vm/csharp/` (.NET 8), held to the same output.
+* **Fail-Fast Integer Arithmetic:** `+ - *` on `int` abort on int64 overflow on every engine — Go, C, C++, C# and the AOT binary — with the same message as the go and c backends (`[Cryo Security] Overflow: integer addition`). Programs that must recover use `checked_add` / `checked_sub` / `checked_mul`.
 * **Code Obfuscation:** The bytecode section of `.pyro` executables is obfuscated using a rolling XOR key system to prevent trivial decompilation.
 * **Native VM Capabilities:** Direct system integration including native I/O (`input`, `read_file`, `write_bytes`, `args`), HTTP networking (`http_get`, `http_post`) and **serving** (`http_serve`), runtime control (`pyro_exec`, `pyro_env`, `pyro_exit`), and JSON serialization.
 * **Complete Parity System:** The C VM features byte-for-byte stdout, stderr, and exit code parity against the Go VM (validated on every build) — extending to HTTP responses served by `http_serve`.
