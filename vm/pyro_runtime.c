@@ -771,6 +771,39 @@ Value parse_json_string(const char** p) {
             if (ec == 'n') c = '\n';
             else if (ec == 'r') c = '\r';
             else if (ec == 't') c = '\t';
+            else if (ec == 'b') c = '\b';
+            else if (ec == 'f') c = '\f';
+            else if (ec == 'u') {
+                unsigned int cp = 0; int ok = 1;
+                for (int k = 1; k <= 4; k++) {
+                    char hc = (*p)[k];
+                    int hv = (hc >= '0' && hc <= '9') ? (hc - '0') : (hc >= 'a' && hc <= 'f') ? (hc - 'a' + 10) : (hc >= 'A' && hc <= 'F') ? (hc - 'A' + 10) : -1;
+                    if (hv < 0) { ok = 0; break; }
+                    cp = (cp << 4) | (unsigned int)hv;
+                }
+                if (ok) {
+                    *p += 4;
+                    if (cp >= 0xD800 && cp <= 0xDBFF && (*p)[1] == '\\' && (*p)[2] == 'u') {
+                        unsigned int lo = 0; int ok2 = 1;
+                        for (int k = 3; k <= 6; k++) {
+                            char hc = (*p)[k];
+                            int hv = (hc >= '0' && hc <= '9') ? (hc - '0') : (hc >= 'a' && hc <= 'f') ? (hc - 'a' + 10) : (hc >= 'A' && hc <= 'F') ? (hc - 'A' + 10) : -1;
+                            if (hv < 0) { ok2 = 0; break; }
+                            lo = (lo << 4) | (unsigned int)hv;
+                        }
+                        if (ok2 && lo >= 0xDC00 && lo <= 0xDFFF) {
+                            cp = 0x10000 + (((cp - 0xD800) << 10) | (lo - 0xDC00));
+                            *p += 6;
+                        }
+                    }
+                    if (length + 5 >= capacity) { capacity = (capacity + 8) * 2; buf = realloc(buf, capacity); }
+                    if (cp < 0x80) { buf[length++] = (char)cp; }
+                    else if (cp < 0x800) { buf[length++] = (char)(0xC0 | (cp >> 6)); buf[length++] = (char)(0x80 | (cp & 0x3F)); }
+                    else if (cp < 0x10000) { buf[length++] = (char)(0xE0 | (cp >> 12)); buf[length++] = (char)(0x80 | ((cp >> 6) & 0x3F)); buf[length++] = (char)(0x80 | (cp & 0x3F)); }
+                    else { buf[length++] = (char)(0xF0 | (cp >> 18)); buf[length++] = (char)(0x80 | ((cp >> 12) & 0x3F)); buf[length++] = (char)(0x80 | ((cp >> 6) & 0x3F)); buf[length++] = (char)(0x80 | (cp & 0x3F)); }
+                    (*p)++; continue;
+                }
+            }
             else if (ec == '"' || ec == '\\' || ec == '/') c = ec;
         }
         if (length + 1 >= capacity) {
@@ -1870,6 +1903,14 @@ void pyro_asset_add(char* name, char* data, int64_t len) {
 // The POSIX build is untouched: there a path is bytes and fopen already
 // takes UTF-8.
 #ifdef _WIN32
+static char* pyro_utf8(const wchar_t* w) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    if (n <= 0) return NULL;
+    char* s = (char*)malloc((size_t)n);
+    if (!s) return NULL;
+    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, s, n, NULL, NULL) <= 0) { free(s); return NULL; }
+    return s;
+}
 static wchar_t* pyro_wpath(const char* s) {
     int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
     if (n <= 0) return NULL;
@@ -2371,7 +2412,27 @@ Value native(int id, Value* a, int argc) {
         case 12: // upper
             {
                 char* s = value_to_string(a[0]);
-                for (int i = 0; s[i]; i++) s[i] = toupper((unsigned char)s[i]);
+                size_t len = strlen(s);
+                char* out = (char*)malloc(len * 2 + 1);
+                size_t pos = 0;
+                for (size_t i = 0; i < len; ) {
+                    unsigned char b0 = (unsigned char)s[i];
+                    if ((b0 & 0x80) == 0) {
+                        out[pos++] = (char)toupper(b0);
+                        i += 1;
+                    } else if ((b0 & 0xE0) == 0xC0 && i + 1 < len && ((unsigned char)s[i + 1] & 0xC0) == 0x80) {
+                        uint32_t cp = ((uint32_t)(b0 & 0x1F) << 6) | (uint32_t)((unsigned char)s[i + 1] & 0x3F);
+                        if ((cp >= 0x00E0 && cp <= 0x00F6) || (cp >= 0x00F8 && cp <= 0x00FE)) cp -= 0x20;
+                        else if (cp == 0x00FF) cp = 0x0178;
+                        else if ((cp >= 0x0100 && cp <= 0x012F) || (cp >= 0x0132 && cp <= 0x0137) || (cp >= 0x014A && cp <= 0x0177)) cp = (cp & 1) ? cp - 1 : cp;
+                        else if ((cp >= 0x0139 && cp <= 0x0148) || (cp >= 0x0179 && cp <= 0x017E)) cp = (cp & 1) ? cp : cp - 1;
+                        out[pos++] = (char)(0xC0 | (cp >> 6));
+                        out[pos++] = (char)(0x80 | (cp & 0x3F));
+                        i += 2;
+                    } else { out[pos++] = (char)b0; i += 1; }
+                }
+                out[pos] = '\0';
+                free(s); s = out;
                 Value res = val_str(s, strlen(s));
                 free(s);
                 return res;
@@ -2379,7 +2440,27 @@ Value native(int id, Value* a, int argc) {
         case 13: // lower
             {
                 char* s = value_to_string(a[0]);
-                for (int i = 0; s[i]; i++) s[i] = tolower((unsigned char)s[i]);
+                size_t len = strlen(s);
+                char* out = (char*)malloc(len * 2 + 1);
+                size_t pos = 0;
+                for (size_t i = 0; i < len; ) {
+                    unsigned char b0 = (unsigned char)s[i];
+                    if ((b0 & 0x80) == 0) {
+                        out[pos++] = (char)tolower(b0);
+                        i += 1;
+                    } else if ((b0 & 0xE0) == 0xC0 && i + 1 < len && ((unsigned char)s[i + 1] & 0xC0) == 0x80) {
+                        uint32_t cp = ((uint32_t)(b0 & 0x1F) << 6) | (uint32_t)((unsigned char)s[i + 1] & 0x3F);
+                        if ((cp >= 0x00C0 && cp <= 0x00D6) || (cp >= 0x00D8 && cp <= 0x00DE)) cp += 0x20;
+                        else if (cp == 0x0178) cp = 0x00FF;
+                        else if ((cp >= 0x0100 && cp <= 0x012F) || (cp >= 0x0132 && cp <= 0x0137) || (cp >= 0x014A && cp <= 0x0177)) cp = (cp & 1) ? cp : cp + 1;
+                        else if ((cp >= 0x0139 && cp <= 0x0148) || (cp >= 0x0179 && cp <= 0x017E)) cp = (cp & 1) ? cp + 1 : cp;
+                        out[pos++] = (char)(0xC0 | (cp >> 6));
+                        out[pos++] = (char)(0x80 | (cp & 0x3F));
+                        i += 2;
+                    } else { out[pos++] = (char)b0; i += 1; }
+                }
+                out[pos] = '\0';
+                free(s); s = out;
                 Value res = val_str(s, strlen(s));
                 free(s);
                 return res;
@@ -2943,6 +3024,49 @@ Value native(int id, Value* a, int argc) {
                 return val_bool(ok);
             }
         case 57: // list_dir(path) -> string[] (names only, sorted; empty on error)
+#ifdef _WIN32
+            {
+                char* p = value_to_string(a[0]);
+                RcArray* out = rc_array_new();
+                char** names = NULL;
+                int n = 0, cap = 0;
+                size_t plen = strlen(p);
+                char* pat = (char*)malloc(plen + 3);
+                if (!pat) { free(p); return val_array(out); }
+                memcpy(pat, p, plen);
+                pat[plen] = '\\'; pat[plen + 1] = '*'; pat[plen + 2] = '\0';
+                free(p);
+                wchar_t* wp = pyro_wpath(pat);
+                free(pat);
+                if (!wp) return val_array(out);
+                WIN32_FIND_DATAW fd;
+                HANDLE h = FindFirstFileW(wp, &fd);
+                free(wp);
+                if (h == INVALID_HANDLE_VALUE) return val_array(out);
+                do {
+                    if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+                    char* u8 = pyro_utf8(fd.cFileName);
+                    if (!u8) continue;
+                    if (n == cap) {
+                        cap = cap ? cap * 2 : 16;
+                        char** grown = (char**)realloc(names, (size_t)cap * sizeof(char*));
+                        if (!grown) { free(u8); break; }
+                        names = grown;
+                    }
+                    names[n++] = u8;
+                } while (FindNextFileW(h, &fd));
+                FindClose(h);
+                if (names) {
+                    qsort(names, (size_t)n, sizeof(char*), pyro_name_cmp);
+                    for (int i = 0; i < n; i++) {
+                        rc_array_push(out, val_str(names[i], (int64_t)strlen(names[i])));
+                        free(names[i]);
+                    }
+                    free(names);
+                }
+                return val_array(out);
+            }
+#else
             {
                 char* p = value_to_string(a[0]);
                 RcArray* out = rc_array_new();
@@ -2973,6 +3097,7 @@ Value native(int id, Value* a, int argc) {
                 }
                 return val_array(out);
             }
+#endif
         case 58: // make_dir(path) -> bool (creates parents)
             {
                 char* p = value_to_string(a[0]);

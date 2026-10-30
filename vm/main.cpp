@@ -571,7 +571,7 @@ void run_program(Program* p) {
             case opPRINT: {
                 Value v = g_stack[--g_sp];
                 char* s = value_to_string(v);
-                std::cout << s << "\n";
+                std::cout << s << "\n"; std::cout.flush();
                 std::free(s);
                 release_value(v);
                 break;
@@ -593,7 +593,7 @@ void run_program(Program* p) {
                 break;
             }
             case opPRINTLN:
-                std::cout << "\n";
+                std::cout << "\n"; std::cout.flush();
                 break;
             case opNEWARR: {
                 uint16_t n = read_u16(code, &g_pc);
@@ -756,14 +756,47 @@ void run_program(Program* p) {
 
 } // namespace pyro
 
+static bool embedded_program(const char* argv0, std::vector<uint8_t>& out_buf) {
+    std::ifstream f("/proc/self/exe", std::ios::binary | std::ios::ate);
+    if (!f && argv0) f.open(argv0, std::ios::binary | std::ios::ate);
+    if (!f) return false;
+    std::streamsize total = f.tellg();
+    if (total < 16) return false;
+    f.seekg(total - 16, std::ios::beg);
+    uint8_t tail[16];
+    if (!f.read(reinterpret_cast<char*>(tail), 16)) return false;
+    if (std::memcmp(tail + 8, "PYROBND1", 8) != 0) return false;
+    uint64_t n = ((uint64_t)tail[0] << 56) | ((uint64_t)tail[1] << 48) |
+                 ((uint64_t)tail[2] << 40) | ((uint64_t)tail[3] << 32) |
+                 ((uint64_t)tail[4] << 24) | ((uint64_t)tail[5] << 16) |
+                 ((uint64_t)tail[6] << 8)  | (uint64_t)tail[7];
+    std::streamsize avail = total - 16;
+    if (n == 0 || n > (uint64_t)avail) {
+        char msg[256];
+        std::snprintf(msg, sizeof(msg),
+                      "this executable carries a corrupt bundle: it claims %llu bytes of bytecode but only %lld are available",
+                      (unsigned long long)n, (long long)avail);
+        fatal(msg);
+    }
+    f.seekg(avail - (std::streamsize)n, std::ios::beg);
+    out_buf.resize((size_t)n);
+    if (!f.read(reinterpret_cast<char*>(out_buf.data()), (std::streamsize)n)) {
+        fatal("this executable carries an unreadable bundle");
+    }
+    if (n < 4 || std::memcmp(out_buf.data(), "PYRO", 4) != 0) {
+        fatal("this executable carries a corrupt bundle: the payload is not Pyro bytecode");
+    }
+    return true;
+}
+
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
+    std::vector<uint8_t> buffer; bool has_emb = embedded_program(argv[0], buffer); if (!has_emb && argc < 2) {
         std::cerr << "[Pyro VM C++] usage: pyrovm_cpp program.pyro\n";
         return 1;
     }
 
-    pyro_argc = argc - 2;
-    pyro_argv = argv + 2;
+    pyro_argc = has_emb ? (argc - 1) : (argc - 2); pyro_argv = has_emb ? (argv + 1) : (argv + 2); if (!has_emb) {
+    // pyro_argv set above
 
     std::ifstream file(argv[1], std::ios::binary | std::ios::ate);
     if (!file) {
@@ -774,19 +807,20 @@ int main(int argc, char* argv[]) {
     std::streamsize size = file.tellg();
     file.seekg(0, std::ios::beg);
 
-    std::vector<uint8_t> buffer((size_t)size);
+    buffer.resize((size_t)size);
     if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
         std::cerr << "Fatal error: error reading file\n";
         return 1;
     }
 
+    } // end if (!has_emb)
     pyro_policy_init(std::getenv("PYRO_POLICY"));
     const char* env_sandbox = std::getenv("PYRO_SANDBOX");
     if (env_sandbox && std::strcmp(env_sandbox, "1") == 0) {
         pyro_sandboxed = true;
     }
 
-    auto prog = pyro::load_program(buffer.data(), (size_t)size);
+    auto prog = pyro::load_program(buffer.data(), buffer.size());
     pyro::run_program(prog.get());
 
     return 0;
