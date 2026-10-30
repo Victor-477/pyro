@@ -68,7 +68,7 @@ public class Value {
         if (double.IsNaN(d)) return "NaN";
         if (double.IsPositiveInfinity(d)) return "+Inf";
         if (double.IsNegativeInfinity(d)) return "-Inf";
-        if (d == Math.Floor(d) && Math.Abs(d) < 1e15)
+        if (d == 0.0 && BitConverter.DoubleToInt64Bits(d) < 0) return "-0"; if (d == Math.Floor(d) && Math.Abs(d) < 1e15)
             return ((long)d).ToString(CultureInfo.InvariantCulture);
         return d.ToString("R", CultureInfo.InvariantCulture);
     }
@@ -556,12 +556,12 @@ public class VM {
                     if (fi >= _prog.Funcs.Count) Fatal("malformed .pyro: function index out of range");
                     var fn = _prog.Funcs[fi];
                     int nextBase = _frames[_fp - 1].LocalsBase + _frames[_fp - 1].NLocals;
-                    if (nextBase + fn.NLocals > STACK_MAX - 2) Fatal("malformed .pyro: locals stack overflow");
+                    if (nextBase + fn.NLocals > STACK_MAX - 2) Fatal("malformed .pyro: locals stack overflow (runaway recursion?)");
                     for (int i = 0; i < fn.NLocals; i++) _locals[nextBase + i] = Value.Null;
                     int baseIdx = _sp - argc;
                     for (int i = 0; i < argc; i++) _locals[nextBase + i] = _stack[baseIdx + i];
                     _sp = baseIdx;
-                    if (_fp > FRAME_MAX - 2) Fatal("malformed .pyro: call stack overflow");
+                    if (_fp > FRAME_MAX - 2) Fatal("malformed .pyro: call stack overflow (runaway recursion?)");
                     _frames[_fp++] = new Frame { RetPC = _pc, LocalsBase = nextBase, NLocals = fn.NLocals, Fn = fi };
                     _pc = (int)fn.Entry;
                     break;
@@ -602,13 +602,13 @@ public class VM {
                     if (fi >= _prog.Funcs.Count) Fatal("malformed .pyro: function index out of range");
                     var fn = _prog.Funcs[fi];
                     int nextBase = _frames[_fp - 1].LocalsBase + _frames[_fp - 1].NLocals;
-                    if (nextBase + fn.NLocals > STACK_MAX - 2) Fatal("malformed .pyro: locals stack overflow");
+                    if (nextBase + fn.NLocals > STACK_MAX - 2) Fatal("malformed .pyro: locals stack overflow (runaway recursion?)");
                     for (int i = 0; i < fn.NLocals; i++) _locals[nextBase + i] = Value.Null;
                     int ncap = fnval.Captures != null ? fnval.Captures.Count : 0;
                     for (int i = 0; i < ncap; i++) _locals[nextBase + i] = fnval.Captures[i];
                     for (int i = 0; i < argc; i++) _locals[nextBase + ncap + i] = _stack[baseIdx + i];
                     _sp = baseIdx - 1;
-                    if (_fp > FRAME_MAX - 2) Fatal("malformed .pyro: call stack overflow");
+                    if (_fp > FRAME_MAX - 2) Fatal("malformed .pyro: call stack overflow (runaway recursion?)");
                     _frames[_fp++] = new Frame { RetPC = _pc, LocalsBase = nextBase, NLocals = fn.NLocals, Fn = fi };
                     _pc = (int)fn.Entry;
                     break;
@@ -926,7 +926,7 @@ public class VM {
             case 29: { // args
                 var arr = new List<Value>();
                 string[] cliArgs = Environment.GetCommandLineArgs();
-                for (int i = 2; i < cliArgs.Length; i++) arr.Add(Value.FromStr(cliArgs[i]));
+                for (int i = EntryPoint.ArgsStartIdx; i < cliArgs.Length; i++) arr.Add(Value.FromStr(cliArgs[i]));
                 return Value.FromArray(arr);
             }
             case 31: { // clamp
@@ -1266,19 +1266,58 @@ public class VM {
 }
 
 public static class EntryPoint {
+    public static int ArgsStartIdx = 2;
+    private static byte[] EmbeddedProgram() {
+        string exe = Environment.ProcessPath;
+        if (string.IsNullOrEmpty(exe) || !File.Exists(exe)) return null;
+        try {
+            using var fs = new FileStream(exe, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            const long trailer = 16;
+            if (fs.Length < trailer) return null;
+            fs.Seek(fs.Length - trailer, SeekOrigin.Begin);
+            byte[] tail = new byte[trailer];
+            if (fs.Read(tail, 0, (int)trailer) != trailer) return null;
+            if (Encoding.ASCII.GetString(tail, 8, 8) != "PYROBND1") return null;
+            long n = ((long)tail[0] << 56) | ((long)tail[1] << 48) | ((long)tail[2] << 40) | ((long)tail[3] << 32) |
+                     ((long)tail[4] << 24) | ((long)tail[5] << 16) | ((long)tail[6] << 8)  | (long)tail[7];
+            long avail = fs.Length - trailer;
+            if (n <= 0 || n > avail) {
+                Console.Error.WriteLine($"[Pyro VM] this executable carries a corrupt bundle: it claims {n} bytes of bytecode but only {avail} are available");
+                Environment.Exit(1);
+            }
+            fs.Seek(avail - n, SeekOrigin.Begin);
+            byte[] payload = new byte[n];
+            int read = 0;
+            while (read < n) {
+                int got = fs.Read(payload, read, (int)n - read);
+                if (got <= 0) {
+                    Console.Error.WriteLine("[Pyro VM] this executable carries an unreadable bundle");
+                    Environment.Exit(1);
+                }
+                read += got;
+            }
+            if (n < 4 || payload[0] != (byte)'P' || payload[1] != (byte)'Y' || payload[2] != (byte)'R' || payload[3] != (byte)'O') {
+                Console.Error.WriteLine("[Pyro VM] this executable carries a corrupt bundle: the payload is not Pyro bytecode");
+                Environment.Exit(1);
+            }
+            return payload;
+        } catch {
+            return null;
+        }
+    }
     public static int Main(string[] args) {
-        if (args.Length < 1) {
+        byte[] bytes = EmbeddedProgram(); if (bytes == null && args.Length < 1) {
             Console.Error.WriteLine("[Pyro VM C#] usage: pyrovm_cs program.pyro");
             return 1;
         }
 
-        string path = args[0];
-        if (!File.Exists(path)) {
+        // path handled below
+        string path = bytes == null ? args[0] : ""; if (bytes == null && !File.Exists(path)) {
             Console.Error.WriteLine("[Pyro VM C#] could not read: " + path);
             return 1;
         }
 
-        byte[] bytes = File.ReadAllBytes(path);
+        if (bytes == null) bytes = File.ReadAllBytes(path); else ArgsStartIdx = 1;
         var program = VM.Load(bytes);
         var vm = new VM(program);
         vm.Run();

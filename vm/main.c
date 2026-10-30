@@ -699,7 +699,7 @@ void run_program(Program* p) {
                 {
                     Value v = stack[--sp];
                     char* s = value_to_string(v);
-                    printf("%s\n", s);
+                    printf("%s\n", s); fflush(stdout);
                     free(s);
                     release_value(v);
                 }
@@ -722,7 +722,7 @@ void run_program(Program* p) {
                 }
                 break;
             case opPRINTLN:
-                printf("\n");
+                printf("\n"); fflush(stdout);
                 break;
             case opNEWARR:
                 {
@@ -921,15 +921,57 @@ void run_program(Program* p) {
 }
 
 // ── Main Entry Point ─────────────────────────────────────────
+static uint8_t* embedded_program(const char* argv0, long* out_size) {
+    FILE* f = fopen("/proc/self/exe", "rb");
+    if (!f && argv0) f = fopen(argv0, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long total = ftell(f);
+    if (total < 16) { fclose(f); return NULL; }
+    if (fseek(f, total - 16, SEEK_SET) != 0) { fclose(f); return NULL; }
+    uint8_t tail[16];
+    if (fread(tail, 1, 16, f) != 16) { fclose(f); return NULL; }
+    if (memcmp(tail + 8, "PYROBND1", 8) != 0) { fclose(f); return NULL; }
+    uint64_t n = ((uint64_t)tail[0] << 56) | ((uint64_t)tail[1] << 48) |
+                 ((uint64_t)tail[2] << 40) | ((uint64_t)tail[3] << 32) |
+                 ((uint64_t)tail[4] << 24) | ((uint64_t)tail[5] << 16) |
+                 ((uint64_t)tail[6] << 8)  | (uint64_t)tail[7];
+    long avail = total - 16;
+    if (n == 0 || n > (uint64_t)avail) {
+        fclose(f);
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "this executable carries a corrupt bundle: it claims %llu bytes of bytecode but only %ld are available",
+                 (unsigned long long)n, avail);
+        fatal(msg);
+    }
+    if (fseek(f, avail - (long)n, SEEK_SET) != 0) {
+        fclose(f);
+        fatal("this executable carries an unreadable bundle");
+    }
+    uint8_t* payload = (uint8_t*)malloc((size_t)n);
+    if (!payload || fread(payload, 1, (size_t)n, f) != (size_t)n) {
+        fclose(f);
+        free(payload);
+        fatal("this executable carries an unreadable bundle");
+    }
+    fclose(f);
+    if (n < 4 || memcmp(payload, "PYRO", 4) != 0) {
+        free(payload);
+        fatal("this executable carries a corrupt bundle: the payload is not Pyro bytecode");
+    }
+    *out_size = (long)n;
+    return payload;
+}
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
+    long size = 0; uint8_t* data = embedded_program(argv[0], &size); if (!data && argc < 2) {
         fprintf(stderr, "[Pyro VM] usage: pyrovm program.pyro\n");
         return 1;
     }
 
     // program args seen by args(): everything after the .pyro path
-    pyro_argc = argc - 2;
-    pyro_argv = argv + 2;
+    pyro_argc = data ? (argc - 1) : (argc - 2); pyro_argv = data ? (argv + 1) : (argv + 2); if (!data) {
+    // pyro_argv set above
 
     FILE* f = fopen(argv[1], "rb");
     if (!f) {
@@ -938,18 +980,19 @@ int main(int argc, char* argv[]) {
     }
     
     fseek(f, 0, SEEK_END);
-    long size = ftell(f);
+    size = ftell(f);
     fseek(f, 0, SEEK_SET);
     
-    uint8_t* data = malloc(size);
+    data = malloc(size);
     if (fread(data, 1, size, f) != size) {
         fprintf(stderr, "Fatal error: error reading file\n");
         fclose(f);
         free(data);
         return 1;
     }
-    fclose(f);
+    fclose(f); }
     
+
     // 11.11 — a policy implies the sandbox: deny by default, grant what
     // is listed. Parsed before PYRO_SANDBOX so a flat deny still wins.
     pyro_policy_init(getenv("PYRO_POLICY"));

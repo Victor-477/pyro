@@ -2439,6 +2439,77 @@ var cpuProfPath string
 // (profStop already exists in profile.go for the 11.25 sampler.)
 var cpuStop func()
 
+// ── a VM that carries its own program (14.x: independence) ──
+//
+// The VM binary already needed nothing but the operating system's own DLLs —
+// no Go, no C, no Python — but it had no way to carry the program, so running
+// anything meant shipping `pyrovm.exe` plus a `.pyro` plus, in practice, the
+// Python CLI that produced it.
+//
+// `pyro bundle` copies this binary and appends the bytecode followed by a
+// 16-byte trailer: an 8-byte big-endian length, then the magic below. The
+// result is ONE executable that runs on a machine with no toolchain of any
+// kind installed.
+//
+// THE TRAILER IS AT THE VERY END so detection is a single read at a known
+// offset, and so appending leaves the original PE image untouched — Windows
+// ignores trailing bytes after the sections, which is what makes this work
+// without a linker.
+//
+// Format, so the C VM can read exactly the same bundles:
+//
+//	[ … PE image … ][ bytecode (n bytes) ][ uint64be n ][ "PYROBND1" ]
+const bundleMagic = "PYROBND1"
+
+// embeddedProgram returns the bundled bytecode, or nil when this is a plain
+// VM. A trailer that is present but inconsistent is a HARD ERROR rather than
+// a fall-through to "plain VM": a truncated bundle would otherwise silently
+// start asking for a file argument, and the operator would be told the
+// command line is wrong when the executable is.
+func embeddedProgram() []byte {
+	exe, err := os.Executable()
+	if err != nil {
+		return nil
+	}
+	f, err := os.Open(exe)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	trailer := int64(8 + len(bundleMagic))
+	if err != nil || st.Size() < trailer {
+		return nil
+	}
+	tail := make([]byte, trailer)
+	if _, err := f.ReadAt(tail, st.Size()-trailer); err != nil {
+		return nil
+	}
+	if string(tail[8:]) != bundleMagic {
+		return nil // a plain VM, which is not an error
+	}
+	n := int64(binary.BigEndian.Uint64(tail[:8]))
+	if n <= 0 || n > st.Size()-trailer {
+		fatal("this executable carries a corrupt bundle: it claims " +
+			strconv.FormatInt(n, 10) + " bytes of bytecode but only " +
+			strconv.FormatInt(st.Size()-trailer, 10) + " are available")
+	}
+	payload := make([]byte, n)
+	if _, err := f.ReadAt(payload, st.Size()-trailer-n); err != nil {
+		fatal("this executable carries an unreadable bundle: " + err.Error())
+	}
+	// Check the bytecode magic HERE rather than letting load() do it. A
+	// length that happens to fit but points at the wrong bytes would
+	// otherwise be reported as "invalid .pyro file (magic)" — and for a
+	// bundled executable there is no .pyro file, so that sends the
+	// operator looking for one.
+	if len(payload) < 4 || string(payload[0:4]) != "PYRO" {
+		fatal("this executable carries a corrupt bundle: the payload is " +
+			"not Pyro bytecode")
+	}
+	return payload
+}
+
 func main() {
 	if p := os.Getenv("PYRO_CPUPROFILE"); p != "" {
 		cpuProfPath = p
@@ -2449,7 +2520,19 @@ func main() {
 	source := ""
 	keySpec := ""
 	debugging := false
-	for len(args) > 0 && strings.HasPrefix(args[0], "--") {
+	// A BUNDLED executable parses NO options from the command line.
+	// With the program inside the binary there is no file argument to
+	// separate the VM's flags from the program's, so every argument has
+	// to belong to the program: `emp.exe --porta 8080` must reach args()
+	// intact. The first test of this did exactly that and the VM
+	// rejected --porta as its own unknown option.
+	//
+	// VM settings still arrive through the ENVIRONMENT, where they
+	// already could: PYRO_SANDBOX, PYRO_POLICY, PYRO_KEY / PYRO_KEY_FILE
+	// and PYRO_CPUPROFILE. That is the only split that works once the
+	// delimiter is gone.
+	embedded := embeddedProgram()
+	for embedded == nil && len(args) > 0 && strings.HasPrefix(args[0], "--") {
 		a := args[0]
 		args = args[1:]
 		val := ""
@@ -2493,15 +2576,29 @@ func main() {
 			fatal("unknown option " + a + "\n" + usage)
 		}
 	}
-	if len(args) < 1 {
-		fatal(usage)
-	}
-	// Before the file is read: a configured key decides whether we are willing
-	// to run it at all (11.14).
+	// Before the program is read: a configured key decides whether we are
+	// willing to run it at all (11.14). That applies to a bundled program
+	// exactly as it does to a file — a signature check that could be
+	// sidestepped by appending the bytecode instead of passing it would not
+	// be a signature check.
 	loadSigningKey(keySpec)
-	data, err := os.ReadFile(args[0])
-	if err != nil {
-		fatal("could not read: " + err.Error())
+	var data []byte
+	if embedded != nil {
+		// A bundled executable takes NO file argument, so every argument on
+		// the command line belongs to the program. `emp.exe --porta 8080`
+		// must reach args() intact rather than being read as a path.
+		data = embedded
+		progArgs = args
+	} else {
+		if len(args) < 1 {
+			fatal(usage)
+		}
+		var err error
+		data, err = os.ReadFile(args[0])
+		if err != nil {
+			fatal("could not read: " + err.Error())
+		}
+		progArgs = args[1:] // exposed to the program via the args() native
 	}
 	if spec := os.Getenv("PYRO_POLICY"); spec != "" {
 		// A policy implies the sandbox: deny by default, grant what is listed.
@@ -2511,7 +2608,9 @@ func main() {
 	if os.Getenv("PYRO_SANDBOX") == "1" {
 		sandboxed = true
 	}
-	progArgs = args[1:] // exposed to the program via the args() native
+	// progArgs was set above, where the program was chosen: a BUNDLED
+	// executable consumes no file argument, so re-slicing here would eat
+	// the program's first real argument.
 	prog := load(data)
 	if debugging {
 		if len(prog.dbg) == 0 {
